@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -1345,7 +1346,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // fuller buffer search, NVIDIA's compiler took 41 s on 53caac5f and the driver reset. Lichii PR 408 found the same (161 s for 68 programs)
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        const Id func_id{OpFunction(type, spv::FunctionControlMask::DontInline, function_type)};
+        // (#994, the floating trees) the task and mesh stages' load helpers are inlined (EDEN_NX2_GM_INLINE=0: not; an EDEN_
+        // switch, so in the program cache's stamp). Not inlined, NVIDIA's compiler (RTX 3070, Windows) gave OoT's tree task
+        // 3cb76827 a wrong address for its third load: n = load(file + 4), code = load(cells[e]), then
+        // load(file + (n + 9 + e) * 4) went to file + (code + 9 + e) * 4, the second call's result in place of the first's,
+        // though the SPIR-V names the first. That load, the cell's end in the placement file's prefix sums, read 0 outside
+        // every buffer, and min(end - start, 256) made every visible cell 256 trees, the next cells' trees drawn in its place:
+        // the wall of trees in the sky. The culling's compute programs, with hundreds of global loads, keep the helper
+        // (NVIDIA took 41 s on one inlined, above)
+        static const bool gm_inline{!getenv("EDEN_NX2_GM_INLINE") || getenv("EDEN_NX2_GM_INLINE")[0] != '0'};
+        const bool inline_here{gm_inline && (stage == Stage::Task || stage == Stage::Mesh)};
+        const Id func_id{OpFunction(type, inline_here ? spv::FunctionControlMask::Inline : spv::FunctionControlMask::DontInline,
+                                    function_type)};
         const Id addr{OpFunctionParameter(U64)};
         define_body(ssbo_member, addr, element_pointer, shift,
                     [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
@@ -2307,6 +2319,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
             if (!Sirit::ValidId(output_position)) {
                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
+                if (position_invariant) Decorate(output_position, spv::Decoration::Invariant);   // (amd-fix, mma_layout.h)
             }
             return {output_position,
                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
@@ -2323,6 +2336,22 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     for (const u32 line : mesh_info.vertex_lines) {
         mesh_vertex_targets.push_back(target(line, false));
     }
+    // (hookshot) A component of a generic output no line writes was undefined at the fragment stage (the console's: 0, and 1 for .w,
+    // as the vertex stage's defaults here). The foliage is drawn by mesh programs: neon plants. RX_VK_MESH_NO_DEFAULTS=1: as before
+    if (!std::getenv("RX_VK_MESH_NO_DEFAULTS")) {
+        std::array<u32, IR::NUM_GENERICS> written{};
+        for (const u32 line : mesh_info.vertex_lines) {
+            const IR::Attribute attribute{line};
+            if (IR::IsGeneric(attribute)) {
+                written[IR::GenericAttributeIndex(attribute)] |= 1U << IR::GenericAttributeElement(attribute);
+            }
+        }
+        for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
+            if (Sirit::ValidId(generics[0][index]) && written[index] != 0xF) {
+                mesh_vertex_defaults.push_back({generics[0][index], 0xFU & ~written[index]});
+            }
+        }
+    }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
     }
@@ -2337,6 +2366,7 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        if (position_invariant) Decorate(output_position, spv::Decoration::Invariant);   // (amd-fix, mma_layout.h)
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {

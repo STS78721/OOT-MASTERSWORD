@@ -42,6 +42,8 @@ struct Pool { uint64_t lo; };
 struct VkBufferCopy { uint64_t srcOffset, dstOffset, size; };
 std::mutex cpu_words_mu;
 std::vector<uint64_t> cpu_words, cpu_words_recent, cpu_words_new;   // (the big and the recent sorted sets, and noted since: vk_memory.cpp)
+constexpr int kPageShift = 12;
+void shadow_written(const uint32_t*, int64_t) {}   // (memory_cpu_owned tells the write-back diff its pages: not checked here)
 #define CHECK(ok) do { if (!(ok)) { std::fprintf(stderr, "failed line %d\n", __LINE__); std::exit(1); } } while (0)
 ''' + helper + r'''
 // after a merge: both sets sorted with no repeats, no word in both, nothing left noted, and together exactly the words in want
@@ -137,7 +139,36 @@ void check_repeats() {
     cpu_words_merge();
     CHECK(cpu_words.empty() && cpu_words_recent.size() == 3 && sets_hold(want));
 }
+// The merges keep the two sets together the set of every word noted, whether the new ones are all known already (the same
+// report words every frame: nothing merged), all new, or mixed, with duplicates among them. (800 rounds over 16384 addresses:
+// the recent set goes past 4096 words and is promoted on the way)
+void merge_matches_a_set() {
+    reset();
+    std::set<uint64_t> want;
+    uint64_t seed = 12345;
+    auto next = [&seed] { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return seed >> 33; };
+    for (int round = 0; round < 800; ++round) {
+        const int kind = round % 4;   // 0 known only, 1 new only, 2 mixed, 3 none
+        const int n = kind == 3 ? 0 : 1 + (int)(next() % 64);
+        for (int i = 0; i < n; ++i) {
+            uint64_t w;
+            if ((kind == 0 || (kind == 2 && next() % 2)) && !want.empty()) {
+                auto it = want.begin();
+                std::advance(it, (long)(next() % want.size()));
+                w = *it;
+            } else {
+                w = (next() % 16384) * 8;
+            }
+            cpu_words_new.push_back(w), want.insert(w);
+            if (next() % 4 == 0) cpu_words_new.push_back(w);   // (a word noted twice before the merge)
+        }
+        cpu_words_merge();
+        CHECK(sets_hold(want));
+    }
+    CHECK(!cpu_words.empty());   // (the recent set was promoted)
+}
 int main() {
+    merge_matches_a_set();
     check(20, 24, {16});        // run starts inside an owned word
     check(20, 32, {16});        // keep the nonowned suffix
     check(12, 20, {16});        // partial end: keep the nonowned prefix
