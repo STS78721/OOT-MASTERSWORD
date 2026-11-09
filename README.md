@@ -29,7 +29,7 @@ Our goal is to **elevate *Ocarina of Time* into a native, flagship PC experience
 
 ---
 
-## 🎮 What Makes This Build Unique (0.1.2d Highlights)
+## 🎮 What Makes This Build Unique (0.1.2e Highlights)
 
 ### 🖥️ Standalone Nixxes/Sony-Style PC Launcher (`MasterSwordLauncher.exe`)
 <p align="center">
@@ -51,7 +51,7 @@ Our goal is to **elevate *Ocarina of Time* into a native, flagship PC experience
 * SMAA + colour grading in the present path; Nodix-style upscale / frame-gen menu rows.
 
 ### 🛡️ Safer Starts & VRAM
-* **0.1.2d hotfix:** full FFmpeg/runtime DLL bundle including libstdc++-6.dll (fixes libaom / cairo / glib / vpl / libstdc++ missing-DLL crashes) + launcher accepts `image.bin` + `romfs\`.
+* **0.1.2e hotfix:** full FFmpeg/runtime DLL bundle including libstdc++-6.dll (fixes libaom / cairo / glib / vpl / libstdc++ missing-DLL crashes) + launcher accepts `image.bin` + `romfs\`.
 * Remade CPU textures re-upload after eviction (fewer garbled blocks on 4–8 GB GPUs).
 * NVIDIA Windows returns retired memory pools by default (less long-session VRAM pile-up).
 * Vulkan DLL accepts host API **v4 and v5** (fixes black window + audio when DLL was ahead of the shipping EXE).
@@ -62,10 +62,10 @@ Our goal is to **elevate *Ocarina of Time* into a native, flagship PC experience
 
 ## 📥 Quick Start & Downloads
 
-Grab the latest prebuilt packages from our **[Latest Release (0.1.2d)](https://github.com/STS78721/OOT-MASTERSWORD/releases/tag/0.1.2d)**:
+Grab the latest prebuilt packages from our **[Latest Release (0.1.2e)](https://github.com/STS78721/OOT-MASTERSWORD/releases/tag/0.1.2e)**:
 
 ### 🎮 1. New Players (Fresh Portable Standalone)
-👉 **Download: [`SteelTemple-MasterSword-0.1.2d-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2d/SteelTemple-MasterSword-0.1.2d-Portable-StandAlone.zip)**
+👉 **Download: [`SteelTemple-MasterSword-0.1.2e-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2e/SteelTemple-MasterSword-0.1.2e-Portable-StandAlone.zip)**
 1. Extract the archive into your chosen game folder (e.g. `C:\Games\MasterSword`).
    - *Includes `MasterSwordLauncher.exe`, `mastersword.exe`, `mastersword_vk.dll`, and the **full** FFmpeg / media runtime DLL set.*
 2. Place **your own** dump beside the build: **`image.bin` + `romfs\`** (recommended).
@@ -83,17 +83,17 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ 2. Upgrading Existing Builds (Drop-in Update) — **required if you hit missing-DLL errors**
-👉 **Download: [`SteelTemple-MasterSword-0.1.2d-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2d/SteelTemple-MasterSword-0.1.2d-Update.zip)**
+👉 **Download: [`SteelTemple-MasterSword-0.1.2e-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2e/SteelTemple-MasterSword-0.1.2e-Update.zip)**
 1. Extract and overwrite into your existing MasterSword game directory.
 2. Preserves saves, `mastersword_options.ini`, and mods.
 3. Or let **`MasterSwordLauncher.exe`** auto-check / auto-install when a newer Update zip is published.
 
 ### 🧰 3. Setup Wizard
-👉 **Download: [`SteelTemple-MasterSword-Setup.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2d/SteelTemple-MasterSword-Setup.exe)**  
+👉 **Download: [`SteelTemple-MasterSword-Setup.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2e/SteelTemple-MasterSword-Setup.exe)**  
 Guided install into a folder you choose (still needs your own dump).
 
 ### 🖥️ 4. Launcher Only
-👉 **Download: [`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2d/MasterSwordLauncher.exe)**  
+👉 **Download: [`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.2e/MasterSwordLauncher.exe)**  
 Point it at a folder that already contains `mastersword.exe`.
 
 ---
