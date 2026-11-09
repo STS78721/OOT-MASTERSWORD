@@ -51,7 +51,8 @@ Our goal is to **elevate *Ocarina of Time* into a native, flagship PC experience
 * SMAA + colour grading in the present path; Nodix-style upscale / frame-gen menu rows.
 
 ### 🛡️ Safer Starts & VRAM
-* **0.1.3 hotfix:** full FFmpeg/runtime DLL bundle including libstdc++-6.dll (fixes libaom / cairo / glib / vpl / libstdc++ missing-DLL crashes) + launcher accepts `image.bin` + `romfs\`.
+* **0.1.3:** Insert-menu **Output resolution** — 2048×1152 / **2560×1440** / **3840×2160** (DLSS/FSR/XeSS-friendly), plus render-target pool scaling for 4K.
+* Full FFmpeg/runtime DLL bundle (libstdc++, libaom, cairo, glib, …) + launcher accepts `image.bin` + `romfs\`.
 * Remade CPU textures re-upload after eviction (fewer garbled blocks on 4–8 GB GPUs).
 * NVIDIA Windows returns retired memory pools by default (less long-session VRAM pile-up).
 * Vulkan DLL accepts host API **v4 and v5** (fixes black window + audio when DLL was ahead of the shipping EXE).
