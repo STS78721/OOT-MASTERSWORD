@@ -1,184 +1,116 @@
-<h1 align="center">
-  <br>
-  <a>
-  <img src="assets/hookshot.png" alt="Hookshot" width="200">
-</a>
-
-  <br>
-  <b>Hookshot</b>
-  <br>
-</h1>
-
-<h4 align="center">The Legend of Zelda: Ocarina of Time (Nintendo Switch 2) running natively on Windows, with no emulator.
-</h4>
+# 🗡️ SteelTempSaint's Ocarina of Time — MasterSword 🎮⚡
+### *Transforming Ocarina of Time into a Flagship Modern PC Experience*
 
 <p align="center">
-  <a href="#project-status">Status</a> |
-  <a href="#how-to-build">How to build</a> |
-  <a href="#in-game-menu">In-game menu</a> |
-  <a href="#how-it-works">How it works</a> |
-  <a href="#want-to-help">Want to help?</a> |
-  <a href="#credits">Credits</a> |
-  <a href="#license">License</a>
+  <img src="assets/mastersword.png" alt="SteelTemple MasterSword" width="220">
 </p>
 
-Hookshot is a static recompilation. The game's code is translated to C and compiled into a Windows program, the
-console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
-**on your PC, from your own copy of the game**.
+[![Latest Release](https://img.shields.io/github/v/release/STS78721/OOT-MASTERSWORD?label=Latest%20Release&color=brightgreen)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)
+[![Release Date](https://img.shields.io/github/release-date/STS78721/OOT-MASTERSWORD?color=blue)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x86--64-informational)](https://github.com/STS78721/OOT-MASTERSWORD)
+[![Renderer](https://img.shields.io/badge/Renderer-Vulkan%201.3-red)](https://github.com/STS78721/OOT-MASTERSWORD)
+[![DualSense](https://img.shields.io/badge/Controller-PS5%20DualSense%20Native-blueviolet)](https://github.com/STS78721/OOT-MASTERSWORD)
+[![Community Feedback](https://img.shields.io/badge/Community-Feedback%20Welcome-orange)](https://github.com/STS78721/OOT-MASTERSWORD/issues)
 
 > [!IMPORTANT]
-> This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
-> need your own copy. Everything the build creates (`hookshot.exe`, the generated code, the shader caches and your
-> saves) comes from your game and stays on your PC. Never share those files.
+> **No copyrighted game files are included.** You need your own legally obtained copy of *The Legend of Zelda: Ocarina of Time* (Nintendo Switch 2 remake), dumped from your own console. No Nintendo binaries, ROMs, or cryptographic keys are distributed with this repository.
 
-## Project status
+---
 
-Experimental. It has only been tested on **one PC** (Ryzen 5 7600X, RTX 4060 Ti 16 GB), mostly in the area at the start
-of the game.
+## 🌟 Our Vision: What We Want to Achieve
 
-| What | Status |
-|---|---|
-| Kokiri Forest: reaching gameplay and walking around | ✅ Works |
-| Sound, controller, keyboard and saves | ✅ Works |
-| In-game menu, frame generation and upscaling | ✅ Works |
-| Black flashes while moving | ✅ Fixed in testing, more play needed |
-| Performance without frame generation | ⚠️ About 50 fps walking, not yet a steady 60 |
-| Models with missing pieces (doors, fences, parts of trees) | ✅ Fixed where tested, more play needed |
-| Stutter when entering new areas | ⚠️ Still happens, mostly the first time |
-| Ultrawide | ⚠️ The 3D keeps its shape, but the HUD is stretched and the picture is softer |
-| Hyrule Field and the rest of the game | ❓ Not tested yet |
-| AMD and Intel cards | ❓ Never tested |
+**SteelTempSaint's MasterSword** is an enthusiast-driven, high-performance static recompilation of *The Legend of Zelda: Ocarina of Time* (Nintendo Switch 2) for native Windows x86-64. There is no emulator at run time: the game's ARM64 code is translated ahead-of-time into C, Horizon OS services are reimplemented on the host, and Switch 2 NVN graphics are rebuilt on **Vulkan 1.3**.
 
-## How to build
+Our goal is to **elevate *Ocarina of Time* into a native, flagship PC experience**:
+- **Next-Gen Immersion:** Native PlayStation 5 DualSense support with tactile feedback and selectable controller glyph layouts.
+- **State-of-the-Art Presentation:** SMAA, colour grading, multi-vendor upscaling / frame-generation menu rows, and low-latency presentation paths on modern GPUs.
+- **Faithful Hyrule, Sharper on PC:** Foliage, terrain, and present-path fixes aimed at a clean Kokiri → Hyrule Field journey without the console's soft look.
+- **A Completely Community-Guided Project:** The same SteelTemple Sony/Nixxes-style launcher workflow as **ToTK SteelTemple** and **DKB BANANAS** — settings outside the game, 1-click updates, save vault, and mod manager.
 
-The game does not come ready-made: it is built on your PC from your copy.
+---
 
-**With Hookshot Builder, the easiest:**
+## 🎮 What Makes This Build Unique (0.1.0 Highlights)
 
-1. Download the HookshotBuilder zip from the Releases page, extract it, and run `HookshotBuilder.exe`. Keep the `tools`
-   folder beside it.
-2. Choose your game's `.nup`, or your `romfs` and `exefs` folders. The builder checks that it is the right version.
-3. Choose a language and a folder for the finished game, and start the build.
-4. When it finishes, open `hookshot.exe` in that folder.
+### 🖥️ Standalone Nixxes/Sony-Style PC Launcher (`MasterSwordLauncher.exe`)
+<p align="center">
+  <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
+</p>
 
-**From the command line:**
+* **PLAY / SETTINGS / DIGITAL EXTRAS** — Sony-style main menu over Master Sword key art.
+* **Settings outside the game** — open SETTINGS anytime; writes `mastersword_options.ini` even before a game folder is chosen.
+* **Auto update check on launch** — when a newer GitHub Release ships an Update zip, the launcher can download and install it automatically.
+* **Pre-Warm Vulkan Shaders** — multi-threaded pipeline warm into the local GPU driver cache.
+* **Save Backup Vault & Mod Manager** — timestamped save snapshots and simple RomFS overlay toggles.
 
-```powershell
-python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Hookshot" --language en-US
+### 🌿 Foliage, Field & Presentation
+* Register-marker fix for bright red/green foliage stems.
+* Sword-swing foliage vanish fix (storage-pointer handles limited to fragment stages).
+* Hyrule Field distant ground lines — BC3 / ASTC one-layer hardening.
+* Neon path hardening (mesh-stage policy, SSBO stretch, handle layout).
+* SMAA + colour grading in the present path; Nodix-style upscale / frame-gen menu rows.
+
+### 🛡️ Safer Starts
+* Drop impossible depth+integer compute seed variants that could crash RADV warm-up.
+* Clear MasterSword branding on the window, options, logs, and portable packages (`mastersword.exe` / `mastersword_vk.dll`).
+
+---
+
+## 📥 Quick Start & Downloads
+
+Grab the latest prebuilt packages from our **[Latest Release (0.1.0)](https://github.com/STS78721/OOT-MASTERSWORD/releases/tag/0.1.0)**:
+
+### 🎮 1. New Players (Fresh Portable Standalone)
+👉 **Download: [`SteelTemple-MasterSword-0.1.0-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.0/SteelTemple-MasterSword-0.1.0-Portable-StandAlone.zip)**
+1. Extract the archive into your chosen game folder (e.g. `C:\Games\MasterSword`).
+   - *Includes `MasterSwordLauncher.exe`, `mastersword.exe`, `mastersword_vk.dll`, SDL / FFmpeg / Vulkan runtimes.*
+2. Place **your own** legally dumped game data beside the build (the layout your dump uses — e.g. `image.bin` / `romfs`, or `exefs` + `romfs` as required by this tree).
+3. Launch **`MasterSwordLauncher.exe`**, pick the game folder if asked, configure graphics, then hit **PLAY**.
+
+```text
+C:\Games\MasterSword\
+├── MasterSwordLauncher.exe
+├── mastersword.exe
+├── mastersword_vk.dll
+├── mastersword_options.ini   <-- created by SETTINGS / first run
+├── SDL2.dll, vulkan-1.dll, …
+└── <your dump files / folders>
 ```
 
-Or with folders:
+### ⚡ 2. Upgrading Existing Builds (Drop-in Update)
+👉 **Download: [`SteelTemple-MasterSword-0.1.0-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.0/SteelTemple-MasterSword-0.1.0-Update.zip)**
+1. Extract and overwrite into your existing MasterSword game directory.
+2. Preserves saves, `mastersword_options.ini`, and mods.
+3. Or let **`MasterSwordLauncher.exe`** auto-check / auto-install when a newer Update zip is published.
 
-```powershell
-python -I nx2/make_game.py --romfs "C:\path\romfs" --exefs "C:\path\exefs" --out "C:\Games\Hookshot" --language en-US
-```
+### 🖥️ 3. Launcher Only
+👉 **Download: [`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.0/MasterSwordLauncher.exe)**  
+Point it at a folder that already contains `mastersword.exe`.
 
-Add `--check` with your `.nup` or `--exefs` to only check the game's version. It builds nothing.
+---
 
-A build takes about 40 minutes, and you can use your PC in the meantime.
+## 🎮 In-Game Controls & Overlay Shortcuts
 
-### What you need
+| Action | Typical Shortcut |
+| :--- | :--- |
+| **Open / Close In-Game Settings Menu** | **`F1`** / **`Esc`** (controller combo where supported) |
+| **Performance Overlay** | **`F10`** |
+| **Toggle Fullscreen / Windowed** | **`F11`** or **`Alt + Enter`** |
 
-- The Visual Studio C++ tools and the Windows SDK. Microsoft does not allow these to be bundled, so install
-  [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++". The
-  builder tells you if they are missing.
-- 64-bit Windows 10 or 11.
-- A graphics card with Vulkan 1.3 and mesh shaders, with an up-to-date driver. Only NVIDIA has been tested.
-- 16 GB of RAM or more. A run uses about 10 GB.
-- About 60 GB free while building.
-- **Your copy of the game at the supported version:** program `0400486024DEC000`, update v131072, build `e0f3ccfa`.
-  Other versions do not work.
+Exact pad combos follow the same SteelTemple overlay conventions as ToTK / DKB builds when DualSense / Xbox layouts are selected in SETTINGS.
 
-To build from the command line you also need:
+---
 
-- Python 3 with `lz4`, `numpy`, `capstone`, `unicorn` and `zstandard`:
-  `pip install lz4 numpy capstone "unicorn>=2.1,<2.2" zstandard`
-- The clang from [emsdk](https://github.com/emscripten-core/emsdk), at `C:\emsdk`.
-- Visual Studio 2022 with .NET 8, only if you want to change the builder itself.
-- The prebuilt tools that go in `third_party/`: `a64emit`, `lld-link`, `zbic` and SDL2.
+## 🛠️ Credits & Acknowledgments
 
-### What this does on your PC
+- **Upstream Hookshot / Switch 2 recompilation stack** — static recompilation architecture, Horizon OS host, and NVN → Vulkan backend contributors.
+- **Eden / Eglantine shader stack** — Ampere → Maxwell lowering used by the Vulkan path.
+- **SMAA (iryoku)** — morphological anti-aliasing in the present path.
+- **SteelTemple Community & Testers** — logs, footage, and feedback across MasterSword, ToTK SteelTemple, and DKB BANANAS.
 
-- The build reads your game and never changes it. It writes to the folder you choose and to
-  `%LOCALAPPDATA%\HookshotBuilder`.
-- The romfs is hard-linked instead of copied where the disk allows it.
-- To uninstall, delete the game folder and `%LOCALAPPDATA%\HookshotBuilder`.
+---
 
-### If something goes wrong
+## 📜 License
 
-| Problem | What to do |
-|---|---|
-| "Hookshot supports build e0f3ccfa" | Check that you chose the right game with its update installed |
-| The game opens and closes | Update your graphics driver |
-| Stutter the first time you see something | Normal for now: shaders are being prepared. It gets better when you pass through the same place again |
-| The game is in the wrong language | Change the code in `language.txt` beside the game. The file lists them all |
+See **[LICENSE](LICENSE)** in this repository. Third-party notices for bundled SDKs and shader components live under `third_party/` / project docs where applicable.
 
-If the problem continues, report it with where you were in the game, your graphics card and a screenshot or video.
-Never send game files.
-
-## In-game menu
-
-Press <kbd>Insert</kbd> in game. Everything is off by default, and your choices are saved in `hookshot_options.ini`
-beside the game.
-
-| Option | Choices |
-|---|---|
-| Frame generation | Off, 2x, 3x, 4x |
-| Frame pacing | Off, On |
-| Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% |
-| Upscaling | Off, Catmull-Rom, Lanczos |
-| Sharpness | 0 to 100% |
-| Game speed | Per frame, Real time |
-| Handheld profile | Off, On |
-| Ultrawide | 16:9, Monitor's shape |
-| FPS counter | Off, On |
-
-With Game speed on Per frame, the game runs slower whenever it is below 60 fps. Real time keeps it at normal speed.
-
-### Controls
-
-Use a controller, or the keyboard and mouse. On the keyboard, <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> move
-and the arrow keys turn the camera.
-
-## How it works
-
-1. `nx2/lift.py` translates the game's ARM64 code to C.
-2. `nx2/build.py` compiles that C together with `host/`, which plays the part of the console's system.
-3. `host/nvn_native.c` records the game's NVN2 graphics calls, and `gpu/vk/` replays them on Vulkan.
-4. Switch 2 Ampere shaders are lowered to Maxwell (`lower_to_maxwell.h`) and translated to SPIR-V by Eden's shader
-   recompiler.
-
-More detail is in the [development guide](docs/development.md) and the [design notes](docs/design.md).
-
-## Want to help?
-
-Testing on other graphics cards and reporting the result already helps a lot, and so does playing further into the
-game than anyone has yet.
-
-Bigger ways to help:
-
-- **Linux support.** Hookshot only runs on Windows today. The Vulkan renderer is a good start, but the system layer
-  still needs porting.
-- **Fixes in your own fork.** Fork the project, fix what you find and send the change back. Keep game files, keys and
-  anything generated from your game out of it.
-
-## Credits
-
-Hookshot exists thanks to the work of many people:
-
-- **NotRexed**: Hookshot, BlueShell (Mario Kart World), Skybound (Tears of the Kingdom) and the a64-kit tools.
-- **[Eden](https://git.eden-emu.dev/eden-emu/eden)** and **Eglantine**: the shader recompiler and Switch 2 shader work.
-- **suyu**: the graphics decoders and the AArch64 translator.
-- **[seedds/nxnative](https://github.com/seedds/nxnative)**: reference for how task and mesh shaders work.
-- **[zortos293/Lichii](https://github.com/zortos293/Lichii)**: reference for Ampere shader lowering.
-- **[kinnay/zbic](https://github.com/kinnay/zbic)**, **Opus** and **SDL**: decompression, audio and controllers.
-
-## License
-
-Hookshot's own code is under the [MIT License](LICENSE).
-
-It also includes code from Eden and suyu, which stays under the GPL, so a compiled game as a whole is covered by
-GPL-3.0-or-later. Third-party parts keep their own licenses. The [LICENSE](LICENSE) file lists which folders are which.
-
-Hookshot is an unofficial fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Ocarina of
-Time are trademarks of Nintendo.
+*Thank you to everyone helping build the ultimate Ocarina of Time PC experience!* 🗡️🌲✨
