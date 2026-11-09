@@ -84,7 +84,11 @@ C:\Games\MasterSword\
 2. Preserves saves, `mastersword_options.ini`, and mods.
 3. Or let **`MasterSwordLauncher.exe`** auto-check / auto-install when a newer Update zip is published.
 
-### 🖥️ 3. Launcher Only
+### 🧰 3. Setup Wizard
+👉 **Download: [`SteelTemple-MasterSword-Setup.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.1/SteelTemple-MasterSword-Setup.exe)**  
+Guided install into a folder you choose (still needs your own dump).
+
+### 🖥️ 4. Launcher Only
 👉 **Download: [`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.1/MasterSwordLauncher.exe)**  
 Point it at a folder that already contains `mastersword.exe`.
 
