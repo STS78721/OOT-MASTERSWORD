@@ -9,6 +9,7 @@
 [![Release Date](https://img.shields.io/github/release-date/STS78721/OOT-MASTERSWORD?color=blue)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x86--64-informational)](https://github.com/STS78721/OOT-MASTERSWORD)
 [![Renderer](https://img.shields.io/badge/Renderer-Vulkan%201.3-red)](https://github.com/STS78721/OOT-MASTERSWORD)
+[![DLSS](https://img.shields.io/badge/NVIDIA-DLSS%20SR-76B900)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)
 [![DualSense](https://img.shields.io/badge/Controller-PS5%20DualSense%20Native-blueviolet)](https://github.com/STS78721/OOT-MASTERSWORD)
 [![Community Feedback](https://img.shields.io/badge/Community-Feedback%20Welcome-orange)](https://github.com/STS78721/OOT-MASTERSWORD/issues)
 
@@ -17,111 +18,99 @@
 
 ---
 
-## 🌟 Our Vision: What We Want to Achieve
+## 🌟 Our Vision
 
 **SteelTempSaint's MasterSword** is an enthusiast-driven, high-performance static recompilation of *The Legend of Zelda: Ocarina of Time* (Nintendo Switch 2) for native Windows x86-64. There is no emulator at run time: the game's ARM64 code is translated ahead-of-time into C, Horizon OS services are reimplemented on the host, and Switch 2 NVN graphics are rebuilt on **Vulkan 1.3**.
 
-Our goal is to **elevate *Ocarina of Time* into a native, flagship PC experience**:
-- **Next-Gen Immersion:** Native PlayStation 5 DualSense support with tactile feedback and selectable controller glyph layouts.
-- **State-of-the-Art Presentation:** SMAA, colour grading, multi-vendor upscaling / frame-generation menu rows, and low-latency presentation paths on modern GPUs.
-- **Faithful Hyrule, Sharper on PC:** Foliage, terrain, and present-path fixes aimed at a clean Kokiri → Hyrule Field journey without the console's soft look.
-- **A Completely Community-Guided Project:** The same SteelTemple Sony/Nixxes-style launcher workflow as **ToTK SteelTemple** and **DKB BANANAS** — settings outside the game, 1-click updates, save vault, and mod manager.
+We aim for a **native, flagship PC experience**:
+- **Next-Gen Immersion** — DualSense support with tactile feedback and selectable glyph layouts
+- **Modern presentation** — **NVIDIA DLSS Super Resolution**, Nodix frame gen, SMAA, colour grading, Reflex
+- **Faithful Hyrule, sharper on PC** — foliage, terrain, and present-path polish for Kokiri → Field
+- **Community workflow** — SteelTemple Sony/Nixxes-style launcher (settings outside the game, 1-click updates, save vault, mod manager)
 
 ---
 
-## 🎮 What Makes This Build Unique (0.1.3aa Highlights)
+## 🎮 What's in 0.1.5
 
-### 🖥️ Standalone Nixxes/Sony-Style PC Launcher (`MasterSwordLauncher.exe`)
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
-* **PLAY / SETTINGS / DIGITAL EXTRAS** — Sony-style main menu over Master Sword key art.
-* **Settings outside the game** — open SETTINGS anytime; writes `mastersword_options.ini` even before a game folder is chosen.
-* **Auto update check on launch** — when a newer GitHub Release ships an Update zip, the launcher can download and install it automatically.
-* **Transparent compass Master Sword icon** on the launcher EXE and package shortcuts (no white / opaque backdrop).
-* **Pre-Warm Vulkan Shaders** — multi-threaded pipeline warm into the local GPU driver cache.
-* **Save Backup Vault & Mod Manager** — timestamped save snapshots and simple RomFS overlay toggles.
+### ✨ MasterSword identity
+* Startup warmer, Insert menu, launcher, and updater all branded **MasterSword 0.1.5**
+* SteelTempSaint logo on the startup screen
 
-### 🌿 Foliage, Field & Presentation
-* Register-marker fix for bright red/green foliage stems.
-* Sword-swing foliage vanish fix (storage-pointer handles limited to fragment stages).
-* Hyrule Field distant ground lines — BC3 / ASTC one-layer hardening.
-* Neon path hardening (mesh-stage policy, SSBO stretch, handle layout).
-* SMAA + colour grading in the present path; Nodix-style upscale / frame-gen menu rows.
+### ❤️ Stability & feel
+* HUD / hearts stay visible after pause (smarter texture memory)
+* Smoother Kokiri and busy scenes on many PCs
+* Better AMD lighting on cards that use wide warps
+* Stronger mesh fallback — fewer missing pieces when the fallback path is active
+* Long / Unicode game folder paths work more reliably
 
-### 🛡️ Safer Starts & VRAM
-* **0.1.3aa:** Output **1440p/4K** + FSR/XeSS/Nodix quality = % of Output (e.g. Quality 67% @ 1440p); crop override fixes pink washed 3D.
-* Full FFmpeg/runtime DLL bundle (libstdc++, libaom, cairo, glib, …) + launcher accepts `image.bin` + `romfs\`.
-* Remade CPU textures re-upload after eviction (fewer garbled blocks on 4–8 GB GPUs).
-* NVIDIA Windows returns retired memory pools by default (less long-session VRAM pile-up).
-* Vulkan DLL accepts host API **v4 and v5** (fixes black window + audio when DLL was ahead of the shipping EXE).
-* Drop impossible depth+integer compute seed variants that could crash RADV warm-up.
-* Clear MasterSword branding on the window, options, logs, and portable packages (`mastersword.exe` / `mastersword_vk.dll`).
+### 🚀 From 0.1.4 (still here)
+* **NVIDIA DLSS SR** — presets **K / M / L** in the Insert menu & launcher
+* **Nodix DLSS MFG** stand-in frame generation + **NVIDIA Reflex**
+* Launcher SETTINGS sync with the in-game Insert menu
+
+### 🖥️ Launcher (`MasterSwordLauncher.exe`)
+* **PLAY / SETTINGS / DIGITAL EXTRAS** over Master Sword key art
+* Auto-update check on launch when a newer Update zip ships
+* Pre-warm Vulkan shaders, save vault, mod manager
 
 ---
 
 ## 📥 Quick Start & Downloads
 
-Grab the latest prebuilt packages from our **[Latest Release (0.1.3aa)](https://github.com/STS78721/OOT-MASTERSWORD/releases/tag/0.1.3a)**:
+Grab packages from the **[Latest Release (0.1.5)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
-### 🎮 1. New Players (Fresh Portable Standalone)
-👉 **Download: [`SteelTemple-MasterSword-0.1.3aa-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.3aa/SteelTemple-MasterSword-0.1.3aa-Portable-StandAlone.zip)**
-1. Extract the archive into your chosen game folder (e.g. `C:\Games\MasterSword`).
-   - *Includes `MasterSwordLauncher.exe`, `mastersword.exe`, `mastersword_vk.dll`, and the **full** FFmpeg / media runtime DLL set.*
-2. Place **your own** dump beside the build: **`image.bin` + `romfs\`** (recommended).
-3. Launch **`MasterSwordLauncher.exe`**, pick the game folder if asked, configure graphics, then hit **PLAY**.
+### 🎮 New players — Portable
+👉 **[`SteelTemple-MasterSword-0.1.5-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5/SteelTemple-MasterSword-0.1.5-Portable-StandAlone.zip)**
+1. Extract (e.g. `C:\Games\MasterSword`)
+2. Put **your** dump beside it: **`image.bin` + `romfs\`**
+3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
+4. NVIDIA: **Download & Install DLSS SDK** if Streamline / `nvngx_dlss.dll` are missing
 
 ```text
 C:\Games\MasterSword\
 ├── MasterSwordLauncher.exe
 ├── mastersword.exe
 ├── mastersword_vk.dll
-├── libaom.dll, libcairo-2.dll, libglib-2.0-0.dll, …   <-- required runtimes
-├── mastersword_options.ini   <-- created by SETTINGS / first run
+├── mastersword_options.ini   <-- SETTINGS / first run
 ├── image.bin + romfs\        <-- YOUR dump
-└── SDL2.dll, vulkan-1.dll, …
+└── runtime DLLs …
 ```
 
-### ⚡ 2. Upgrading Existing Builds (Drop-in Update) — **required if you hit missing-DLL errors**
-👉 **Download: [`SteelTemple-MasterSword-0.1.3aa-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.3aa/SteelTemple-MasterSword-0.1.3aa-Update.zip)**
-1. Extract and overwrite into your existing MasterSword game directory.
-2. Preserves saves, `mastersword_options.ini`, and mods.
-3. Or let **`MasterSwordLauncher.exe`** auto-check / auto-install when a newer Update zip is published.
+### ⚡ Existing players — Update
+👉 **[`SteelTemple-MasterSword-0.1.5-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5/SteelTemple-MasterSword-0.1.5-Update.zip)**  
+Overwrite your game folder — or just open the launcher and let it install automatically.
 
-### 🧰 3. Setup Wizard
-👉 **Download: [`SteelTemple-MasterSword-Setup.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.3aa/SteelTemple-MasterSword-Setup.exe)**  
-Guided install into a folder you choose (still needs your own dump).
-
-### 🖥️ 4. Launcher Only
-👉 **Download: [`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.3aa/MasterSwordLauncher.exe)**  
-Point it at a folder that already contains `mastersword.exe`.
+### 🖥️ Launcher only
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5/MasterSwordLauncher.exe)**
 
 ---
 
-## 🎮 In-Game Controls & Overlay Shortcuts
+## 🎮 In-game shortcuts
 
-| Action | Typical Shortcut |
+| Action | Shortcut |
 | :--- | :--- |
-| **Open / Close In-Game Settings Menu** | **`F1`** / **`Esc`** (controller combo where supported) |
-| **Performance Overlay** | **`F10`** |
-| **Toggle Fullscreen / Windowed** | **`F11`** or **`Alt + Enter`** |
-
-Exact pad combos follow the same SteelTemple overlay conventions as ToTK / DKB builds when DualSense / Xbox layouts are selected in SETTINGS.
+| **Insert menu** (graphics / MasterSword options) | **`Insert`** |
+| **Performance overlay** | **`F10`** (where enabled) |
+| **Fullscreen / windowed** | **`F11`** or **`Alt + Enter`** |
 
 ---
 
 ## 🛠️ Credits & Acknowledgments
 
-- **Upstream Hookshot / Switch 2 recompilation stack** — static recompilation architecture, Horizon OS host, and NVN → Vulkan backend contributors.
-- **Eden / Eglantine shader stack** — Ampere → Maxwell lowering used by the Vulkan path.
-- **SMAA (iryoku)** — morphological anti-aliasing in the present path.
-- **SteelTemple Community & Testers** — logs, footage, and feedback across MasterSword, ToTK SteelTemple, and DKB BANANAS.
+- **NotRexed & Hookshot contributors** — static recompilation architecture, Horizon OS host, and NVN → Vulkan work this project builds on
+- **Eden / Eglantine** — Ampere → Maxwell shader lowering used by the Vulkan path
+- **EvilBoyce / evilmfkr (EvilOOT)** and other community GPU / foliage contributors
+- **NVIDIA DLSS** — optional Streamline / NGX Super Resolution (downloaded by the launcher; NVIDIA trademarks)
+- **SteelTempSaint community & testers** — logs, footage, and feedback across MasterSword, ToTK SteelTemple, and DKB BANANAS
 
 ---
 
 ## 📜 License
 
-See **[LICENSE](LICENSE)** in this repository. Third-party notices for bundled SDKs and shader components live under `third_party/` / project docs where applicable.
+See **[LICENSE](LICENSE)** in this repository. Third-party notices live under `third_party/` / project docs where applicable.
 
 *Thank you to everyone helping build the ultimate Ocarina of Time PC experience!* 🗡️🌲✨
