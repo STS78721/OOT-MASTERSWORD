@@ -30,17 +30,20 @@ We aim for a **native, flagship PC experience**:
 
 ---
 
-## 🎮 What's in 0.1.5c
+## 🎮 What's in 0.1.5d
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup warmer, Insert menu, launcher, and updater all branded **MasterSword 0.1.5c**
+* Startup warmer, Insert menu, launcher, and updater all branded **MasterSword 0.1.5d**
 * SteelTempSaint logo on the startup screen
 
-### 🧩 0.1.5c — FSR 4 & tip ports
+### 🧩 0.1.5d — options.ini hotfix
+* Host reads **`mastersword_options.ini`** (frame rate cap, output, binds, audio) — was still looking for legacy `hookshot_options.ini` in 0.1.5c
+
+### ❤️ From 0.1.5c (still here)
 * **AMD FSR 4** Upscaling row (FidelityFX SDK 2.4 runtime shipped for Windows AMD GPUs)
 * Tip-port Graphics polish: V-Sync, mesh shaders, uncapped FPS, upscaler probe on startup
 * DLSS / FSR 4 Resolution + Native AA render scales; fullscreen Insert menu stays visible at 4K
@@ -66,10 +69,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.5c)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.5d)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.5c-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5c/SteelTemple-MasterSword-0.1.5c-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.5d-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5d/SteelTemple-MasterSword-0.1.5d-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -87,11 +90,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.5c-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5c/SteelTemple-MasterSword-0.1.5c-Update.zip)**  
+👉 **[`SteelTemple-MasterSword-0.1.5d-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5d/SteelTemple-MasterSword-0.1.5d-Update.zip)**  
 Overwrite your game folder — or just open the launcher and let it install automatically.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5c/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5d/MasterSwordLauncher.exe)**
 
 ---
 
