@@ -30,32 +30,31 @@ We aim for a **native, flagship PC experience**:
 
 ---
 
-## 🎮 What's in 0.1.5b
+## 🎮 What's in 0.1.5c
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup warmer, Insert menu, launcher, and updater all branded **MasterSword 0.1.5b**
+* Startup warmer, Insert menu, launcher, and updater all branded **MasterSword 0.1.5c**
 * SteelTempSaint logo on the startup screen
 
-### 🧩 0.1.5b polish
-* More Ampere shaders lower cleanly
-* AMD cloth / task+mesh hardening
+### 🧩 0.1.5c — FSR 4 & tip ports
+* **AMD FSR 4** Upscaling row (FidelityFX SDK 2.4 runtime shipped for Windows AMD GPUs)
+* Tip-port Graphics polish: V-Sync, mesh shaders, uncapped FPS, upscaler probe on startup
+* DLSS / FSR 4 Resolution + Native AA render scales; fullscreen Insert menu stays visible at 4K
+* Coherent menu pointer samples (Windows + SDL)
+
+### ❤️ From 0.1.5b (still here)
+* Ampere shader / AMD cloth / task+mesh hardening
 * Image-view retry, texel-buffer ownership, pipeline play-cache
 * Present device-lost ends cleanly after a checkpoint report
-
-### ❤️ Stability & feel
-* HUD / hearts stay visible after pause (smarter texture memory)
-* Smoother Kokiri and busy scenes on many PCs
-* Better AMD lighting on cards that use wide warps
-* Stronger mesh fallback — fewer missing pieces when the fallback path is active
-* Long / Unicode game folder paths work more reliably
+* HUD / hearts, mesh fallback, long Unicode paths
 
 ### 🚀 From 0.1.4 (still here)
 * **NVIDIA DLSS SR** — presets **K / M / L** in the Insert menu & launcher
-* **Nodix DLSS MFG** stand-in frame generation + **NVIDIA Reflex**
+* **Nodix / MasterSword** frame generation + **NVIDIA Reflex**
 * Launcher SETTINGS sync with the in-game Insert menu
 
 ### 🖥️ Launcher (`MasterSwordLauncher.exe`)
@@ -67,10 +66,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.5b)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.5c)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.5b-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5b/SteelTemple-MasterSword-0.1.5b-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.5c-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5c/SteelTemple-MasterSword-0.1.5c-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -81,17 +80,18 @@ C:\Games\MasterSword\
 ├── MasterSwordLauncher.exe
 ├── mastersword.exe
 ├── mastersword_vk.dll
+├── amd_fidelityfx_*_vk.dll   <-- FSR 4 (AMD)
 ├── mastersword_options.ini   <-- SETTINGS / first run
 ├── image.bin + romfs\        <-- YOUR dump
 └── runtime DLLs …
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.5b-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5b/SteelTemple-MasterSword-0.1.5b-Update.zip)**  
+👉 **[`SteelTemple-MasterSword-0.1.5c-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5c/SteelTemple-MasterSword-0.1.5c-Update.zip)**  
 Overwrite your game folder — or just open the launcher and let it install automatically.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5b/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5c/MasterSwordLauncher.exe)**
 
 ---
 
