@@ -10,6 +10,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x86--64-informational)](https://github.com/STS78721/OOT-MASTERSWORD)
 [![Renderer](https://img.shields.io/badge/Renderer-Vulkan%201.3-red)](https://github.com/STS78721/OOT-MASTERSWORD)
 [![DLSS](https://img.shields.io/badge/NVIDIA-DLSS%20SR-76B900)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)
+[![FSR4](https://img.shields.io/badge/AMD-FSR%204-ED1C24)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)
 [![DualSense](https://img.shields.io/badge/Controller-PS5%20DualSense%20Native-blueviolet)](https://github.com/STS78721/OOT-MASTERSWORD)
 [![Community Feedback](https://img.shields.io/badge/Community-Feedback%20Welcome-orange)](https://github.com/STS78721/OOT-MASTERSWORD/issues)
 
@@ -24,24 +25,31 @@
 
 We aim for a **native, flagship PC experience**:
 - **Next-Gen Immersion** — DualSense support with tactile feedback and selectable glyph layouts
-- **Modern presentation** — **NVIDIA DLSS Super Resolution**, Nodix frame gen, SMAA, colour grading, Reflex
-- **Faithful Hyrule, sharper on PC** — foliage, terrain, and present-path polish for Kokiri → Field
-- **Community workflow** — SteelTemple Sony/Nixxes-style launcher (settings outside the game, 1-click updates, save vault, mod manager)
+- **Modern presentation** — **NVIDIA DLSS Super Resolution**, **AMD FSR 4**, Nodix / MasterSword frame gen, SMAA, colour grading, Reflex
+- **Faithful Hyrule, sharper on PC** — foliage, terrain, and native-resolution CPU/VRAM optimizations for smooth Kokiri → Hyrule Field play
+- **Community workflow** — SteelTemple Sony/Nixxes-style launcher (settings outside the game, 1-click auto-updates, save vault, mod manager)
 
 ---
 
-## 🎮 What's in 0.1.5d
+## 🎮 What's in 0.1.5e
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup warmer, Insert menu, launcher, and updater all branded **MasterSword 0.1.5d**
+* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.5e**
 * SteelTempSaint logo on the startup screen
 
-### 🧩 0.1.5d — options.ini hotfix
-* Host reads **`mastersword_options.ini`** (frame rate cap, output, binds, audio) — was still looking for legacy `hookshot_options.ini` in 0.1.5c
+### ⚡ 0.1.5e — Native-Res CPU, VRAM Pooling & Auto-Updater Overhaul
+* **Render-target image pooling (`256 MB`) & dedicated `128 MB` VMA target blocks** — recycles render targets across scale transitions and keeps transient targets out of sampled texture blocks
+* **Per-slot descriptor reuse & lockless TLS sampler cache** — enabled by default (`Descriptor reuse` / `Sampler cache`), cutting Vulkan draw-submission CPU overhead at full native resolution
+* **Zero-copy submitted-page cache & multi-threaded shadow copies** — 32-slot `memory_read_as_submitted` pointer cache + parallel `CopyHelpers` shadow page updates
+* **VRAM & host pacing wins** — dynamic VRAM pressure relief on mirrors/shadows, opt-in VMA compaction (`RX_VK_COMPACT=1`), zero-texture GPU clear fast-path, movie upscale fallback, reserved OS CPU core, and batched background logging
+* **1-click Launcher Auto-Updater & NGX Installer hardening** — `--probe-dpi` executable verification, **FSR 4** / **FSR 3.1** (`options_version=8`) launcher sync, and standalone SHA-256-verified NVIDIA NGX DLSS `v310.9.16` download
+
+### 🧩 From 0.1.5d (still here)
+* Host reads **`mastersword_options.ini`** first (frame rate cap, output resolution, binds, audio)
 
 ### ❤️ From 0.1.5c (still here)
 * **AMD FSR 4** Upscaling row (FidelityFX SDK 2.4 runtime shipped for Windows AMD GPUs)
@@ -56,27 +64,27 @@ We aim for a **native, flagship PC experience**:
 * HUD / hearts, mesh fallback, long Unicode paths
 
 ### 🚀 From 0.1.4 (still here)
-* **NVIDIA DLSS SR** — presets **K / M / L** in the Insert menu & launcher
+* **NVIDIA DLSS SR** — presets **K / M / L** + **DLAA** in the Insert menu & launcher
 * **Nodix / MasterSword** frame generation + **NVIDIA Reflex**
 * Launcher SETTINGS sync with the in-game Insert menu
 
 ### 🖥️ Launcher (`MasterSwordLauncher.exe`)
 * **PLAY / SETTINGS / DIGITAL EXTRAS** over Master Sword key art
-* Auto-update check on launch when a newer Update zip ships
+* Automatic 1-click update check & in-place install when a newer Update zip ships
 * Pre-warm Vulkan shaders, save vault, mod manager
 
 ---
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.5d)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.5e)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.5d-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5d/SteelTemple-MasterSword-0.1.5d-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.5e-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5e/SteelTemple-MasterSword-0.1.5e-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
-4. NVIDIA: **Download & Install DLSS SDK** if Streamline / `nvngx_dlss.dll` are missing
+4. NVIDIA: **Download & Install DLSS SDK** in SETTINGS if `ngx\nvngx_dlss.dll` is not yet installed
 
 ```text
 C:\Games\MasterSword\
@@ -90,11 +98,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.5d-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5d/SteelTemple-MasterSword-0.1.5d-Update.zip)**  
-Overwrite your game folder — or just open the launcher and let it install automatically.
+👉 **[`SteelTemple-MasterSword-0.1.5e-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5e/SteelTemple-MasterSword-0.1.5e-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.5e`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5d/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.5e/MasterSwordLauncher.exe)**
 
 ---
 
@@ -113,7 +121,8 @@ Overwrite your game folder — or just open the launcher and let it install auto
 - **NotRexed & Hookshot contributors** — static recompilation architecture, Horizon OS host, and NVN → Vulkan work this project builds on
 - **Eden / Eglantine** — Ampere → Maxwell shader lowering used by the Vulkan path
 - **EvilBoyce / evilmfkr (EvilOOT)** and other community GPU / foliage contributors
-- **NVIDIA DLSS** — optional Streamline / NGX Super Resolution (downloaded by the launcher; NVIDIA trademarks)
+- **NVIDIA DLSS** — optional NGX Super Resolution (downloaded by the launcher; NVIDIA trademarks)
+- **AMD FidelityFX / FSR SDK** — FSR 3.1 & FSR 4 Vulkan upscaling technology
 - **SteelTempSaint community & testers** — logs, footage, and feedback across MasterSword, ToTK SteelTemple, and DKB BANANAS
 
 ---
