@@ -24,38 +24,36 @@
 **SteelTempSaint's MasterSword** is an enthusiast-driven, high-performance static recompilation of *The Legend of Zelda: Ocarina of Time* (Nintendo Switch 2) for native Windows x86-64. There is no emulator at run time: the game's ARM64 code is translated ahead-of-time into C, Horizon OS services are reimplemented on the host, and Switch 2 NVN graphics are rebuilt on **Vulkan 1.3**.
 
 We aim for a **native, flagship PC experience**:
-- **Next-Gen Immersion** — DualSense support with tactile feedback and selectable glyph layouts
-- **Modern presentation** — **NVIDIA DLSS Super Resolution & Hardware Multi-Frame Generation (2x–4x)**, **AMD FSR 4 & FSR 3.1 FG**, MasterSword / Nodix frame gen, SMAA, colour grading, **NVIDIA Reflex** (active even with Frame Generation!)
-- **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, and native-resolution CPU/FMA/VRAM optimizations for smooth Kokiri → Hyrule Field play
+- **Next-Gen Immersion** — DualSense support with tactile feedback, native mouse camera, live gameplay FOV (`50%–150%`), and selectable glyph layouts
+- **Modern presentation** — **NVIDIA DLSS Super Resolution & Hardware Multi-Frame Generation (2x–4x)**, **AMD FSR 4 & FSR 3.1 FG**, MasterSword / Nodix frame gen, SMAA, colour grading, **5K2K (`5120×2160`) ultrawide**, **NVIDIA Reflex** (active even with Frame Generation!)
+- **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, true >60 FPS physics/audio/clock accuracy, and native-resolution CPU/FMA/VRAM optimizations
 - **Community workflow** — SteelTemple Sony/Nixxes-style launcher (safe 1080p out-of-the-box baseline, settings outside the game, 1-click auto-updates, save vault, mod manager)
 
 ---
 
-## 🎮 What's in 0.1.6
+## 🎮 What's in 0.1.7
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.6**
+* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.7**
 * SteelTempSaint logo on the startup screen & safe 1080p vendor-neutral out-of-the-box defaults
 
-### 🚀 0.1.6 — Hardware NGX DLSS Frame Generation, Reactive Masks, AVX2/FMA & GPU Stability
-* **Real Hardware NVIDIA NGX DLSS Frame Generation (`nvngx_dlssg.dll`, 2x–4x)** — **FG engine = DLSS MFG** now drives native NGX Frame Generation directly from temporal depth, dilated + actor motion vectors, and camera matrices (works both with DLSS SR / DLAA **and** at pure **Native 1080p / 1440p / 4K** with Upscaling = Off!)
-* **3x/4x Present-Ahead + V-Sync Auto FIFO + NVIDIA Reflex under FG** — submits multi-frame sets ahead of time with spare swapchain images, uses FIFO on VRR displays under DLSS-G, and keeps **NVIDIA Reflex** active on real game frames while Frame Generation is on
-* **Transparency Reactive Mask & Negative LOD Mip Bias** — prevents alpha/particle ghosting on water splashes, fire, and dust under DLSS & FSR 3.1, and sharpens textures under sub-native DLSS presets; also wires full **AMD FSR 3.1 SR & FSR 3.1 Frame Interpolation**
-* **Hardware AVX2/FMA Single-Precision Math & Faster Shader Prep** — fuses `FMADD`/`FRECPS`/`FRSQRTS` into single `vfmadd` instructions across all lifted game chunks (22–45% faster on FMA chains) and reuses per-thread shader translation pools (~20–30% faster shader preparation)
-* **Major Stability & >60 FPS World Fixes** — fixes the Hyrule Castle tree-shadow GPU hang, 3D BC slice render-target `VK_ERROR_DEVICE_LOST` (enabling foliage LOD dither safely), Kokiri Forest flashing mesh triangles, VRAM compaction active-texture guards, and frozen water ripples + pick-up counters above 60 FPS
-* **1-Click Dual NGX SDK Installer in Launcher** — **Download & Install DLSS SDK** in `MasterSwordLauncher.exe` now fetches and SHA-256-verifies both `ngx\nvngx_dlss.dll` and `ngx\nvngx_dlssg.dll` (`v310.9.16`)
+### 🚀 0.1.7 — Live Field of View, >60 FPS Physics/Audio/Clock Fixes, Temporal FSR 3.1 & 5K2K Ultrawide
+* **Live Gameplay Field of View (`50%–150%`)** — new **`Insert` → Gameplay → Field of view** slider (bidirectionally synced with **SETTINGS → Display → Field of View** in `MasterSwordLauncher.exe`); adjusts gameplay vertical FOV live while keeping cutscenes and title framing at `100%`
+* **True >60 FPS Physics, Audio, Time-of-Day & Movies** — sub-steps physics solver velocity/position integration so moving platforms carry Link cleanly above 60 FPS, gates `SoundJob` ticks to 60 Hz, fixes high-FPS time-of-day progression, and paces movies accurately
+* **AMD FSR 3.1 on the Shared Temporal Chain + DLSS Recovery** — promotes **FSR 3.1** onto the unified temporal pipeline with character/actor motion vectors and reactive masks, and adds transient NGX DLSS failure recovery
+* **Room-Transition Heap Retry & Cooperative-Matrix Barrier Fix** — prevents `OptimizeChangeBank` heap-exhaustion crashes on scene swaps and fixes `16×2` bright bar artifacts on NVIDIA cooperative-matrix shader paths
+* **Native Mouse Camera Polish, `nn::audio` Aux/Splitter Filters & `5120×2160` Ultrawide** — smoother bow/slingshot aim handoffs and climb camera resets, expanded audio aux/biquad filter support, and native 5K2K (`5120×2160`) 21:9 ultrawide rendering
 
-### ⚡ From 0.1.5e (still here)
-* **Render-target image pooling (`256 MB`) & dedicated `128 MB` VMA target blocks**
-* **Per-slot descriptor reuse & lockless TLS sampler cache** — cuts Vulkan draw-submission CPU overhead at native resolution
-* **Zero-copy submitted-page cache & multi-threaded shadow copies**, reserved OS CPU core, and `--probe-dpi` 1-click launcher update verification
+### 🔥 From 0.1.6 (still here)
+* **Real Hardware NVIDIA NGX DLSS Frame Generation (`nvngx_dlssg.dll`, 2x–4x)** with 3x/4x present-ahead, V-Sync Auto FIFO, and **NVIDIA Reflex active under Frame Generation** (including at Native 1080p/1440p/4K with Upscaling = Off)
+* **Transparency Reactive Mask & Negative LOD Mip Bias**, **AMD FSR 3.1 Frame Interpolation**, **Hardware AVX2/FMA single-precision math**, and 1-click dual NGX SDK installer in the Launcher
 
-### 🧩 From 0.1.5c–0.1.5d (still here)
-* Host reads **`mastersword_options.ini`** first (frame rate cap, output resolution, binds, audio)
+### ⚡ From 0.1.5c–0.1.5e (still here)
+* **Render-target image pooling (`256 MB`), dedicated `128 MB` VMA target blocks, per-slot descriptor reuse & lockless TLS sampler cache**
 * **AMD FSR 4** Upscaling row (FidelityFX SDK 2.4 runtime shipped for Windows AMD GPUs), V-Sync, mesh shaders, uncapped FPS, fullscreen 4K Insert menu scaling
 
 ### 🖥️ Launcher (`MasterSwordLauncher.exe`)
@@ -67,10 +65,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.6)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.7)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.6-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.6/SteelTemple-MasterSword-0.1.6-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.7-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.7/SteelTemple-MasterSword-0.1.7-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -89,11 +87,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.6-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.6/SteelTemple-MasterSword-0.1.6-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.6`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.1.7-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.7/SteelTemple-MasterSword-0.1.7-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.7`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.6/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.7/MasterSwordLauncher.exe)**
 
 ---
 
