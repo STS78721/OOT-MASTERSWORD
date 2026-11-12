@@ -31,15 +31,23 @@ We aim for a **native, flagship PC experience**:
 
 ---
 
-## 🎮 What's in 0.1.9
+## 🎮 What's in 0.1.9b
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.9**
+* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.9b**
 * SteelTempSaint logo on the startup screen & safe 1080p vendor-neutral out-of-the-box defaults
+
+### 🚀 0.1.9b — Smoother area traversal
+* **Area changes** — when the card is nearly full, cold textures are cleared before a large new texture is created, and texture reshuffling waits until the new area has finished streaming in.
+* **Old areas** — an import that is mostly unused after a scene change is cut down to the live part. The picture in the new area is kept.
+* **Smaller memory copies** — imports are 4 MB instead of 16 MB on cards that keep a video-memory mirror, so empty padding no longer counts as used memory.
+* **Helpers come back** — write-back copies dropped under memory pressure are rebuilt once there is room, so one tight scene does not leave the rest of the session heavy.
+* A hitch can still happen inside town. Traversal between areas is the part this update improves.
+* **Mastersword Pacer (Experimental)** stays Off until you turn it on. **V-Sync Mailbox** stays the new-install default.
 
 ### 🚀 0.1.9 — Frame generation, Mastersword Pacer, Mailbox
 * **Frame Generation** makes the multiplier you select. MasterSword 2x/3x/4x/6x/8x. DLSS MFG 2x/3x/4x/6x. Nodix SMFG and Apex FG (Fast) 2x–6x, including 5x. XeSS MFG 2x/3x/4x. FSR 3.1 FG is 2x.
@@ -72,10 +80,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.9)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.9b)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.9-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9/SteelTemple-MasterSword-0.1.9-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.9b-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9b/SteelTemple-MasterSword-0.1.9b-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -95,11 +103,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.9-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9/SteelTemple-MasterSword-0.1.9-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.9`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.1.9b-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9b/SteelTemple-MasterSword-0.1.9b-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.9b`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9b/MasterSwordLauncher.exe)**
 
 ---
 
