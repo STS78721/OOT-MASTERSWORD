@@ -26,35 +26,33 @@
 We aim for a **native, flagship PC experience**:
 - **Next-Gen Immersion** — DualSense support with tactile feedback, native mouse camera, live gameplay FOV (`50%–150%`), and selectable glyph layouts
 - **Modern presentation** — **NVIDIA DLSS Super Resolution & Hardware Multi-Frame Generation (2x–4x)**, **AMD FSR 4 & FSR 3.1 FG**, MasterSword / Nodix frame gen, SMAA, colour grading, **5K2K (`5120×2160`) ultrawide**, **NVIDIA Reflex** (active even with Frame Generation!)
-- **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, true >60 FPS physics/audio/clock accuracy, and native-resolution CPU/FMA/VRAM optimizations
+- **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, true >60 FPS physics/audio/clock accuracy, shipped zero-stutter pipeline precompilation, and native-resolution CPU/AVX2/VRAM optimizations
 - **Community workflow** — SteelTemple Sony/Nixxes-style launcher (safe 1080p out-of-the-box baseline, settings outside the game, 1-click auto-updates, save vault, mod manager)
 
 ---
 
-## 🎮 What's in 0.1.7
+## 🎮 What's in 0.1.8
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.7**
+* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.8**
 * SteelTempSaint logo on the startup screen & safe 1080p vendor-neutral out-of-the-box defaults
 
-### 🚀 0.1.7 — Live Field of View, >60 FPS Physics/Audio/Clock Fixes, Temporal FSR 3.1 & 5K2K Ultrawide
-* **Live Gameplay Field of View (`50%–150%`)** — new **`Insert` → Gameplay → Field of view** slider (bidirectionally synced with **SETTINGS → Display → Field of View** in `MasterSwordLauncher.exe`); adjusts gameplay vertical FOV live while keeping cutscenes and title framing at `100%`
-* **True >60 FPS Physics, Audio, Time-of-Day & Movies** — sub-steps physics solver velocity/position integration so moving platforms carry Link cleanly above 60 FPS, gates `SoundJob` ticks to 60 Hz, fixes high-FPS time-of-day progression, and paces movies accurately
-* **AMD FSR 3.1 on the Shared Temporal Chain + DLSS Recovery** — promotes **FSR 3.1** onto the unified temporal pipeline with character/actor motion vectors and reactive masks, and adds transient NGX DLSS failure recovery
-* **Room-Transition Heap Retry & Cooperative-Matrix Barrier Fix** — prevents `OptimizeChangeBank` heap-exhaustion crashes on scene swaps and fixes `16×2` bright bar artifacts on NVIDIA cooperative-matrix shader paths
-* **Native Mouse Camera Polish, `nn::audio` Aux/Splitter Filters & `5120×2160` Ultrawide** — smoother bow/slingshot aim handoffs and climb camera resets, expanded audio aux/biquad filter support, and native 5K2K (`5120×2160`) 21:9 ultrawide rendering
+### 🚀 0.1.8 — Major CPU/GPU Performance, Zero-Stutter Precompilation & Cross-PC Frame-Pacing Overhaul
+* **Hot/Cold Recompiled Code Split (`-O2`) & `.text` Call-Locality Packing** — isolates `728` hot lifted functions (`99.1%` of CPU execution) with inlined FP fast paths and orders `4,513` hot call-graph neighbours contiguously at the start of `.text`, slashing instruction-cache & iTLB misses
+* **Shipped `HKSTATE2` Pipeline State List (`41,839` Pipelines)** — bundles `hookshot_pipeline_states_shipped.bin` with upgrade-aware startup pre-warming so pipelines compile ahead of time instead of stuttering in combat or new areas
+* **Zero Recycled Render-Target Upload Spikes & ~10–15× Fewer Mirror-Sync Copies** — eliminates 12–17 ms `8–32 MB` CPU unswizzle spikes over finalized GPU render targets and coalesces contiguous 4 KB capture-to-mirror `VkBufferCopy` transfers
+* **AVX2 Dirty-RAM `VPTEST` Scanner, Bloom-Filtered Multi-Wait Sync & Vendor-Smart Barriers** — faster write-watch page scanning, lighter kernel thread wakes, 1-in-4 GPU timestamp sampling, and tighter Vulkan render-pass/compute barriers
+* **Windows 11 Hybrid P-Core / MMCSS Scheduling, RomFS Handle Cache & Live 6–8 GB VRAM Guardrail** — pins frame-critical and audio threads onto P-cores / V-Cache CCDs via MMCSS + per-thread Anti-EcoQoS, caches 64 read-only RomFS handles across room transitions, and dynamically trims idle buffer mirrors when live VRAM crosses 85%
 
-### 🔥 From 0.1.6 (still here)
-* **Real Hardware NVIDIA NGX DLSS Frame Generation (`nvngx_dlssg.dll`, 2x–4x)** with 3x/4x present-ahead, V-Sync Auto FIFO, and **NVIDIA Reflex active under Frame Generation** (including at Native 1080p/1440p/4K with Upscaling = Off)
-* **Transparency Reactive Mask & Negative LOD Mip Bias**, **AMD FSR 3.1 Frame Interpolation**, **Hardware AVX2/FMA single-precision math**, and 1-click dual NGX SDK installer in the Launcher
+### 🏹 From 0.1.7 (still here)
+* **Live Gameplay Field of View (`50%–150%`)**, **>60 FPS moving-platform physics, 60 Hz SoundJob gating, time-of-day & movie pacing fixes**, **AMD FSR 3.1 on the shared temporal chain**, **room-transition heap retry**, and **`5120×2160` (5K2K) 21:9 ultrawide**
 
-### ⚡ From 0.1.5c–0.1.5e (still here)
-* **Render-target image pooling (`256 MB`), dedicated `128 MB` VMA target blocks, per-slot descriptor reuse & lockless TLS sampler cache**
-* **AMD FSR 4** Upscaling row (FidelityFX SDK 2.4 runtime shipped for Windows AMD GPUs), V-Sync, mesh shaders, uncapped FPS, fullscreen 4K Insert menu scaling
+### 🔥 From 0.1.6 & 0.1.5c–0.1.5e (still here)
+* **Real Hardware NVIDIA NGX DLSS Frame Generation (`nvngx_dlssg.dll`, 2x–4x)** + **NVIDIA Reflex**, **AMD FSR 4 & FSR 3.1 FG**, **Transparency Reactive Mask**, **Render-target image pooling (`256 MB`)**, and **1-click NGX SDK installer**
 
 ### 🖥️ Launcher (`MasterSwordLauncher.exe`)
 * **PLAY / SETTINGS / DIGITAL EXTRAS** over Master Sword key art
@@ -65,10 +63,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.7)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.8)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.7-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.7/SteelTemple-MasterSword-0.1.7-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.8-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.8/SteelTemple-MasterSword-0.1.8-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -79,19 +77,20 @@ C:\Games\MasterSword\
 ├── MasterSwordLauncher.exe
 ├── mastersword.exe
 ├── mastersword_vk.dll
-├── amd_fidelityfx_*_vk.dll   <-- FSR 4 (AMD)
-├── ngx\                      <-- DLSS SR + DLSS-G (installed via Launcher)
-├── mastersword_options.ini   <-- SETTINGS / first run (defaults to safe 1080p)
-├── image.bin + romfs\        <-- YOUR dump
+├── hookshot_pipeline_states_shipped.bin  <-- 41,839 pre-baked pipeline states
+├── amd_fidelityfx_*_vk.dll               <-- FSR 4 (AMD)
+├── ngx\                                  <-- DLSS SR + DLSS-G (installed via Launcher)
+├── mastersword_options.ini               <-- SETTINGS / first run (defaults to safe 1080p)
+├── image.bin + romfs\                    <-- YOUR dump
 └── runtime DLLs …
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.7-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.7/SteelTemple-MasterSword-0.1.7-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.7`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.1.8-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.8/SteelTemple-MasterSword-0.1.8-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.8`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.7/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.8/MasterSwordLauncher.exe)**
 
 ---
 
