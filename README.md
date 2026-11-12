@@ -43,7 +43,7 @@ We aim for a **native, flagship PC experience**:
 
 ### 🚀 0.1.9 — Frame generation, Mastersword Pacer, Mailbox
 * **Frame Generation** makes the multiplier you select. MasterSword 2x/3x/4x/6x/8x. DLSS MFG 2x/3x/4x/6x. Nodix SMFG and Apex FG (Fast) 2x–6x, including 5x. XeSS MFG 2x/3x/4x. FSR 3.1 FG is 2x.
-* **Mastersword Pacer (Experimental)** is on the Graphics tab, On by default. It holds the game's own frames to an even beat.
+* **Mastersword Pacer (Experimental)** is on the Graphics tab and Off by default. Turn it on to hold the game's own frames to an even beat.
 * **V-Sync** is On, Mailbox, or Off. Mailbox is the default on a new install. A saved On or Off is kept.
 * **Streaming upload hitch** — a one-off GPU unswizzle no longer imports a whole pool on the replay thread (Deku Tree camera turns). Same pixels.
 * **Apex FG (Fast)** — recommended row; tighter motion search when that engine is on. The DLSS frame-gen model row appears only for DLSS MFG. Apex Super Resolution is not in this update.
