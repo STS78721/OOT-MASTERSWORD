@@ -25,23 +25,32 @@
 
 We aim for a **native, flagship PC experience**:
 - **Next-Gen Immersion** — DualSense support with tactile feedback, native mouse camera, live gameplay FOV (`50%–150%`), and selectable glyph layouts
-- **Modern presentation** — **NVIDIA DLSS Super Resolution & Hardware Multi-Frame Generation (2x–4x)**, **AMD FSR 4 & FSR 3.1 FG**, MasterSword / Nodix frame gen, SMAA, colour grading, **5K2K (`5120×2160`) ultrawide**, **NVIDIA Reflex** (active even with Frame Generation!)
+- **Modern presentation** — **NVIDIA DLSS Super Resolution & Multi Frame Generation (2x/3x/4x/6x)**, **AMD FSR 4 & FSR 3.1 FG (2x)**, **MasterSword frame generation up to 8x**, **Nodix SMFG and Apex FG up to 6x**, Mailbox by default, SMAA, colour grading, **5K2K (`5120×2160`) ultrawide**, **NVIDIA Reflex** (active even with Frame Generation)
 - **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, true >60 FPS physics/audio/clock accuracy, shipped zero-stutter pipeline precompilation, and native-resolution CPU/AVX2/VRAM optimizations
 - **Community workflow** — SteelTemple Sony/Nixxes-style launcher (safe 1080p out-of-the-box baseline, settings outside the game, 1-click auto-updates, save vault, mod manager)
 
 ---
 
-## 🎮 What's in 0.1.8
+## 🎮 What's in 0.1.9
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.8**
+* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.9**
 * SteelTempSaint logo on the startup screen & safe 1080p vendor-neutral out-of-the-box defaults
 
-### 🚀 0.1.8 — Major CPU/GPU Performance, Zero-Stutter Precompilation & Cross-PC Frame-Pacing Overhaul
+### 🚀 0.1.9 — Frame generation, Mastersword Pacer, Mailbox
+* **Frame Generation** makes the multiplier you select. MasterSword 2x/3x/4x/6x/8x. DLSS MFG 2x/3x/4x/6x. Nodix SMFG and Apex FG (Fast) 2x–6x, including 5x. XeSS MFG 2x/3x/4x. FSR 3.1 FG is 2x.
+* **Mastersword Pacer (Experimental)** is on the Graphics tab, On by default. It holds the game's own frames to an even beat.
+* **V-Sync** is On, Mailbox, or Off. Mailbox is the default on a new install. A saved On or Off is kept.
+* **Streaming upload hitch** — a one-off GPU unswizzle no longer imports a whole pool on the replay thread (Deku Tree camera turns). Same pixels.
+* **Apex FG (Fast)** — recommended row; tighter motion search when that engine is on. The DLSS frame-gen model row appears only for DLSS MFG. Apex Super Resolution is not in this update.
+* **Left / Right stick speed** — Controls, default 100% (stock).
+* **Parallel replay stays off** unless `RX_VK_PARALLEL` is set.
+
+### 🏹 From 0.1.8 (still here)
 * **Hot/Cold Recompiled Code Split (`-O2`) & `.text` Call-Locality Packing** — isolates `728` hot lifted functions (`99.1%` of CPU execution) with inlined FP fast paths and orders `4,513` hot call-graph neighbours contiguously at the start of `.text`, slashing instruction-cache & iTLB misses
 * **Shipped `HKSTATE2` Pipeline State List (`41,839` Pipelines)** — bundles `hookshot_pipeline_states_shipped.bin` with upgrade-aware startup pre-warming so pipelines compile ahead of time instead of stuttering in combat or new areas
 * **Zero Recycled Render-Target Upload Spikes & ~10–15× Fewer Mirror-Sync Copies** — eliminates 12–17 ms `8–32 MB` CPU unswizzle spikes over finalized GPU render targets and coalesces contiguous 4 KB capture-to-mirror `VkBufferCopy` transfers
@@ -63,10 +72,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.8)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.9)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.8-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.8/SteelTemple-MasterSword-0.1.8-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.9-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9/SteelTemple-MasterSword-0.1.9-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -86,11 +95,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.8-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.8/SteelTemple-MasterSword-0.1.8-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.8`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.1.9-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9/SteelTemple-MasterSword-0.1.9-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.9`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.8/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9/MasterSwordLauncher.exe)**
 
 ---
 
