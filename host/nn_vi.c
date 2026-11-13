@@ -18,13 +18,26 @@ static volatile LONG nvsync;
 static HANDLE vsync_thread;
 
 static int fps_max(void);   /* (below: HOS_FPS_MAX) */
+/* The high-resolution timer wakes about 0.5 ms early. One sleep then lets a 60 cap present at 62-63, and the
+   next frame waits the remainder: the hitch. Sleep the bulk, then yield up to the deadline. */
+static void wait_until(int64_t until) {
+    for (;;) {
+        const int64_t now = hos_now_ns();
+        if (now >= until) return;
+        const int64_t left = until - now;
+        if (left > 2000000) hos_sleep_ns(left - 1000000);
+        else {
+            while (hos_now_ns() < until) SwitchToThread();
+            return;
+        }
+    }
+}
 static DWORD WINAPI vsync_main(void *p) {
     (void)p;
     const int64_t period = 1000000000LL / fps_max();
     int64_t next = hos_now_ns() + period;
     for (;;) {
-        const int64_t now = hos_now_ns();
-        if (next > now) hos_sleep_ns(next - now);
+        wait_until(next);
         next += period;
         if (next < hos_now_ns()) next = hos_now_ns() + period;   /* (fell behind: no burst of vsyncs) */
         for (LONG i = 0; i < nvsync; i++) hos_system_event_signal(vsync_events[i]);
@@ -107,24 +120,28 @@ HLE(_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE) {
    interval's vsyncs (1: 60 fps, 2: 30) after the last present, so the game runs at the display's rate.
    HOS_NO_PACING=1: as fast as it can. */
 static volatile int present_interval = 1;
-/* (hookshot) HOS_FPS_MAX=<61-240>: the frame rate cap past the console's 60 (opt-in, a test): the display pacing's interval, the game's
-   own limiter (+0xfc) and the real-time step's rate (+0x2c8, game time = 60 / rate a frame) all go up to it, so the game is not sped up.
-   Unset or 60: 60, as on the console */
+/* (hookshot) Frame rate cap past 60 (Insert menu Game frame rate cap / HOS_FPS_MAX): pacing, the game's limiter and
+   vsync event follow it; time step is the frames' own (realtime_step). Uncapped is 1000 fps (1 ms pacing). Unset/60: console. */
 int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c) */
 static int fps_max(void) {
+    enum { FPS_UNCAPPED = 1000 };
     static int v = -1;
     if (v < 0) {
-        /* (the Insert menu's Frame rate cap, frame_rate_cap=: 0 the console's 60, then 90, 120, 144, 165, 240; HOS_FPS_MAX over it) */
-        static const int caps[] = {60, 90, 120, 144, 165, 240};
+        /* frame_rate_cap=: 0..5 = 60..240, 6 Uncapped; unknown -> 60. HOS_FPS_MAX over it */
+        static const int caps[] = {60, 90, 120, 144, 165, 240, FPS_UNCAPPED};
+        enum { CAPS = sizeof caps / sizeof caps[0] };
         const int i = hos_ini_option("frame_rate_cap", 0);
         const char *e = getenv("HOS_FPS_MAX");
-        const int want = e ? atoi(e) : caps[i >= 0 && i < 6 ? i : 0];
-        v = want > 60 ? (want > 240 ? 240 : want) : 60;
-        if (v > 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
+        const int want = e ? atoi(e) : caps[i >= 0 && i < CAPS ? i : 0];
+        v = want > 60 ? (want > FPS_UNCAPPED ? FPS_UNCAPPED : want) : 60;
+        if (v == FPS_UNCAPPED) hos_log("vi: frame rate uncapped: pacing, the game's limiter and its time step follow the frames");
+        else if (v > 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
     }
     return v;
 }
 static int64_t next_frame_at, window_start, frames_in_window;
+/* Mastersword Pacer: when acquire returned and this frame's work began. Present reads it and does not sleep. */
+static int64_t ms_pace_started;
 static volatile LONG64 presents;
 int hos_vi_native_interval(Ctx *c, int requested) {
     (void)c;
@@ -154,14 +171,19 @@ void hos_vi_native_acquire(int active) {
     static int no_pacing = -1, double_buffered = -1;
     if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
     if (double_buffered < 0) double_buffered = getenv("HOS_VI_DOUBLE") != NULL;
-    if (no_pacing || !next_frame_at) return;
-    int64_t until = next_frame_at;
-    if (!double_buffered && active >= 2) {
-        const int64_t n = shown_count, frame = n - active + 1;   /* (the frame whose showing frees this texture) */
-        until = frame >= 0 && frame < n ? shown_at[frame & 15] : 0;
+    /* Mastersword Pacer waits here, before the frame's work. next_frame_at is the start that lands the present
+       on the beat. The texture time is how long the console would still be showing an older frame. A start already
+       in the past is not held for another whole interval. */
+    if (!no_pacing && next_frame_at) {
+        int64_t until = next_frame_at;
+        if (!double_buffered && active >= 2) {
+            const int64_t n = shown_count, frame = n - active + 1;   /* (the frame whose showing frees this texture) */
+            const int64_t tex = frame >= 0 && frame < n ? shown_at[frame & 15] : 0;
+            if (tex > until) until = tex;
+        }
+        wait_until(until);
     }
-    const int64_t now = hos_now_ns();
-    if (until > now) hos_sleep_ns(until - now);
+    ms_pace_started = hos_now_ns();
 }
 /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
@@ -221,6 +243,54 @@ static float text_scale(const char *env, int menu) {
     const int v = env && *env ? atoi(env) : menu;
     return v == 1 ? 2.0f : v == 2 ? 4.0f : v >= 3 ? 1e6f : 1.0f;
 }
+volatile uint64_t hos_step_probe = 0;   /* (f_80706be0's object; +0xd58 game clock: nx2/oot_patches.py) */
+volatile uint32_t hos_frame_seconds_bits = 0;   /* (frame seconds as float bits for the step hook; 0: game's own step) */
+/* A movie's frame count while the frames' time is given (a Frame rate cap above 60): how many 60ths of a second this update of
+   that movie player is worth, the rest carried to its next one (issue 1742). Called by lifted f_83b7c710. */
+uint32_t hos_movie_frames(uint64_t player) {
+    enum { PLACES = 16 };
+    const uint32_t bits = __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED);
+    if (!bits) return 1;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static int timed = -1;
+    static struct { uint64_t player, used; double part; } carry[PLACES];
+    static uint64_t calls;
+    static unsigned made;
+    float secs;
+    uint32_t n = 1;
+    memcpy(&secs, &bits, 4);
+    AcquireSRWLockExclusive(&lock);
+    if (timed < 0) timed = !(getenv("HOS_FPS_MOVIE") && !atoi(getenv("HOS_FPS_MOVIE")));
+    if (timed) {
+        int i = 0;
+        while (i < PLACES && carry[i].player != player) i++;
+        if (i == PLACES) {
+            uint32_t x = made++;
+            x ^= x >> 16, x *= 0x85ebca6bu, x ^= x >> 13, x *= 0xc2b2ae35u, x ^= x >> 16;
+            i = 0;
+            for (int k = 1; k < PLACES; k++)
+                if (carry[k].used < carry[i].used) i = k;
+            carry[i].player = player, carry[i].part = x / 4294967296.0;
+        }
+        carry[i].used = ++calls;
+        carry[i].part += (double)secs * 60.0;
+        n = (uint32_t)carry[i].part;
+        carry[i].part -= n;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return n;
+}
+/* (nx2/oot_patches.py patch_whole_frames) the whole frames a game counter at `at` takes for an amount of the frame step (its
+   float's bits): with the frames' own time as the step, their fractions carried per counter; else cut as the game cuts it */
+#include "frame_whole.h"
+static FrameWhole frame_whole_state;
+static SRWLOCK frame_whole_lock = SRWLOCK_INIT;   /* (the game's update threads) */
+uint32_t hos_frame_whole(uint64_t at, uint64_t amount_bits) {
+    AcquireSRWLockExclusive(&frame_whole_lock);
+    const uint32_t whole = frame_whole(&frame_whole_state, at, amount_bits, __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED) != 0);
+    ReleaseSRWLockExclusive(&frame_whole_lock);
+    return whole;
+}
 volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is the 3D's scale: nx2/oot_patches.py) */
 static void realtime_step(int64_t now) {
     int rx_option(int id, int otherwise);
@@ -275,8 +345,22 @@ static void realtime_step(int64_t now) {
             hos_log("vi: frame limiter %d, vrr %d %d, nominal %d, controller +0x58.. %d %d %d %d", *limit, *(uint8_t *)GP(mod + 0x231),
                     *(uint8_t *)GP(mod + 0x232), *(int *)GP(mod + 0x2c8), *(int *)GP(mod + 0x270 + 0x58), *(int *)GP(mod + 0x270 + 0x28),
                     *(int *)GP(mod + 0x270 + 0x2c), *(int *)GP(mod + 0x270 + 0x30));
+        if (log_on && !((n - 1) % 300) && hos_step_probe) {
+            static double clock_before;
+            static int64_t at_before;
+            double game_clock;
+            memcpy(&game_clock, GP(hos_step_probe + 0xd58), 8);
+            if (at_before && now > at_before) {
+                const double rate = (game_clock - clock_before) * 1e9 / (double)(now - at_before);
+                hos_log("vi: game clock %.1f: %.2f a second of wall time (speed %.3f) at %.1f fps", game_clock, rate, rate / 60.0,
+                        300e9 / (double)(now - at_before));
+            }
+            clock_before = game_clock, at_before = now;
+        }
         if (target && *limit > 0 && *limit < target) *limit = target;
         if (fps_max() > 60 && *limit > 0 && *limit < fps_max()) *limit = fps_max();
+        /* A cap of 60 still lets the game write 62-63 into its own limiter. That is the burst, then the hitch. */
+        if (*limit > fps_max()) *limit = fps_max();
     }
     /* (the Insert menu's Game speed "per frame": a frame is a 60th of a second of game time. Not past 60 fps: the game would run
        faster than real time, so a cap above 60 keeps the real-time step whatever that row says) */
@@ -302,11 +386,25 @@ static void realtime_step(int64_t now) {
     if (count < (unsigned)window) count++;
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
+    /* Cap >60: publish measured frame seconds for the lift hook; keep engine nominal ≤60. HOS_FPS_STEP=0: old path. */
+    static int timed_step = -1;
+    if (timed_step < 0) timed_step = !(getenv("HOS_FPS_STEP") && !atoi(getenv("HOS_FPS_STEP")));
+    const int timed = fps_max() > 60 && timed_step && hos_step_probe;
+    if (timed) {
+        const double secs = sum / count, shortest = 1.0 / (fps_max() > 240 ? fps_max() : 240);
+        const float f = (float)(secs > 4.0 / 60.0 ? 4.0 / 60.0 : secs < shortest ? shortest : secs);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        __atomic_store_n(&hos_frame_seconds_bits, bits, __ATOMIC_RELAXED);   /* (read by the game's threads) */
+    } else {
+        __atomic_store_n(&hos_frame_seconds_bits, 0, __ATOMIC_RELAXED);
+    }
+    const int top = timed ? 60 : fps_max();
     double ratio = sum / count * 60.0 + carry;
-    const double least = 60.0 / fps_max();
+    const double least = 60.0 / top;
     ratio = ratio < least ? least : ratio > 4.0 ? 4.0 : ratio;
     int fps = (int)(60.0 / ratio + 0.5);
-    fps = fps < 15 ? 15 : fps > fps_max() ? fps_max() : fps;
+    fps = fps < 15 ? 15 : fps > top ? top : fps;
     int *slot = (int *)GP(mod + 0x2c8);
     if (*slot < 15 || *slot > fps_max()) {
         static int logged;
@@ -356,8 +454,45 @@ void hos_vi_native_presented(void) {
     }
     const int64_t period = 1000000000LL / fps_max() * present_interval, now = hos_now_ns();
     realtime_step(now);
-    /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */
-    next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now + period;
+    /* Mastersword Pacer. The beat is a present time. Acquire waits until that beat minus the short recent frames,
+       so a fast frame after a late one still lands on the period. More than 2 ms late starts a new beat one period
+       ahead and does not sleep the next frame for a full interval. No sleep in this function: present holds the
+       game's locks. */
+    {
+        static int no_pacing = -1;
+        static int64_t due, work_ns, samples[8];
+        static int sample_n, sample_fill;
+        if (no_pacing < 0) no_pacing = getenv("HOS_NO_PACING") != NULL;
+        if (no_pacing) next_frame_at = 0;
+        else {
+            int rx_option(int id, int otherwise);
+            const int on = rx_option(HOS_OPT_MS_PACER, 0);
+            static int last = -1;
+            if (on != last) last = on, hos_log("vi: Mastersword Pacer %s", on ? "on" : "off");
+            if (!on) {
+                due = 0;
+                /* The previous cap: on the grid unless this present is a full period late, then the next frame may start now. */
+                next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now;
+            } else {
+            if (ms_pace_started && now > ms_pace_started) {
+                const int64_t work = now - ms_pace_started;
+                if (work >= 1000000 && work <= period) {
+                    samples[sample_n++ & 7] = work;
+                    if (sample_fill < 8) sample_fill++;
+                    int64_t low = samples[0];
+                    for (int i = 1; i < sample_fill; i++) if (samples[i] < low) low = samples[i];
+                    work_ns = low;
+                }
+            }
+            const int64_t slack = 2000000;   /* 2 ms: inside this, the beat stays */
+            if (!due || now - due > slack) due = now + period;
+            else due += period;
+            int64_t start = work_ns ? due - work_ns : now;
+            if (start < now) start = now;
+            next_frame_at = start;
+            }
+        }
+    }
     {   /* (the display queue: this frame is shown one interval after the last, or now when the display waits) */
         const int64_t n = shown_count, last = n ? shown_at[(n - 1) & 15] : 0;
         shown_at[n & 15] = last + period > now ? last + period : now;

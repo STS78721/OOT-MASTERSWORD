@@ -63,6 +63,8 @@ def patch_life(source):
     start = source.find(LIFE_HEAD)
     if start < 0:
         return None
+    if "hos_oot_hearts_enabled()" in source:
+        return source
     end = source.find("\n}", start)
     if end < 0 or source[start:end].count(LIFE_CAS) != 2:
         return None
@@ -81,6 +83,8 @@ def patch_movement(source):
     start = source.find(MOVE_HEAD)
     if start < 0:
         return None
+    if "hos_oot_lift_player(" in source:
+        return source
     end = source.find("\n}", start)
     if end < 0 or source[start:end].count(MOVE_ANCHOR) != 1 or source[start:end].count(MOVE_MATRIX) != 1:
         return None
@@ -98,6 +102,8 @@ def patch_flight_rotation(source):
     start = source.find(WARP_HEAD)
     if start < 0:
         return None
+    if "hos_oot_flight_rotation(" in source:
+        return source
     end = source.find("\n}", start)
     body = source[start:end]
     if end < 0 or body.count(WARP_ANCHOR) != 1:
@@ -112,6 +118,8 @@ def patch_view(source):
     start = source.find(VIEW_HEAD)
     if start < 0:
         return None
+    if "hos_oot_free_view(" in source:
+        return source
     end = source.find("\n}", start)
     body = source[start:end]
     if end < 0:
@@ -163,6 +171,237 @@ def patch_dynres(s):
     return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + DECL, 1)
 
 
+# Frame's real time for Frame rate cap >60 (host/nn_vi.c hos_frame_seconds_bits). Both step divides or neither.
+STEP_SITES = (("void f_80706be0(Ctx *__restrict A64_NOESC c) {\n", 8, "\n    hos_step_probe = c->x[19];"),
+              ("void f_83b6ea90(Ctx *__restrict A64_NOESC c) {\n", 0, ""))
+STEP_OLD = "    _v=a64_fpx_div32_div32(c,_a,_b);\n    a64_vset64(c->vreg[%d],_v);}"
+STEP_HOOK = ("    _v=a64_fpx_div32_div32(c,_a,_b);\n"
+             "    { const uint32_t _hs = hos_frame_seconds_bits; if (_hs) { float _base, _secs; uint32_t _w; memcpy(&_base,&_a,4); "
+             "memcpy(&_secs,&_hs,4); _base *= _secs; memcpy(&_w,&_base,4); _v = _w; } }   /* (base * the frame's seconds: nx2/oot_patches.py) */\n"
+             "    a64_vset64(c->vreg[%d],_v);}")
+STEP_MARK = "hos_frame_seconds_bits; if (_hs)"
+STEP_DECL = "extern volatile uint32_t hos_frame_seconds_bits;\nextern volatile uint64_t hos_step_probe;\n"
+
+
+def patch_frame_seconds(s):
+    """Host frame time at f_80706be0 / f_83b6ea90 step divides. Returns (s, sites_patched)."""
+    done = 0
+    for head_text, reg, extra in STEP_SITES:
+        head = s.find(head_text)
+        if head < 0:
+            continue
+        end = s.find("\nvoid f_", head + len(head_text))
+        body = s[head:end if end >= 0 else len(s)]
+        old, new = STEP_OLD % reg, STEP_HOOK % reg + extra
+        if new in body or body.count(old) != 1 or body.count("a64_fpx_div32_div32") != 1:
+            continue
+        at = head + body.index(old)
+        s = s[:at] + new + s[at + len(old):]
+        done += 1
+    if done and STEP_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + STEP_DECL, 1)
+    return s, done
+
+
+def unpatch_frame_seconds(s):
+    for _, reg, extra in STEP_SITES:
+        s = s.replace(STEP_HOOK % reg + extra, STEP_OLD % reg)
+    return s if STEP_MARK in s else s.replace(STEP_DECL, "", 1)
+
+
+# Game counters that cut a fractional frame step to whole frames with FCVTZS (host/nn_vi.c hos_frame_whole):
+# - f_80a87e50: the pick-up indicator's timer (+864 on x19; issue 1832)
+# - f_800672e0: the water rings Link and actors make in water (per water object x21; #2409)
+# - f_803edf70: the time of day (+60 on x19; #2093)
+WHOLE_SITES = (
+    ("void f_80a87e50(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[12]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@",
+     "c->x[19] + 864"),
+    ("void f_800672e0(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[9]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@",
+     "c->x[21]"),
+    # (the cut with the store after it: the function cuts into x8 the same way once more, in the branch that sets
+    #  the time from another source)
+    ("void f_803edf70(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@"
+     "    recomp_store32(c,c->x[19] + 60,c->x[8]);@",
+     "c->x[19] + 60"),
+)
+WHOLE_SITES = tuple((h.replace("@", "\n"), o.replace("@", "\n"), k) for h, o, k in WHOLE_SITES)
+WHOLE_MARK = "/* (the step's whole frames: nx2/oot_patches.py) */"
+WHOLE_DECL = "extern uint32_t hos_frame_whole(uint64_t at, uint64_t amount_bits);\n"
+
+
+def whole_new(old, key):
+    """old with its cut to whole frames (the one recomp_fp_to_int) made hos_frame_whole's for the counter at key"""
+    lines = old.split("\n")
+    for i, line in enumerate(lines):
+        if "recomp_fp_to_int(c->vreg[0][0]" in line:
+            reg = line.split("=", 1)[0]
+            lines[i] = "%s=hos_frame_whole(%s, (uint32_t)c->vreg[0][0]);   %s" % (reg, key, WHOLE_MARK)
+    return "\n".join(lines)
+
+
+def patch_whole_frames(s):
+    """The counters of WHOLE_SITES take hos_frame_whole's whole frames: (s, the sites patched here)."""
+    done = 0
+    for head_text, old, key in WHOLE_SITES:
+        head = s.find(head_text)
+        if head < 0:
+            continue
+        end = s.find("\n}\n", head)
+        body = s[head:end if end >= 0 else len(s)]
+        new = whole_new(old, key)
+        if new in body or body.count(old) != 1:
+            continue
+        at = head + body.index(old)
+        s = s[:at] + new + s[at + len(old):]
+        done += 1
+    if done and WHOLE_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + WHOLE_DECL, 1)
+    return s, done
+
+
+# Above a Frame rate cap of 60, two places that need whole 60 fps frames (host/oot_high_fps.h has why and the logic; at a cap of
+# 60 the host hands back what the game computed):
+# - the sound manager's job, f_80435300 (phase in w2; phase 0 loads the game step, [[slot]]+0x10, and hands it to the sound
+#   engine): its head asks hos_oot_sound_gate whether to run now (60 Hz above 60 fps, the other phases following phase 0), and
+#   the step it loads goes through hos_oot_sound_step (a whole one while the gate holds the job). After zortos293/Lichii PR #1289
+#   (auz466), which does the same as a code patch for the emulator.
+# - the physics solver's step count, set each update from the frame step in f_838ceb80 and f_838cfc10 (the same code in both):
+#   hos_oot_solver_steps rounds it up instead of down, at least 1, so Link stays on moving platforms (issue 1798).
+SOUND_HEAD = "void f_80435300(Ctx *__restrict A64_NOESC c) {\n"
+SOUND_SLOT = "g_module_base + 0x80435000ULL + (int64_t)75927552"   # (the page of the step's pointer, whose +2192 holds it)
+SOUND_OLD = ("    c->x[8]=" + SOUND_SLOT + ";\n"
+             "    { uint64_t _r = ((uint64_t)0 | ((c->x[0]) << 0)); c->x[19] = _r; }\n"
+             "    c->x[8]=recomp_load64(c,c->x[8] + 2192);\n"
+             "    c->x[8]=recomp_load64(c,c->x[8] + 0);\n"
+             "    { { uint64_t _v=recomp_load32(c,(c->x[8]+16ULL)); a64_vset64(c->vreg[0],_v); } }\n")
+SOUND_NEW = SOUND_OLD.replace("uint64_t _v=recomp_load32(c,(c->x[8]+16ULL));",
+                              "uint64_t _v=hos_oot_sound_step((uint32_t)recomp_load32(c,(c->x[8]+16ULL)));")
+SOUND_GATE = ("    if (!hos_oot_sound_gate(c, (uint32_t)c->x[2], " + SOUND_SLOT + " + 2192)) return;"
+              "   /* (nx2/oot_patches.py: the sound job at 60 Hz above 60 fps) */\n")
+SOUND_DECL = "extern int hos_oot_sound_gate(Ctx *c, uint32_t phase, uint64_t slot);\nextern uint32_t hos_oot_sound_step(uint32_t step_bits);\n"
+SOLVER_HEADS = ("void f_838ceb80(Ctx *__restrict A64_NOESC c) {\n", "void f_838cfc10(Ctx *__restrict A64_NOESC c) {\n")
+# (the cut of frame step * steps a frame + 0.001, then its store into the solver: vreg 0 the float cut, vreg 1 the steps a frame)
+SOLVER_OLD = ("    c->x[1]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);\n"
+              "    recomp_store32(c,c->x[0] + 712,c->x[1]);\n")
+SOLVER_NEW = SOLVER_OLD.replace(
+    "    recomp_store32(", "    c->x[1]=hos_oot_solver_steps((uint32_t)c->x[1], (uint32_t)c->vreg[0][0], (uint32_t)c->vreg[1][0]);"
+    "   /* (nx2/oot_patches.py: solver steps rounded up above 60 fps) */\n    recomp_store32(", 1)
+SOLVER_DECL = "extern uint32_t hos_oot_solver_steps(uint32_t game, uint32_t scaled_bits, uint32_t per_frame_bits);\n"
+
+
+def _function(s, head_text):
+    """(start, end) of the function whose head is head_text, or None"""
+    head = s.find(head_text)
+    if head < 0:
+        return None
+    end = s.find("\nvoid f_", head + len(head_text))
+    return head, end if end >= 0 else len(s)
+
+
+def patch_sound_job(s):
+    """The sound job's gate and step: (s, 1) when the job is in s with them (made now or before), (s, 0) when it is not here or
+    its code differs (another game version: left as it is)"""
+    at = _function(s, SOUND_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if body.count(SOUND_NEW) == 1 and body.count(SOUND_GATE) == 1:
+        return s, 1
+    if body.count(SOUND_OLD) != 1 or SOUND_GATE in body:
+        return s, 0
+    body = body.replace(SOUND_OLD, SOUND_NEW, 1)
+    body = SOUND_HEAD + SOUND_GATE + body[len(SOUND_HEAD):]
+    s = s[:head] + body + s[end:]
+    if SOUND_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SOUND_DECL, 1)
+    return s, 1
+
+
+def patch_solver_steps(s):
+    """The solver step count's two places: (s, how many of them are in s with the hook, made now or before)"""
+    done = 0
+    for head_text in SOLVER_HEADS:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        if body.count(SOLVER_NEW) == 1:
+            done += 1
+        elif body.count(SOLVER_OLD) == 1:
+            s = s[:head] + body.replace(SOLVER_OLD, SOLVER_NEW, 1) + s[end:]
+            done += 1
+    if done and SOLVER_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SOLVER_DECL, 1)
+    return s, done
+
+
+# (from TomShafford/Hookshot 55d68e8cd6 and 65c1998222) f_804566e0's two calls of f_80522050, the GPU memory a model's material
+# block is made with, made through host/oot_heap_retry.c hos_oot_gpu_alloc, which calls the game's own and tries a full heap's
+# failure again in the heap's parents. f_80522050's other callers stay as they are.
+GPU_ALLOC_SITES = (0x80456f1c, 0x80457098)   # (the calls' return addresses)
+GPU_ALLOC_OLD = "c->x[30] = %#xULL; f_80522050(c);"
+GPU_ALLOC_NEW = "c->x[30] = %#xULL; hos_oot_gpu_alloc(c, f_80522050);   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */"
+GPU_ALLOC_DECL = "void hos_oot_gpu_alloc(Ctx *A64_NOESC c, A64Fn game);\n"
+# f_804566e0's tryAllocs of the CPU buffers at its MatBlock's +200 (its bump allocator's memory) and +168, each sized for the
+# model (x0 the heap, x1 the size, x2 the alignment): a null result tried in the heap's parents (hos_oot_heap_retry)
+HEAP_ALLOC_SITES = (0x80456910, 0x80456da4)
+HEAP_ALLOC_OLD = "{ uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
+HEAP_ALLOC_NEW = ("{ const uint64_t _hh = c->x[0], _hn = c->x[1], _ha = c->x[2];   /* (nx2/oot_patches.py: host/oot_heap_retry.c) */\n"
+                  "  if (hos_oot_heap_refuse()) c->x[0] = 0;\n"
+                  "  else { uint64_t _t = c->x[8]; c->x[30] = %#xULL; A64_ICALL(c, _t); }\n"
+                  "  if (!c->x[0]) hos_oot_heap_retry(c, _hh, _hn, _ha, %#xULL); }\n")
+HEAP_ALLOC_DECL = "int hos_oot_heap_refuse(void);\nvoid hos_oot_heap_retry(Ctx *c, uint64_t heap, uint64_t size, uint64_t align, uint64_t lr);\n"
+
+
+def patch_heap_retry(s):
+    """The four places above in one file's text: (text, [GPU sites, CPU sites] made now or found made). apply() wants
+    [2, 2] over the whole lift and warns otherwise"""
+    found = [0, 0]
+    decls = []
+    for kind, sites, old, new, decl in ((0, GPU_ALLOC_SITES, GPU_ALLOC_OLD, GPU_ALLOC_NEW, GPU_ALLOC_DECL),
+                                        (1, HEAP_ALLOC_SITES, HEAP_ALLOC_OLD, HEAP_ALLOC_NEW, HEAP_ALLOC_DECL)):
+        for lr in sites:
+            o, n = old % lr, (new % lr if kind == 0 else new % (lr, lr))
+            if n in s:
+                found[kind] += 1
+            elif s.count(o) == 1 and s.count('#include "a64.h"\n') == 1:
+                s = s.replace(o, n, 1)
+                found[kind] += 1
+                if decl not in decls:
+                    decls.append(decl)
+    for decl in decls:
+        if decl not in s:
+            s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + decl, 1)
+    return s, found
+
+
+# A movie's frame count above a 60 cap (issue 1742): hos_movie_frames in host/nn_vi.c.
+MOVIE_HEAD = "void f_83b7c710(Ctx *__restrict A64_NOESC c) {\n"
+MOVIE_OLD = ("    c->x[8]=recomp_load32(c,c->x[20] + 760);\n"
+             "    { uint64_t _a=c->x[8], _b=1ULL; uint64_t _r=_a+_b; _r&=0xFFFFFFFFULL; c->x[8]=_r; }\n")
+MOVIE_NEW = MOVIE_OLD.replace("_b=1ULL", "_b=hos_movie_frames(c->x[20])")
+MOVIE_DECL = "uint32_t hos_movie_frames(uint64_t player);\n"
+
+
+def patch_movie_frames(s):
+    """The movie player's count by the frames' time; None when the file has no such function."""
+    head = s.find(MOVIE_HEAD)
+    if head < 0:
+        return None
+    end = s.find("\nvoid f_", head + len(MOVIE_HEAD))
+    body = s[head:end if end >= 0 else len(s)]
+    if body.count(MOVIE_OLD) != 1:
+        return s
+    at = head + body.index(MOVIE_OLD)
+    s = s[:at] + MOVIE_NEW + s[at + len(MOVIE_OLD):]
+    return s if MOVIE_DECL in s else s.replace('#include "a64.h"\n', '#include "a64.h"\n' + MOVIE_DECL, 1)
+
+
 def patch_text_speed(s):
     """The scale at the head of the letters' block of f_80b1e140; None when the file has no such function, s unchanged when the
     function is there but its code differs (another game version)."""
@@ -190,13 +429,18 @@ def apply(gen, *, protect_hearts=False, required=False):
     The other patches only warn when their place is not found once."""
     import oot_native_resolution   # (HOS_SCENE_NATIVE=1: the scene's base scale 1.0; off by default since #849's output resolution)
     oot_native_resolution.apply(gen)
-    done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0}
+    done = {"dynamic resolution branch": 0, "text speed block": 0, "fixed path's scale": 0, "movie's frame count": 0}
     if protect_hearts:
         done["player heart protection"] = 0
         done["player flight"] = 0
         done["player flight rotation"] = 0
         done["free camera"] = 0
         done["mouse camera"] = 0
+    step_sites, step_files = 0, []
+    whole_sites = 0
+    sound_jobs = 0
+    solver_sites = 0
+    heap_sites = [0, 0]
     for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -211,6 +455,13 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = t
             done["text speed block"] += 1
             print("oot_patches: text speed scale in", os.path.basename(path))
+        movie = patch_movie_frames(out)
+        if movie is not None:
+            if MOVIE_NEW in movie:
+                done["movie's frame count"] += 1
+            if movie != out:
+                print("oot_patches: the movie's frame count by the frames' time in", os.path.basename(path))
+            out = movie
         out, n = fixed_scale(out)
         if n:
             done["fixed path's scale"] += 1
@@ -240,11 +491,53 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = view
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
+        out, sites = patch_frame_seconds(out)
+        if STEP_MARK in out:
+            step_sites += out.count(STEP_MARK)
+            step_files.append(path)
+        if sites:
+            print("oot_patches: the frame's time at %d step divide(s) in %s" % (sites, os.path.basename(path)))
+        out, whole = patch_whole_frames(out)
+        whole_sites += out.count(WHOLE_MARK)
+        if whole:
+            print("oot_patches: %d frame counter(s) with the step's whole frames in %s" % (whole, os.path.basename(path)))
+        sound, found_sound = patch_sound_job(out)
+        sound_jobs += found_sound
+        if sound != out:
+            print("oot_patches: the sound job at 60 Hz above 60 fps in " + os.path.basename(path))
+        out = sound
+        solver, found_solver = patch_solver_steps(out)
+        solver_sites += found_solver
+        if solver != out:
+            print("oot_patches: the solver steps rounded up above 60 fps in " + os.path.basename(path))
+        out = solver
+        heap, found_heap = patch_heap_retry(out) if protect_hearts else (out, [0, 0])
+        heap_sites[0] += found_heap[0]
+        heap_sites[1] += found_heap[1]
+        if heap != out:
+            print("oot_patches: heap-full retries of the OptimizeChangeBank allocations in", os.path.basename(path))
+        out = heap
         if out != s:
             whole_write.write_whole(path, out, newline="")
+    if sound_jobs != 1:
+        print("oot_patches: WARNING: the sound job was found %d times, not once" % sound_jobs)
+    if solver_sites != len(SOLVER_HEADS):
+        print("oot_patches: WARNING: the solver step count was found at %d of %d places" % (solver_sites, len(SOLVER_HEADS)))
+    if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:
+        print("oot_patches: WARNING: the OptimizeChangeBank allocations were found %s times, not once each" % heap_sites)
     for what, n in done.items():
         if n != 1:
             print("oot_patches: WARNING: the %s was found %d times" % (what, n))
+    if step_sites != len(STEP_SITES):
+        for path in step_files:
+            with open(path, encoding="utf-8", newline="") as f:
+                s = f.read()
+            whole_write.write_whole(path, unpatch_frame_seconds(s), newline="")
+        print("oot_patches: WARNING: the frame's time was found at %d of %d step divides, none patched (a Frame rate cap above 60 "
+              "keeps the game's own step)" % (step_sites, len(STEP_SITES)))
+    elif whole_sites != len(WHOLE_SITES):
+        print("oot_patches: WARNING: %d of %d frame counters found for the step's whole frames (above 60 fps a counter can stop: "
+              "the pick-up indicator, the water ripples, the time of day)" % (whole_sites, len(WHOLE_SITES)))
     apply_output_size(gen, required=required)
 
 

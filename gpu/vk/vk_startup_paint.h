@@ -78,7 +78,7 @@ inline void spaced(HDC dc, const std::string& t, int x, int y, int gap, bool cen
 }
 } // namespace startup_gdi
 
-/// The logo (assets/hookshot.png, nx2/logo_rgba.py) into a 32-bit top-down DIB of width w: lh pixels tall, centred on cx, its
+/// The logo (assets/mastersword.png, nx2/logo_rgba.py) into a 32-bit top-down DIB of width w: lh pixels tall, centred on cx, its
 /// top at y, blended by its alpha over what is there; bilinear
 inline void blit_logo(uint32_t* bits, int w, int h, int cx, int y, int lh) {
 #ifdef HOOKSHOT_LOGO
@@ -129,15 +129,17 @@ inline void paint_startup_view(HDC dc, uint32_t w, uint32_t h, int pct, const St
     HFONT mark = font(S(40), FW_BOLD), ver = font(S(10.5), FW_NORMAL), step = font(S(12), FW_BOLD), title = font(S(22), FW_SEMIBOLD),
           body = font(S(14), FW_NORMAL), hint = font(S(13), FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, mark);
-    // the logo, the wordmark and the version under it
+    // the logo, SteelTempSaint's MasterSword wordmark, and the version under it
     GdiFlush();
     blit_logo(bits, (int)w, (int)h, cx, 0, S(kLogoH));
     SetTextColor(dc, ink);
-    spaced(dc, "HOOKSHOT", cx, Y(0), S(7), true);
+    spaced(dc, "MASTERSWORD", cx, Y(0), S(5), true);
     SelectObject(dc, ver);
-    SetTextColor(dc, dim);
+    SetTextColor(dc, soft);
     SetTextAlign(dc, TA_CENTER | TA_TOP);
-    TextOutA(dc, cx, Y(56), v.version.c_str(), (int)v.version.size());
+    TextOutA(dc, cx, Y(44), "SteelTempSaint", 14);
+    SetTextColor(dc, dim);
+    TextOutA(dc, cx, Y(60), v.version.c_str(), (int)v.version.size());
     if (!v.title.empty() && v.fraction < 0) {   // (no count: the title and its line centred, the step above)
         if (!v.step.empty()) {
             SelectObject(dc, step);

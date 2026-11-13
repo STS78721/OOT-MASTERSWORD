@@ -1,0 +1,16 @@
+#version 450
+// Hybrid MVec debug: encode RG16F pixel motion as false-colour (R=+x, G=+y, B=|v|).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D mvec;
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { float scale; } pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, imageSize(dst)))) return;
+    const vec2 v = texelFetch(mvec, clamp(g, ivec2(0), textureSize(mvec, 0) - 1), 0).xy;
+    const float s = max(pc.scale, 1.0);
+    const vec3 c = vec3(0.5 + 0.5 * clamp(v.x / s, -1.0, 1.0),
+                        0.5 + 0.5 * clamp(v.y / s, -1.0, 1.0),
+                        clamp(length(v) / s, 0.0, 1.0));
+    imageStore(dst, g, vec4(c, 1.0));
+}

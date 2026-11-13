@@ -19,3 +19,6 @@ What CONTRIBUTING.md does not spell out, and agents trip on:
 
 Pull requests: **open the description with why the PR is needed**, in one or two plain sentences, and **include
 screenshots when the change shows on screen** (CONTRIBUTING.md, *Commits and pull requests*).
+
+MasterSword local smoke / FG work: follow `.cursor/rules/mastersword-smoke-discipline.mdc` and
+`runs/_release_prep/STICKY.md` (golden = `bak_4x50`, host ABI 10 / DLL 11, surgical diffs only, plan before restore).

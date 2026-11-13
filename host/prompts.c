@@ -61,8 +61,13 @@ static int contains(const char *text, const char *word) {   /* (any case) */
 static int choose_face(const char *dir) {
     char path[MAX_PATH], line[80];
     int choice = 0;
-    snprintf(path, sizeof path, "%shookshot_options.ini", dir);
-    FILE *f = fopen(path, "r");
+    FILE *f = NULL;
+    snprintf(path, sizeof path, "%smastersword_options.ini", dir);
+    f = fopen(path, "r");
+    if (!f) {
+        snprintf(path, sizeof path, "%shookshot_options.ini", dir);
+        f = fopen(path, "r");
+    }
     if (f) {
         while (fgets(line, sizeof line, f))
             if (!strncmp(line, "button_prompts=", 15)) choice = atoi(line + 15);

@@ -89,11 +89,7 @@ int hos_ini_option(const char *key, int otherwise);
 #define ini_option hos_ini_option
 int hos_ini_option(const char *key, int otherwise) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp; nn_vi.c reads it too) */
     char path[MAX_PATH];
-    const DWORD n = hos_game_path_a(path, MAX_PATH);
-    char *slash = n ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/'; the game folder's, not bin\\'s) */
-    if (!slash) return otherwise;
-    snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
-    FILE *f = fopen(path, "r");
+    FILE *f = hos_open_options_r(path, MAX_PATH);   /* mastersword_options.ini, else hookshot_options.ini */
     if (!f) return otherwise;
     char line[80];
     const size_t len = strlen(key);
@@ -122,6 +118,24 @@ static int output_mode(void) {
     return v;
 }
 uint32_t hos_output_size(int height) {
+    if (!handheld() && ini_option("match_monitor", 0)) {
+        static uint32_t w, h;
+        if (!w) {
+            w = 1920, h = 1080;
+            HMONITOR mon = MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY);
+            MONITORINFO mi;
+            mi.cbSize = sizeof mi;
+            if (GetMonitorInfo(mon, &mi)) {
+                int ww = mi.rcMonitor.right - mi.rcMonitor.left;
+                int hh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                ww &= ~7;
+                hh &= ~7;
+                if (ww >= 640 && hh >= 480) w = (uint32_t)ww, h = (uint32_t)hh;
+            }
+            hos_log("oe: match monitor %ux%u", w, h);
+        }
+        return height ? h : w;
+    }
     switch (output_mode()) {
     case 2: return height ? 2160 : 3840;
     case 3: return height ? 1080 : 1920;

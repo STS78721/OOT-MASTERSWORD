@@ -4,6 +4,7 @@
    GetModuleFileName(NULL, ...) does, but with the folder's path when the exe is in a "bin" folder beside image.bin, so code that
    strips the exe's name and adds a file's finds the folder's file. Modules (DLLs) are still loaded from beside the exe itself. */
 #pragma once
+#include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 #ifdef _WIN32
@@ -33,6 +34,18 @@ static inline DWORD hos_game_path_a(char *buf, DWORD size) {
     if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) return n;
     memmove(buf + root, name, strlen(name) + 1);   /* (folder\hookshot.exe) */
     return (DWORD)strlen(buf);
+}
+
+/* Insert menu / launcher write mastersword_options.ini; older builds used hookshot_options.ini. Prefer the new name. */
+static inline FILE *hos_open_options_r(char *path, DWORD size) {
+    const DWORD n = hos_game_path_a(path, size);
+    char *slash = n ? (strrchr(path, '\\') ? strrchr(path, '\\') : strrchr(path, '/')) : NULL;
+    if (!slash) return NULL;
+    snprintf(slash + 1, (size_t)(path + size - slash - 1), "mastersword_options.ini");
+    FILE *f = fopen(path, "r");
+    if (f) return f;
+    snprintf(slash + 1, (size_t)(path + size - slash - 1), "hookshot_options.ini");
+    return fopen(path, "r");
 }
 
 static inline DWORD hos_game_path_w(wchar_t *buf, DWORD size) {
@@ -77,5 +90,16 @@ static inline DWORD hos_game_path_a(char *buf, DWORD size) {
     if (access(probe, F_OK) != 0) return n;
     memmove(buf + root, name, strlen(name) + 1);
     return (DWORD)strlen(buf);
+}
+
+static inline FILE *hos_open_options_r(char *path, DWORD size) {
+    const DWORD n = hos_game_path_a(path, size);
+    char *slash = n ? strrchr(path, '/') : NULL;
+    if (!slash) return NULL;
+    snprintf(slash + 1, (size_t)(path + size - slash - 1), "mastersword_options.ini");
+    FILE *f = fopen(path, "r");
+    if (f) return f;
+    snprintf(slash + 1, (size_t)(path + size - slash - 1), "hookshot_options.ini");
+    return fopen(path, "r");
 }
 #endif

@@ -46,6 +46,8 @@ struct DrawArgs {
 
 /// A recording starts (its slot's descriptor pool and upload stream are reset); value: the timeline value it signals
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value);
+/// Publish CPU writes from this slot's used streams before its commands reach the GPU (also for worker slots).
+void draw_flush_recording(int slot);
 /// The recording's stream still holds [at, at + n) in the mapping at base (a reset starts used over)
 bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n);
 /// The open render pass ends (before transfers, clears, barriers and the recording's end)
@@ -59,6 +61,7 @@ void clear_stats(int64_t* clears, int64_t* masked);
 /// indirect: the workgroup counts' GPU address (x, y, z unused)
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect);
 void dry_mark_written(NvnState& s, bool compute, bool first);   // (hookshot: the parallel replay's dry pass)
+void dry_marks_begin();   // (at the start of each dry pass: the last targets it skipped by are forgotten)
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipelines);
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
@@ -67,6 +70,7 @@ void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
 bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* lib_cold, int64_t* lib_built, double* lib_build_ms);
 void draw_skip_report(double frames);   // (hookshot) skips by the line that made them
 int64_t draw_desc_reused();
+int64_t draw_desc_uniform_only();   // (hookshot: draws that built uniform ranges alone, desc_rest_stands)
 /// (RX_VK_DESC_SLOTGEN) Of those, the reuses the global registrations' generation check would have rebuilt for
 int64_t draw_slotgen_saves();
 /// RX_VK_FLASH_RECORD=<key>,...: the last frames' draws of those programs, written to the log for frames around a flash
@@ -77,8 +81,14 @@ uint64_t ub_generation();
 /// A background thread (shader translation, pipeline builds) reads guest memory from the captures only, never the stream's
 /// uniform updates: that list is the replay's, which grows and is pruned while such a thread runs
 void ub_thread_off();
+/// (0.1.9c) A background worker (vk_jobs.cpp) placed on a hybrid CPU's E-cores, off the P-cores the game and the replay use
+/// (vk_replay.cpp; RX_VK_JOBS_ANY_CORE=1: anywhere). Nothing on a CPU of one kind
+void jobs_worker_placement();
 /// The pipeline cache to disk (force: whatever was built since the last save; else only after a few new ones)
 void pipeline_cache_save(bool force);
+// (the window closed: what play made since the last save, a few ms; the start's cache is not written there, as before)
+void pipeline_cache_close();
+void pipeline_cache_play();   // (the start-up done: what play makes goes into play files of its own)
 
 /// The stream's uniform updates (UPDATE_UB, vk_replay.cpp) that overlap [addr, addr + n) and may not be in guest
 /// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc returns in the

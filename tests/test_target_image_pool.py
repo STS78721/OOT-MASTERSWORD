@@ -95,9 +95,10 @@ class TargetImagePoolTests(unittest.TestCase):
 
     def test_the_trim_is_bounded_a_present_and_gives_back_idle_and_excess_images(self):
         trim = block(self.tex, "size_t pool_trim()")
-        self.assertIn("pool_pressed ? 0 : pool_cap()", trim)
+        self.assertIn("pool_pressed ? std::min<uint64_t>(pool_cap(), 96ull << 20) : pool_cap()", trim)
+        self.assertIn("pool_pressed ? 30 : 120", trim)
         self.assertIn("pool_pressed ? 64 : 16", trim)
-        self.assertIn("frame_no - v[i].since <= 120", trim)
+        self.assertIn("frame_no - v[i].since <= age", trim)
         self.assertIn("pool_bytes <= cap", trim)
         self.assertIn("pool_destroy(v[i]);", trim)
         destroy = block(self.tex, "void pool_destroy(Pooled& p)")

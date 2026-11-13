@@ -29,7 +29,6 @@ import ctypes
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -38,11 +37,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # (python -I leaves the script folder off)
 import kit
 import lifted_c
-import rtgen
 import logo_rgba
+import rtgen
 import toolchain
 import version
-import win_manifest
 
 NX2_RT = os.path.join(kit.HERE, "rt")
 HOST = os.path.join(kit.HERE, "..", "host")
@@ -59,48 +57,9 @@ PGO = os.environ.get("RX_PGO", "")
 LINUX = not toolchain.windows()   # (hookshot: RX_TARGET=windows on Linux builds the Windows game, with llvm-mingw)
 POSIX = os.path.join(kit.HERE, "..", "host", "posix")
 SYSROOT = os.environ.get("HOOKSHOT_SYSROOT", "")
-EXE = "hookshot" if LINUX else "hookshot.exe"
-VK_LIB = "hookshot_vk.so" if LINUX else "hookshot_vk.dll"
+EXE = "mastersword" if LINUX else "mastersword.exe"
+VK_LIB = "mastersword_vk.so" if LINUX else "mastersword_vk.dll"
 
-
-def check_vk_symbols(so):
-    """The back end is dlopened with RTLD_NOW, so one unresolved symbol stops the whole thing
-    loading -- and the only sign of that at run time is "the renderer did not start: the window
-    stays black", with no symbol named. The link itself does not fail: a shared object is allowed to
-    leave symbols for its loader to supply, which is exactly what the host executable does for the
-    weak hos_* ones.
-
-    So: anything still undefined here that is not weak and not the C or C++ runtime's is a mistake,
-    and this says which. It has caught two, each of which had cost a run apiece to find by hand: a
-    host function referenced without __attribute__((weak)), and an `extern` of one of our own
-    globals written inside an anonymous namespace, which makes a different symbol that nothing
-    defines.
-    """
-    nm = shutil.which("nm") or shutil.which("llvm-nm")
-    if not nm:
-        return True   # (not a reason to fail a build; the check is a guard, not a dependency)
-    try:
-        out = subprocess.run([nm, "-D", "--undefined-only", so], capture_output=True, text=True,
-                             check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return True
-    bad = []
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or parts[0] != "U":   # ("w" is weak: the host supplies those, or does not)
-            continue
-        name = parts[1]
-        if "@GLIBC" in name or "@CXXABI" in name or "@GLIBCXX" in name or "@GCC" in name:
-            continue
-        bad.append(name)
-    if not bad:
-        return True
-    print("%s has %d unresolved symbol(s); it would not load:" % (os.path.basename(so), len(bad)))
-    for name in bad[:20]:
-        print("    " + name)
-    print("  a host function wants __attribute__((weak)); one of our own globals wants an extern at")
-    print("  namespace scope, not inside an anonymous namespace")
-    return False
 
 def target():
     """toolchain.native_target(), with the sysroot on Linux"""
@@ -164,7 +123,7 @@ def gpu_sources():
 def tree_headers(*roots, skip=()):
     """Every header under these folders, as one dependency blob (suyu's headers sit in many folders); folders named
     in skip are left out"""
-    h = hashlib.sha1(usedforsecurity=False)
+    h = hashlib.sha1()
     for root in roots:
         found = []
         # (the walk pruned as it goes: sorting the whole walk first, as this once did, made skip do nothing, and every
@@ -197,6 +156,10 @@ def ngx_sdk(sdk, linux):
 NGX_SDK = ngx_sdk(os.environ.get("HOOKSHOT_NGX_SDK", ""), LINUX)
 # (llvm-mingw: what NVIDIA's library asks of Microsoft's runtime, linked in with it. Not compiled otherwise)
 NGX_MSVC_RT = "vk_ngx_msvc_rt.cpp"
+# HOOKSHOT_FSR=1: the Vulkan back end with AMD FSR 4 (gpu/vk/vk_fsr4.cpp), from AMD's FSR API headers (third_party/fidelityfx,
+# MIT). AMD's signed DLLs are not part of the build: the user's, loaded at run time. Off without it (make_game.py --fsr sets
+# it; the camera jitter it needs is in every build: nx2/oot_jitter.py)
+FSR = os.environ.get("HOOKSHOT_FSR", "") == "1"
 
 
 def ngx_link(sdk, mingw):
@@ -206,6 +169,7 @@ def ngx_link(sdk, mingw):
     if not sdk:
         return []
     return [ngx_library(sdk, False), "-ladvapi32"] + (["-Wl,-Xlink=/nodefaultlib:libcpmt"] if mingw else [])
+
 
 
 def vk_sources():
@@ -302,61 +266,16 @@ def tree_rss(pid):
     return n
 
 
-class ProcessEntry(ctypes.Structure):   # (Windows' PROCESSENTRY32W, for CreateToolhelp32Snapshot)
-    _fields_ = [("size", ctypes.c_uint32), ("usage", ctypes.c_uint32), ("pid", ctypes.c_uint32), ("heap", ctypes.c_size_t),
-                ("module", ctypes.c_uint32), ("threads", ctypes.c_uint32), ("parent", ctypes.c_uint32), ("base", ctypes.c_long),
-                ("flags", ctypes.c_uint32), ("exe", ctypes.c_wchar * 260)]
-
-
-def tree_ws(pid):
-    """(windows) The working set in bytes of a process and the processes it started: llvm-mingw's clang.exe is a 5 MB driver, and the
-    memory is in the clang-23.exe it runs"""
-    k = ctypes.WinDLL("kernel32")
-    psapi = ctypes.WinDLL("psapi")
-    k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
-    k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-    k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
-    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    k.OpenProcess.restype = ctypes.c_void_p
-    k.CloseHandle.argtypes = [ctypes.c_void_p]
-    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_uint32]
-    snapshot = k.CreateToolhelp32Snapshot(2, 0)   # (TH32CS_SNAPPROCESS)
-    if snapshot in (None, ctypes.c_void_p(-1).value):
-        return 0
-    children = {}
-    try:
-        e = ProcessEntry()
-        e.size = ctypes.sizeof(ProcessEntry)
-        more = k.Process32FirstW(snapshot, ctypes.byref(e))
-        while more:
-            children.setdefault(e.parent, []).append(e.pid)
-            more = k.Process32NextW(snapshot, ctypes.byref(e))
-    finally:
-        k.CloseHandle(snapshot)
-    total, seen, todo = 0, set(), [pid]
-    while todo:
-        p = todo.pop()
-        if p in seen:   # (Windows reuses ids: a parent id can name a newer process, and even loop)
-            continue
-        seen.add(p)
-        todo += children.get(p, [])
-        handle = k.OpenProcess(0x1000, 0, p)   # (PROCESS_QUERY_LIMITED_INFORMATION)
-        if handle:
-            c = ProcessMemory()
-            c.cb = ctypes.sizeof(ProcessMemory)
-            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb):
-                total += c.ws
-            k.CloseHandle(handle)
-    return total
-
-
 def rss_mb(proc):
     """A running compiler's resident memory in MB (0: not known, or not started yet)"""
     if proc is None:
         return 0
     try:
         if os.name == "nt":
-            return tree_ws(proc.pid) >> 20
+            c = ProcessMemory()
+            c.cb = ctypes.sizeof(ProcessMemory)
+            ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(c), c.cb)
+            return c.ws >> 20 if ok else 0
         return tree_rss(proc.pid) >> 20
     except (OSError, ValueError, AttributeError, IndexError):
         return 0
@@ -392,7 +311,7 @@ class MemoryGate:
 
     def __init__(self):
         self.cv = threading.Condition()
-        self.running = {}   # (per-compile lease: [need, Popen or None]; one source can have several objects)
+        self.running = {}   # (src: [need, Popen or None])
         self.reserve = float(os.environ.get("HOOKSHOT_MEM_RESERVE_GB") or 1.5) * 1024
         self.floor = max(1, min(4, (os.cpu_count() or 2) // 2)) if os.name == "nt" else 1
 
@@ -407,13 +326,11 @@ class MemoryGate:
                 if free - owed - self.reserve >= need:
                     break
                 self.cv.wait(1.0)
-            lease = object()
-            self.running[lease] = [need, None]
-            return lease
+            self.running[src] = [need, None]
 
-    def started(self, lease, proc):
+    def started(self, src, proc):
         with self.cv:
-            self.running[lease][1] = proc
+            self.running[src][1] = proc
 
     def expected(self, jobs):
         """How many compilers the memory free now is likely to hold at once (COMPILER_MB each), between the floor and the jobs:
@@ -423,9 +340,9 @@ class MemoryGate:
             return jobs
         return max(self.floor, min(jobs, int((free - self.reserve) // COMPILER_MB)))
 
-    def leave(self, lease):
+    def leave(self, src):
         with self.cv:
-            self.running.pop(lease, None)
+            self.running.pop(src, None)
             self.cv.notify_all()
 
 
@@ -537,7 +454,7 @@ def flag_text(fl):
 
 def object_key(src, fl, deps):
     """What an object depends on: its source, the flags (flag_text), and the headers."""
-    return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps, usedforsecurity=False).hexdigest()
+    return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps).hexdigest()
 
 
 def times_from(path):
@@ -614,7 +531,7 @@ def migrate_stamps(gen, obj_dir, fl, deps):
             continue
         src = os.path.join(gen, f)
         content = open(src, "rb").read()
-        if open(stamp).read() == hashlib.sha1(content + " ".join(fl).encode() + deps, usedforsecurity=False).hexdigest():
+        if open(stamp).read() == hashlib.sha1(content + " ".join(fl).encode() + deps).hexdigest():
             key = object_key(src, fl, deps)
             open(stamp, "w").write(key)
             cache_put(obj, key)
@@ -661,21 +578,21 @@ def compile_one(job):
             shutil.copyfile(cached, obj)
         open(stamp, "w").write(key)
         return src, 0.0, None
-    lease = GATE.enter(src) if GATE else None
+    if GATE:
+        GATE.enter(src)
     t = time.time()
     try:
         with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
             no_throttle(getattr(p, "_handle", None))
             if GATE:
-                GATE.started(lease, p)
+                GATE.started(src, p)
             out, err = p.communicate()
     finally:
         if GATE:
-            GATE.leave(lease)
+            GATE.leave(src)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
-        failure = r.stderr or r.stdout or "Compiler exited with status %d without diagnostics." % r.returncode
-        return src, time.time() - t, failure[-4000:]
+        return src, time.time() - t, r.stderr[-4000:]
     open(stamp, "w").write(key)
     cache_put(obj, key)
     return src, time.time() - t, None
@@ -696,16 +613,12 @@ def main():
     gen = os.path.join(sa if a.standalone else kit.WORK, "gen")
     out = os.path.join(sa if a.standalone else kit.WORK, "build")
     obj_dir = os.path.join(out, "obj")
-    # (hookshot) the start-up screen's logo, assets/hookshot.png as RGBA bytes in a header of the build's own (nx2/logo_rgba.py);
-    # its bytes are part of vk_menu.cpp's dependencies
-    gen_dir = os.path.join(out, "gen")
-    logo_text = logo_rgba.write(os.path.join(gen_dir, "hookshot_logo.h")).encode()
     os.makedirs(obj_dir, exist_ok=True)
     if os.environ.get("RX_VK_ONLY"):   # (the Vulkan back end needs no game: built so with no lift, as the AppImage's is)
         os.makedirs(gen, exist_ok=True)
     rt64 = rtgen.write(os.path.join(out, "rt64"))
     cc = toolchain.need(toolchain.find("clang"))
-    fl = flags(gen, rt64, a.opt, not a.no_polls) + (["-DA64_POLL_CTX"] if a.dll else [])   # (the shim's poll takes the context: rtgen.py)
+    fl = flags(gen, rt64, a.opt, not a.no_polls)
     # (which Hookshot this is, for the log's first line and the Insert menu: given to those two files only, so a new
     # release name rebuilds them and nothing else)
     stamp_def = version.define()
@@ -716,8 +629,7 @@ def main():
     shim_deps = deps + open(os.path.join(NX2_RT, "mkw_host.h"), "rb").read()
     eden_gen, eden_out = os.path.join(kit.WORK, "gen"), os.path.join(kit.WORK, "build")
     migrate_stamps(eden_gen, os.path.join(eden_out, "obj"),
-                   flags(eden_gen, os.path.join(eden_out, "rt64"), a.opt, not a.no_polls) +
-                   (["-DA64_POLL_CTX"] if a.dll else []), deps)   # (as fl below: the flags its objects were built with)
+                   flags(eden_gen, os.path.join(eden_out, "rt64"), a.opt, not a.no_polls), deps)
     migrate_stamps(gen, obj_dir, fl, deps)
     chunks = sorted(f for f in os.listdir(gen) if f.startswith("code_") and f.endswith(".c"))
     if a.only:
@@ -755,15 +667,15 @@ def main():
         # (the profile's contents in the flags the object key hashes: its path alone stays the same across releases, so an update with a
         # new profile kept the hot code built from the old one)
         with open(PGO, "rb") as f:
-            hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:16]]
+            hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
              hot_fl if os.path.basename(s).startswith("code_hot") else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
     # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
-    fp = lambda b: hashlib.sha1(b, usedforsecurity=False).hexdigest()[:10]
+    fp = lambda b: hashlib.sha1(b).hexdigest()[:10]
     norm = lambda f: flag_text(f).encode()
-    code = hashlib.sha1(usedforsecurity=False)
+    code = hashlib.sha1()
     for code_src in sorted(x for x in srcs if os.path.basename(x).startswith("code_")):
         code.update(os.path.basename(code_src).encode() + open(code_src, "rb").read())
     print("object keys: game-code headers %s, flags %s, hot flags %s, lifted code %s (%d files)" % (
@@ -771,13 +683,11 @@ def main():
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-I" + os.path.join(GPU, "vk", "compat"), "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
-                                if f.endswith(".h"))
+                                if f.endswith(".h")) + open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
     if LINUX:
         host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
-        host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()
-    host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
     host_deps += ffmpeg_version_key()
     jobs += [(cc, s, os.path.join(obj_dir, "host_" + os.path.basename(s)[:-2] + ".o"),
               host_fl + ["-I" + os.path.join(OPUS, "include")] +
@@ -785,10 +695,8 @@ def main():
               (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
               ([stamp_def] if os.path.basename(s) == "hos_main.c" else []), host_deps) for s in host_srcs]
     # libopus 1.5.2 (third_party/opus, from TOTKPort): nn::codec's hardware Opus decoder (host/nn_codec.c)
-    # (hookshot: built for the same CPU target as the rest (CPU), so its float code can be vectorized where the target has
-    # AVX2: the vendored copy has no x86 intrinsics files of its own)
     if host_srcs:
-        oflags = target() + CPU + ["-O2", "-g0", "-Wno-everything", "-DOPUS_BUILD", "-DUSE_ALLOCA",
+        oflags = target() + ["-O2", "-g0", "-Wno-everything", "-DOPUS_BUILD", "-DUSE_ALLOCA",
                                               "-DHAVE_LRINTF", "-DHAVE_LRINT"] +             ["-I" + os.path.join(OPUS, d) for d in ("include", "celt", "silk", "silk/float", "src")]
         for rel in open(os.path.join(OPUS, "sources.txt")).read().split():
             jobs.append((cc, os.path.join(OPUS, rel), os.path.join(obj_dir, "opus_" + rel.replace("/", "_")[:-2] + ".o"),
@@ -816,15 +724,19 @@ def main():
     elif a.standalone and not a.only and vk_headers and spirv_headers:
         cxx = toolchain.need(toolchain.find("clang++"))
         vk = os.path.join(GPU, "vk")
+        # (MasterSword) start-up logo from assets/mastersword.png as RGBA bytes (nx2/logo_rgba.py) in the build's own folder
+        gen_dir = os.path.join(out, "gen")
+        os.makedirs(gen_dir, exist_ok=True)
+        logo_text = logo_rgba.write(os.path.join(gen_dir, "hookshot_logo.h")).encode()
         # (what the shader caches are good for: what translates shaders, not the whole DLL, so a build that changes something else
         # keeps them)
-        stamp = hashlib.sha1(usedforsecurity=False)
+        stamp = hashlib.sha1()
         translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
-        for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h", "vk_api.h")]:
+        for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
-        shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
+            "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
@@ -839,31 +751,29 @@ def main():
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
             "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
-        # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
-        # it is the stubs that say DLSS is not there)
-        ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
-        if NGX_SDK:
-            print("the Vulkan back end: with NVIDIA DLSS (NVIDIA's NGX SDK in %s)" % NGX_SDK, flush=True)
         # (Eden's recompiler and sirit see only their own headers: a change to the back end's vk_*.h does not
         # rebuild their ~500 files; the back end itself depends on everything, suyu's texture decoders included)
         vk_lib_deps = tree_headers(os.path.join(vk, "eden"), os.path.join(vk, "sirit"), os.path.join(vk, "compat"),
                                    os.path.join(GPU, "compat"))
         vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
                              os.path.join(GPU, "third_party", "suyu", "video_core", "textures"))
+        ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
+        ngx_deps = tree_headers(os.path.join(NGX_SDK, "include")) if NGX_SDK else b""
+        if NGX_SDK:
+            print("the Vulkan back end: with NVIDIA DLSS (NVIDIA's NGX SDK in %s)" % NGX_SDK, flush=True)
+        fsr_flags = ["-DHOOKSHOT_FSR", "-I" + os.path.join(kit.HERE, "..", "third_party", "fidelityfx")] if FSR else []
+        if FSR:
+            print("the Vulkan back end: with AMD FSR 4 (third_party/fidelityfx)", flush=True)
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
+            base = os.path.basename(src)
+            deps = vk_lib_deps if lib else (vdeps + logo_text if base == "vk_menu.cpp" else vdeps)
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
-                            ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
-                            (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []),
-                            vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_menu.cpp" else b"")))
-        if NGX_SDK and not LINUX and toolchain.mingw():
-            # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
-            # of that runtime: the C parts as for the static FFmpeg (host/mingw_msvc_shims.c), the C++ ones in vk_ngx_msvc_rt.cpp)
-            vk_jobs.append((cxx, os.path.join(vk, NGX_MSVC_RT), os.path.join(obj_dir, "vk_ngx_msvc_rt.o"), vflags + ngx_flags, vdeps))
-            vk_jobs.append((cc, os.path.join(HOST, "mingw_msvc_shims.c"), os.path.join(obj_dir, "vk_ngx_mingw_msvc_shims.o"),
-                            target() + ["-O2", "-g0", "-Wno-everything"], b""))
+                            vflags + ([stamp_def] if base == "vk_menu.cpp" else []) +
+                            (ngx_flags if base == "vk_dlss.cpp" else []) +
+                            (fsr_flags if base == "vk_fsr4.cpp" else []),
+                            deps + (ngx_deps if base == "vk_dlss.cpp" else b"")))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
             cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
                                        "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
@@ -895,12 +805,10 @@ def main():
     t0, failed = time.time(), []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
         # (as each ends, not in order: the builder app shows progress from these lines, and the biggest file comes first)
-        submitted = {ex.submit(compile_one, job): job for job in jobs}
-        for future in concurrent.futures.as_completed(submitted):
-            src, secs, err = future.result()
+        for src, secs, err in (f.result() for f in concurrent.futures.as_completed([ex.submit(compile_one, j) for j in jobs])):
             size = os.path.getsize(src) >> 20
             if err:
-                failed.append(submitted[future])
+                failed.append(src)
                 print("not compiled yet: %s (%d MB, %.0fs), tried again alone at the end:\n%s"
                       % (os.path.basename(src), size, secs, err[-1500:]), flush=True)
             else:
@@ -914,8 +822,9 @@ def main():
     # (a compiler that ran out of memory beside the others dies "due to signal": a player's 24 MB code_021.c, 2026-11-08. The
     # files that failed are compiled again one at a time, with all the memory, before the build gives up)
     still = 0
-    for job in failed:
-        src, secs, err = compile_one(job)
+    for src in failed:
+        job = next(j for j in jobs if j[1] == src)
+        _, secs, err = compile_one(job)
         size = os.path.getsize(src) >> 20
         if err:
             still += 1
@@ -958,13 +867,12 @@ def main():
             import shutil
             shutil.copyfile(sdl, os.path.join(out, "libSDL2-2.0.so.0"))
     elif a.standalone and not a.only and not vk_only:
-        exe = os.path.join(out, "hookshot.exe")   # (+ hookshot.map: crash offsets -> f_<guest address>)
+        exe = os.path.join(out, EXE)   # (+ .map: crash offsets -> f_<guest address>)
         t = time.time()
         r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
                            ["-o", exe, toolchain.link_opt("/map:" + exe[:-4] + ".map"), toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
                            ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if PGO == "gen" else []) +
-                           ([os.path.join(kit.WORK, "hookshot.res")] if os.path.exists(os.path.join(kit.WORK, "hookshot.res")) else []) +   # (nx2/make_icon.py)
-                           [win_manifest.write(os.path.join(out, "hookshot_manifest.res"))] +   # (UTF-8 paths: nx2/win_manifest.py)
+                           ([os.path.join(kit.WORK, "mastersword.res")] if os.path.exists(os.path.join(kit.WORK, "mastersword.res")) else []) +   # (nx2/make_icon.py)
                            ([toolchain.link_opt("/subsystem:windows"), toolchain.link_opt("/entry:mainCRTStartup")] if os.environ.get("RX_RELEASE") == "1" else []) +   # (no console window)
                            ([os.path.join(WGPU, "lib", "wgpu_native.dll.lib")] if wgpu else []) +
                            ([os.path.join(FFMPEG, "lib", l + ".lib") for l in ("avcodec", "swscale", "swresample", "avutil")] +
@@ -1023,8 +931,6 @@ def main():
             print("%s link FAILED, %d undefined symbols" % (VK_LIB, len(undefined)))
             print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
             return 1
-        if LINUX and not check_vk_symbols(vdll):
-            return 1
         print("linked %s: %d MB (%.0fs)" % (vdll, os.path.getsize(vdll) >> 20, time.time() - t))
     if a.dll and not a.only:
         dll = os.path.join(out, "hookshot_game.dll")   # (+ hookshot_game.map: crash offsets -> f_<guest address>)
@@ -1043,4 +949,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

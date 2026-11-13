@@ -1,4 +1,4 @@
-"""The Insert menu's upscale label stays inside its three names, and RX_VK_UPSCALE stays inside the row.
+"""The Insert menu's upscale label stays inside its names, and RX_VK_UPSCALE stays inside the row.
 
 python -I -B tests/test_upscale_label.py [--cxx g++]
 """
@@ -41,10 +41,11 @@ int main() {
     CHECK(std::strcmp(tx_upscale(0), "Off") == 0);
     CHECK(std::strcmp(tx_upscale(1), "Catmull-Rom") == 0);
     CHECK(std::strcmp(tx_upscale(2), "Lanczos") == 0);
+    CHECK(std::strcmp(tx_upscale(8), "DLSS SR") == 0);
+    CHECK(std::strcmp(tx_upscale(9), "FSR 4") == 0);
     CHECK(std::strcmp(tx_upscale(-1), "Off") == 0);
-    CHECK(std::strcmp(tx_upscale(3), "Off") == 0);
     CHECK(std::strcmp(tx_upscale(99), "Off") == 0);
-    std::printf("PASS: upscale labels for 0..2 and for a setting past the row\n");
+    std::printf("PASS: upscale labels including DLSS SR and FSR 4\n");
 }
 '''
     with tempfile.TemporaryDirectory(prefix="upscale-label-") as tmp:

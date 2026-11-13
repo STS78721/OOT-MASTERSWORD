@@ -84,6 +84,52 @@ inline bool reprojection(const float* current, const float* previous, float out[
     return true;
 }
 
+/// (hookshot) The camera of a perspective view-projection m (row major, clip = m * position): its position, and the direction it looks.
+/// A jitter moves neither. False when the matrix is not a perspective one, or not finite.
+inline bool camera_pose(const float m[16], double pos[3], double fwd[3]) {
+    for (int i = 0; i < 16; i++)
+        if (!std::isfinite(m[i])) return false;
+    const int rows[3] = {0, 1, 3};
+    double a[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++) a[r][c] = c < 3 ? m[rows[r] * 4 + c] : -m[rows[r] * 4 + 3];
+    for (int c = 0; c < 3; c++) {
+        int p = c;
+        for (int r = c + 1; r < 3; r++)
+            if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
+        if (std::fabs(a[p][c]) < 1e-12) return false;
+        if (p != c)
+            for (int k = 0; k < 4; k++) std::swap(a[p][k], a[c][k]);
+        const double inv = 1.0 / a[c][c];
+        for (int k = 0; k < 4; k++) a[c][k] *= inv;
+        for (int r = 0; r < 3; r++) {
+            if (r == c || a[r][c] == 0.0) continue;
+            const double f = a[r][c];
+            for (int k = 0; k < 4; k++) a[r][k] -= f * a[c][k];
+        }
+    }
+    const double len = std::sqrt((double)m[12] * m[12] + (double)m[13] * m[13] + (double)m[14] * m[14]);
+    if (!(len > 1e-12)) return false;
+    for (int i = 0; i < 3; i++) pos[i] = a[i][3], fwd[i] = m[12 + i] / len;
+    return std::isfinite(pos[0]) && std::isfinite(pos[1]) && std::isfinite(pos[2]);
+}
+
+/// A camera cut between two frames, ms apart: a move over 5 m, or a turn over 30 degrees with a move over 0.5 m, scaled to the
+/// time between frames. Normal play and a quick swing around Link do not count. An area load or a spawn does.
+inline bool camera_cut(const float previous[16], const float current[16], double ms, double* move, double* turn) {
+    double p0[3], f0[3], p1[3], f1[3];
+    *move = *turn = 0;
+    if (!camera_pose(previous, p0, f0) || !camera_pose(current, p1, f1)) return false;
+    const double dx = p1[0] - p0[0], dy = p1[1] - p0[1], dz = p1[2] - p0[2];
+    *move = std::sqrt(dx * dx + dy * dy + dz * dz);
+    double dot = f0[0] * f1[0] + f0[1] * f1[1] + f0[2] * f1[2];
+    dot = dot > 1 ? 1 : dot < -1 ? -1 : dot;
+    *turn = std::acos(dot) * (180.0 / 3.14159265358979323846);
+    double k = ms / (1000.0 / 60);
+    k = k < 0.25 ? 0.25 : k > 4 ? 4 : k;
+    return *move > 5.0 * k || (*turn > 30.0 * k && *move > 0.5 * k);
+}
+
 /// A view-projection's jitter taken off (row major): a jitter moves clip x and y by jitter * w, so jitter times the w row
 /// comes off the first two rows
 inline void unjitter(float m[16], const float jitter[2]) {

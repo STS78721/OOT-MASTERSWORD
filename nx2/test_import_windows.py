@@ -34,7 +34,7 @@ def main():
 #include <mutex>
 #include <vector>
 #define CHECK(x) do { if(!(x)){std::fprintf(stderr,"FAIL:%d %s\\n",__LINE__,#x);std::exit(1);} }while(0)
-struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false; };
+struct Pool { uint64_t lo=0,hi=0,range_lo=0,range_hi=0,address=0; bool prefetched=false,gpu_only=false,gpu_written=false; uint8_t trims=0; uint64_t trim_epoch=0; };
 struct GuestPool { uint64_t lo,hi; };
 std::vector<GuestPool> guest_pools;
 std::map<uint64_t,Pool> imported;
@@ -47,6 +47,7 @@ std::mutex bg_mu;std::condition_variable bg_done_cv,bg_cv;std::vector<uint64_t> 
 std::deque<std::pair<uint64_t,uint64_t>> bg_queue;
 void bg_start() { bg_starts++; } // Recording spy: no thread or GPU import is started.
 void logf(const char*,...){} void bg_drain(){}
+bool mirror_on() { return true; }
 void guest_pages_set(uint64_t,uint64_t,uint64_t){}
 void retire_pool(std::map<uint64_t,Pool>::iterator it) { imported.erase(it);last_pool=nullptr;std::fill(std::begin(pool_cache),std::end(pool_cache),nullptr);retires++; }
 enum { VK_SUCCESS = 0 };

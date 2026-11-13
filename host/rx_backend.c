@@ -5,6 +5,9 @@
 #include "hos.h"
 #include <stdlib.h>
 #include <string.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -66,39 +69,157 @@ void hos_mark_written(const void *p, size_t n);
 static void host_log(const char *line) { hos_log("%s", line); }
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 int hos_gpu_guest_ranges(uint64_t (*out)[2], int max);
+
+static uint32_t *page_pool_buf[2];
+static size_t page_pool_cap[2];
+static int page_pool_busy[2];
+
+static uint32_t *alloc_page_buf(size_t *cap_out, int *slot_out) {
+    for (int i = 0; i < 2; i++) {
+        if (__atomic_exchange_n(&page_pool_busy[i], 1, __ATOMIC_ACQUIRE) == 0) {
+            if (!page_pool_buf[i]) {
+                page_pool_cap[i] = 8192;
+                page_pool_buf[i] = malloc(page_pool_cap[i] * sizeof(uint32_t));
+            }
+            *cap_out = page_pool_cap[i];
+            *slot_out = i;
+            return page_pool_buf[i];
+        }
+    }
+    *cap_out = 4096;
+    *slot_out = -1;
+    return malloc(4096 * sizeof(uint32_t));
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2,bmi")))
+static size_t collect_range_avx2(uint64_t p, uint64_t p1, uint32_t **out_p, size_t n, size_t *cap_p) {
+    uint32_t *out = *out_p;
+    size_t cap = *cap_p;
+    const __m256i zero = _mm256_setzero_si256();
+    while (p < p1 && (p & 31)) {
+        if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED)) {
+            __atomic_store_n(&a64_dirty[p], 0, __ATOMIC_RELAXED);
+            if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+            out[n++] = (uint32_t)p;
+        }
+        p++;
+    }
+    for (; p + 64 <= p1; p += 64) {
+        const __m256i v0 = _mm256_loadu_si256((const __m256i *)&a64_dirty[p]);
+        const __m256i v1 = _mm256_loadu_si256((const __m256i *)&a64_dirty[p + 32]);
+        const __m256i u = _mm256_or_si256(v0, v1);
+        if (_mm256_testz_si256(u, u)) continue;
+        uint32_t m0 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, zero));
+        while (m0) {
+            const uint32_t b = (uint32_t)__builtin_ctz(m0);
+            m0 &= m0 - 1;
+            __atomic_store_n(&a64_dirty[p + b], 0, __ATOMIC_RELAXED);
+            if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+            out[n++] = (uint32_t)(p + b);
+        }
+        uint32_t m1 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, zero));
+        while (m1) {
+            const uint32_t b = (uint32_t)__builtin_ctz(m1);
+            m1 &= m1 - 1;
+            __atomic_store_n(&a64_dirty[p + 32 + b], 0, __ATOMIC_RELAXED);
+            if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+            out[n++] = (uint32_t)(p + 32 + b);
+        }
+    }
+    for (; p < p1; p++) {
+        if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED)) {
+            __atomic_store_n(&a64_dirty[p], 0, __ATOMIC_RELAXED);
+            if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+            out[n++] = (uint32_t)p;
+        }
+    }
+    *out_p = out;
+    *cap_p = cap;
+    return n;
+}
+#endif
+
+static size_t collect_range_scalar(uint64_t p, uint64_t p1, uint32_t **out_p, size_t n, size_t *cap_p) {
+    uint32_t *out = *out_p;
+    size_t cap = *cap_p;
+    for (; p < p1;) {
+        if (!(p & 31) && p + 32 <= p1) {
+            uint64_t w[4];
+            memcpy(w, &a64_dirty[p], 32);
+            if (!(w[0] | w[1] | w[2] | w[3])) {
+                p += 32;
+                continue;
+            }
+        }
+        if (!(p & 7) && p + 8 <= p1) {
+            uint64_t w;
+            memcpy(&w, &a64_dirty[p], 8);
+            if (!w) {
+                p += 8;
+                continue;
+            }
+            while (w) {
+                const uint32_t b = (uint32_t)(__builtin_ctzll(w) >> 3);
+                w &= ~(0xFFull << (b * 8));
+                __atomic_store_n(&a64_dirty[p + b], 0, __ATOMIC_RELAXED);
+                if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+                out[n++] = (uint32_t)(p + b);
+            }
+            p += 8;
+            continue;
+        }
+        if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED)) {
+            __atomic_store_n(&a64_dirty[p], 0, __ATOMIC_RELAXED);
+            if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+            out[n++] = (uint32_t)p;
+        }
+        p++;
+    }
+    *out_p = out;
+    *cap_p = cap;
+    return n;
+}
+
 /* The soft write watch's marks (rt/a64.h A64_MARK, hos_mark_written) over the GPU-visible ranges, read and cleared:
    the Vulkan back end's own collection (gpu/render's rx_collect_written works only with the WebGPU renderer started).
    One consumer: with Vulkan the WebGPU renderer never runs. */
 static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
-    size_t n = 0, cap = 4096;
-    uint32_t *out = malloc(cap * sizeof *out);
+    size_t n = 0, cap = 0;
+    int slot = -1;
+    uint32_t *out = alloc_page_buf(&cap, &slot);
+    const uint64_t gsize = hos_guest_size();
+#if defined(__x86_64__) || defined(_M_X64)
+    static int use_avx2 = -1;
+    if (use_avx2 < 0) {
+        const char *no_simd = getenv("HOS_DIRTY_SCALAR");
+#ifdef _WIN32
+        const int hw = IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */) != 0;
+#else
+        const int hw = __builtin_cpu_supports("avx2") != 0;
+#endif
+        use_avx2 = (!no_simd || !no_simd[0] || no_simd[0] == '0') && hw;
+    }
+#endif
     for (int r = 0; r < nranges; r++) {
-        const uint64_t lo = ranges[r][0], hi = ranges[r][1] < hos_guest_size() ? ranges[r][1] : hos_guest_size();
+        const uint64_t lo = ranges[r][0], hi = ranges[r][1] < gsize ? ranges[r][1] : gsize;
+        if (hi <= lo) continue;
         uint64_t p1 = (hi + 4095) >> 12;
         if (p1 > A64_DIRTY_PAGES) p1 = A64_DIRTY_PAGES;
-        for (uint64_t p = lo >> 12; p < p1;) {
-            if (!(p & 31) && p + 32 <= p1) {   /* (32 pages at a time while none is marked) */
-                uint64_t w[4];
-                memcpy(w, &a64_dirty[p], 32);
-                if (!(w[0] | w[1] | w[2] | w[3])) {
-                    p += 32;
-                    continue;
-                }
-            }
-            if (!(p & 7) && p + 8 <= p1) {   /* (eight pages a load while none is marked) */
-                uint64_t w;
-                memcpy(&w, &a64_dirty[p], 8);
-                if (!w) {
-                    p += 8;
-                    continue;
-                }
-            }
-            if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED) && __atomic_exchange_n(&a64_dirty[p], 0, __ATOMIC_ACQUIRE)) {
-                if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
-                out[n++] = (uint32_t)p;
-            }
-            p++;
+        const uint64_t p0 = lo >> 12;
+        if (p0 >= p1) continue;
+#if defined(__x86_64__) || defined(_M_X64)
+        if (use_avx2) {
+            n = collect_range_avx2(p0, p1, &out, n, &cap);
+            continue;
         }
+#endif
+        n = collect_range_scalar(p0, p1, &out, n, &cap);
+    }
+    if (n) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (slot >= 0) {
+        __atomic_store_n(&page_pool_buf[slot], out, __ATOMIC_RELAXED);
+        page_pool_cap[slot] = cap;
     }
     *pages = out;
     return (int64_t)n;
@@ -119,7 +240,19 @@ static int64_t host_collect(uint32_t **pages) {
 }
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { (void)ranges, (void)n; *pages = 0; return 0; }
 #endif
-static void host_free_pages(uint32_t *pages) { free(pages); }
+static void host_free_pages(uint32_t *pages) {
+#if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
+    if (!pages) return;
+    for (int i = 0; i < 2; i++) {
+        if (__atomic_load_n(&page_pool_busy[i], __ATOMIC_RELAXED) &&
+            __atomic_load_n(&page_pool_buf[i], __ATOMIC_RELAXED) == pages) {
+            __atomic_store_n(&page_pool_busy[i], 0, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+#endif
+    free(pages);
+}
 static void host_mark_written(const void *p, uint64_t n) {
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
     hos_mark_written(p, (size_t)n);
@@ -254,8 +387,10 @@ int rx_start(void *hwnd) {
     const char *b = getenv("RX_BACKEND");
     const int eden = b && !_stricmp(b, "eden");
     if (!b || !_stricmp(b, "vulkan") || eden) {   /* (hookshot: Vulkan unless told otherwise; a started game has no RX_BACKEND) */
-        const char *dll = eden ? "mkw_eden.dll" : "hookshot_vk.dll";
+        /* MasterSword ships mastersword_vk.dll; fall back to hookshot_vk.dll for upstream-named folders. */
+        const char *dll = eden ? "mkw_eden.dll" : "mastersword_vk.dll";
         const MkwVkRenderer *r = load_vulkan(dll);
+        if (!r && !eden) r = load_vulkan("hookshot_vk.dll"), dll = r ? "hookshot_vk.dll" : dll;
         if (r && r->start(hwnd)) {
             vk = r;
             hos_log("rx: renderer: %s (%s)", eden ? "Eden's" : "Vulkan", dll);
@@ -271,7 +406,8 @@ int rx_start(void *hwnd) {
 /* (hookshot) hookshot --prepare-shaders: the Vulkan back end started with no window and no game, which prepares
    every shader in its start (gpu/vk/vk_main.cpp started_up) and is then let go. 0 when there is no usable Vulkan */
 int rx_prepare_shaders(void) {
-    const MkwVkRenderer *r = load_vulkan("hookshot_vk.dll");
+    const MkwVkRenderer *r = load_vulkan("mastersword_vk.dll");
+    if (!r) r = load_vulkan("hookshot_vk.dll");
     return r && r->start(NULL);
 }
 /* (hookshot) the window is being closed: a back end still preparing its shaders stops and keeps what it made first (a few

@@ -109,7 +109,7 @@ uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout
     return l.ssbo_at();
 }
 
-/// (hookshot, #940) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
+/// (#940 / #983) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
 /// the address word of an entry of the uniform or storage buffer table its control section lays out. Nothing is bound before the
 /// game, so the storage buffer pass's port (EDEN_NX2_GM_LEGACY=0), which binds an access to a pointer only when that pointer is
 /// mapped (Env::IsCbufStorageBufferPointer), found none and left every access to the run-time search, under the key play then used
@@ -209,6 +209,9 @@ uint32_t sampler_slot_version(int id) {
 uint64_t sampler_registrations_generation() {
     return samp_gen.load(std::memory_order_acquire);
 }
+void samplers_changed() {
+    samp_gen.fetch_add(1, std::memory_order_acq_rel);
+}
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);
     auto it = regs_by_serial.find(serial);
@@ -246,13 +249,21 @@ void driver_bank(const NvnState& s, int bank, int stage, uint8_t d[0xA00]) {
 struct PointerEntry { uint64_t addr, size; };
 constexpr uint32_t kPointerTable = 0x880, kPointerEntries = 3;
 const PointerEntry* pointer_table(const NvnState& s, int stage) {
-    thread_local PointerEntry e[kPointerEntries];
-    thread_local uint64_t for_gen = ~0ull;
-    thread_local const NvnState* for_state = nullptr;
-    thread_local int for_stage = -1;
-    if (for_gen == s.bind_gen && for_state == &s && for_stage == stage) return e;
-    for_gen = s.bind_gen, for_state = &s, for_stage = stage;
-    std::memset(e, 0, sizeof e);
+    const int st = std::clamp(stage, 0, kNvnStages - 1);
+    struct StagePtrCache {
+        PointerEntry e[kPointerEntries]{};
+        uint64_t bind_gen = ~0ull;
+        uint64_t epoch = ~0ull;
+        const NvnState* state = nullptr;
+    };
+    thread_local StagePtrCache cache[kNvnStages];
+    StagePtrCache& c = cache[st];
+    const uint64_t bgen = s.bind_gen;
+    const uint64_t ep = memory_capture_view();
+    if (c.bind_gen == bgen && c.epoch == ep && c.state == &s) return c.e;
+    c.bind_gen = bgen, c.epoch = ep, c.state = &s;
+    PointerEntry* e = c.e;
+    std::memset(e, 0, sizeof c.e);
     uint64_t found[32];
     uint32_t n = 0;
     const auto bound = [&](uint64_t v) {

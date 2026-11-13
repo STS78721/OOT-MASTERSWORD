@@ -21,10 +21,10 @@ def sources():
     menu, api, backend = read("gpu", "vk", "vk_menu.cpp"), read("gpu", "vk", "vk_api.h"), read("host", "rx_backend.c")
     win, sdl = read("host", "display.c"), read("host", "posix", "display_sdl.c")
     if '#include "vk_menu_hit.h"' not in menu or any("menu_hit::%s(" % f not in menu
-                                                      for f in ("options", "controls", "cheats", "list_lines")):
+                                                      for f in ("options", "controls")):
         raise SystemExit("the menu does not hit-test with vk_menu_hit.h")
-    for size in ("menu_hit::kTabY", "menu_hit::kRowH", "menu_hit::rows_top(s)", "menu_hit::tab_slot_w(", "menu_hit::kCtlRowH",
-                 "menu_hit::kCheatTop", "menu_hit::kCheatRowH", "menu_hit::kListTop", "menu_hit::kListRowH"):
+    for size in ("menu_hit::kTabY", "menu_hit::kRowH", "menu_hit::rows_top(s)", "menu_hit::tab_slot_w(",
+                 "menu_hit::kCtlRowH", "menu_hit::kSideW", "menu_hit::kHeadH", "menu_hit::content_x"):
         if size not in menu:
             raise SystemExit("the menu draws without %s: its picture and its hit-test can drift apart" % size)
     if "PostMessageA(app_window(), WM_APP + 8" not in menu:

@@ -1,0 +1,38 @@
+#version 450
+// Hybrid MVec: unproject scene depth with curr VP inverse → prev VP → screen-space pixel delta.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth;
+layout(binding = 1, rgba16f) uniform writeonly image2D out_mv; // xy = pixel delta, z = confidence
+layout(push_constant) uniform P {
+    mat4 curr_inv;
+    mat4 prev;
+    vec2 size;
+    float z_near_eps;
+    float z_far_eps;
+} pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 sz = imageSize(out_mv);
+    if (any(greaterThanEqual(g, sz))) return;
+    const float z = texelFetch(depth, clamp(g, ivec2(0), textureSize(depth, 0) - 1), 0).r;
+    vec2 delta = vec2(0.0);
+    float conf = 0.0;
+    if (z == z && z > pc.z_near_eps && z < 1.0 - pc.z_far_eps) {
+        const vec2 uv = (vec2(g) + 0.5) / pc.size;
+        // Vulkan NDC: y down after present; guest VP often OpenGL-like. Use Vulkan clip: x,y in [-1,1], z in [0,1].
+        const vec4 clip = vec4(uv * 2.0 - 1.0, z, 1.0);
+        vec4 world = pc.curr_inv * clip;
+        if (abs(world.w) > 1e-8) {
+            world /= world.w;
+            vec4 prev_clip = pc.prev * world;
+            if (abs(prev_clip.w) > 1e-8) {
+                prev_clip /= prev_clip.w;
+                const vec2 prev_uv = prev_clip.xy * 0.5 + 0.5;
+                const vec2 prev_px = prev_uv * pc.size - 0.5;
+                delta = prev_px - vec2(g);
+                conf = 1.0;
+            }
+        }
+    }
+    imageStore(out_mv, g, vec4(delta, conf, 1.0));
+}

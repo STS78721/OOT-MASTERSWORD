@@ -1,0 +1,53 @@
+#version 450
+// SMAA neighborhood blending (iryoku/smaa).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D colorTex;
+layout(binding = 1) uniform sampler2D blendTex;
+layout(binding = 2, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P {
+    vec4 metrics; // 1/w, 1/h, w, h
+    ivec2 offset; // crop origin in colorTex when >0; usually 0 after a prior crop pass
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(pc.metrics.zw);
+    if (any(greaterThanEqual(p, size))) return;
+
+    vec2 texcoord = (vec2(p) + 0.5) * pc.metrics.xy;
+    // Fetch blending weights: right / top from neighbours, bottom+left from this pixel (SMAA.hlsl)
+    vec4 a;
+    a.x = textureLod(blendTex, texcoord + vec2(pc.metrics.x, 0.0), 0.0).a; // right
+    a.y = textureLod(blendTex, texcoord + vec2(0.0, -pc.metrics.y), 0.0).g; // top (Vulkan Y down: -y is up in SMAA with FLIP_Y=0 → use +y?)
+    // With SMAA_FLIP_Y 0 and Vulkan top-left origin, "top" neighbour is y-1 in pixel space = -metrics.y in UV if V grows down... 
+    // texcoord increases downward; SMAA's API_V_DIR(1) with FLIP_Y=0 is +1 in pixel Y for "top" in their DX convention.
+    // For Vulkan UV with V+ down, the pixel above is -metrics.y.
+    a.y = textureLod(blendTex, texcoord + vec2(0.0, -pc.metrics.y), 0.0).g;
+    a.wz = textureLod(blendTex, texcoord, 0.0).xz; // bottom / left
+
+    vec2 color_uv = texcoord + vec2(pc.offset) * pc.metrics.xy;
+    if (dot(a, vec4(1.0)) < 1e-5) {
+        vec3 c = textureLod(colorTex, color_uv, 0.0).rgb;
+        imageStore(dst, p, vec4(c, 1.0));
+        return;
+    }
+
+    bool h = max(a.x, a.z) > max(a.y, a.w);
+    vec4 blendingOffset = vec4(0.0, a.y, 0.0, a.w);
+    vec2 blendingWeight = a.yw;
+    if (h) {
+        blendingOffset = vec4(a.x, 0.0, a.z, 0.0);
+        blendingWeight = a.xz;
+    }
+    blendingWeight /= max(dot(blendingWeight, vec2(1.0)), 1e-5);
+    // Vertical offsets: with V+ down, SMAA's +offset.y for "top" weight uses -V in Vulkan → negate y components
+    blendingOffset.y *= -1.0;
+    blendingOffset.w *= -1.0;
+
+    vec4 blendingCoord = texcoord.xyxy + blendingOffset * vec4(pc.metrics.xy, -pc.metrics.xy);
+    blendingCoord += vec4(pc.offset, pc.offset) * pc.metrics.xyxy;
+
+    vec3 c0 = textureLod(colorTex, blendingCoord.xy, 0.0).rgb;
+    vec3 c1 = textureLod(colorTex, blendingCoord.zw, 0.0).rgb;
+    imageStore(dst, p, vec4(blendingWeight.x * c0 + blendingWeight.y * c1, 1.0));
+}

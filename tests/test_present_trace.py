@@ -31,6 +31,9 @@ PREFIX = r'''
 typedef long long LONG64;
 static volatile int present_interval = 1;
 static int64_t next_frame_at, window_start, frames_in_window, shown_at[16];
+static int64_t ms_pace_started;
+enum { HOS_OPT_MS_PACER = 52 };
+int rx_option(int id, int otherwise) { (void)id; return otherwise; }
 static volatile LONG64 presents, shown_count;
 static volatile uint64_t hos_mkw_pacer;
 static uint32_t guest32;

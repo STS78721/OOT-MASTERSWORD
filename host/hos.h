@@ -50,7 +50,7 @@ extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main
 /* (oot-recomp) MKW's own hooks at fixed guest addresses (its frame pacer in nvn_native.c / nn_vi.c, its idle loop in
    hos_thread.c) run only when the lifted main is Mario Kart World's: any other game has other code there */
 int hos_game_is_mkw(void);
-#define HOS_GAME_TITLE "Hookshot"
+#define HOS_GAME_TITLE "MasterSword"
 void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
@@ -104,6 +104,8 @@ void hos_thread_start(HosThread *t);
 void hos_thread_join(HosThread *t);
 void hos_thread_destroy(HosThread *t);
 void hos_thread_set_name(HosThread *t, const char *name);
+int hos_thread_serial(const HosThread *t);   /* (#2709) MainThread / Presentation Thread */
+int64_t hos_spin_ns(void);                  /* (#2709) spin before a wait sleeps: HOS_SPIN_US / HOS_SPIN_OTHER_US */
 void hos_thread_pin(void *h, const char *name);   /* HOS_PIN: host CPU affinity by thread name */
 int hos_game_cores(void);   /* totk_cores.c: HOS_GAME_CORES, or 0 */
 const char *hos_thread_name(HosThread *t);
@@ -113,7 +115,8 @@ int hos_thread_priority(HosThread *t, int set, int value);
 int hos_thread_core(HosThread *t);
 int hos_cores(void);
 /* virtual cores (hos_thread.c, HOS_VCORES=1): a guest thread gives its core up for a block (hos_vcore_away: 1 if it
-   held one) and takes one again after it (hos_vcore_back); checkpoints hand it to a better waiter that asked */
+   held one, or ran without one since an escape) and takes one again after it (hos_vcore_back); checkpoints hand it to a
+   better waiter that asked */
 int hos_vcores_on(void);
 int hos_vcore_away(void);
 void hos_vcore_back(void);

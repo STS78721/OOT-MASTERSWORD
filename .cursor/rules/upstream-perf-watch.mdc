@@ -1,0 +1,24 @@
+---
+description: Notify the user about performance-related upstream Hookshot updates
+alwaysApply: true
+---
+
+# Upstream performance watch
+
+When working in this MasterSword tree, **proactively tell the user** if you notice new performance-related upstream (NotRexed/Hookshot) updates that are not yet ported here.
+
+## What counts as performance-related
+
+- FPS / frame pacing / uncapped rate / realtime step
+- CPU-bound replay, submit, barriers, write-back, mirrors, capture
+- Pipeline / program / shader cache, stutter, precompile
+- VRAM / memory / import / sync cost
+- Present / swapchain / FG timing that affects frame time
+- Wave C style state-list / draw path throughput (#2046 / #1980 / #2032 class work)
+
+## What to do
+
+1. Prefer checking `origin` (`https://github.com/NotRexed/Hookshot.git`) vs this tree when the session touches ports or packaging.
+2. If something new and performance-shaped landed upstream (merged PR, tip commit, release note), **say so in chat** with PR/issue numbers and a one-line why it matters for MasterSword — do not silently ignore it.
+3. Do **not** auto-port or ship unless the user asks; just flag it.
+4. Skip pure branding, docs-only, or unrelated gameplay fixes unless they clearly change frame time.

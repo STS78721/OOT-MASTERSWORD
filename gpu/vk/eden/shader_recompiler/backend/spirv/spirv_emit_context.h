@@ -19,8 +19,6 @@
 
 namespace Shader::Backend::SPIRV {
 
-static std::bitset<8> clip_distance_written;
-
 using Sirit::Id;
 
 class VectorTypes {
@@ -369,6 +367,8 @@ public:
     bool need_input_position_indirect{};
     Id input_position{};
     std::array<InputGenericInfo, 32> input_generics{};
+    /// Screen-linear fragment inputs read through perspective interpolation, times FragCoord.w.
+    std::array<bool, 32> noperspective_as_smooth_inputs{};
 
     Id output_point_size{};
     Id output_position{};
@@ -399,6 +399,9 @@ public:
     Id mesh_attributes{};
     Id mesh_map{};
     Id mesh_primitive_count{};
+    /// (hookshot) a fallback mesh workgroup's slot (task workgroup * threads + its index), read from the task's map in the
+    /// entry block (EmitMeshPrologue); invalid without a task program, where the slot is the workgroup id
+    Id mesh_fallback_slot{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
     MeshInfo mesh_info{};

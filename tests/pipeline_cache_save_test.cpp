@@ -162,7 +162,7 @@ int run(const std::string& name) {
         pipeline_cache_save(true);
         CHECK(new_file() && queries == 1 && replacements == 1);
     } else if (name == "api-results") {
-        for (Fault f : {QUERY_FAIL, EMPTY, COPY_FAIL}) {
+        for (Fault f : {QUERY_FAIL, EMPTY, COPY_FAIL, COPY_INCOMPLETE, COPY_OVERSIZE}) {
             fault = f;
             pipeline_cache_save(true);
             CHECK(old_file() && replacements == 0 && save_errors == 0 && start_errors == 0);
@@ -170,6 +170,16 @@ int run(const std::string& name) {
         fault = NONE;
         pipeline_cache_save(true);
         CHECK(new_file() && replacements == 1);
+    } else if (name == "actual-size") {
+        fault = COPY_SHORT;
+        pipeline_cache_save(true);
+        CHECK(pcache_saved_size == cache_size - 1);
+        FILE* f = std::fopen(pcache_path.c_str(), "rb"); CHECK(f);
+        CHECK(std::fseek(f, 0, SEEK_END) == 0);
+        CHECK(std::ftell(f) == (long)(cache_size - 1)); std::fclose(f);
+        fault = NONE;
+        pipeline_cache_save(true);
+        CHECK(new_file() && pcache_saved_size == cache_size && replacements == 2);
     } else if (name == "short-write") {
         fault = SHORT_WRITE;
         pipeline_cache_save(true);

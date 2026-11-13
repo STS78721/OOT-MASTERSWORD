@@ -46,6 +46,8 @@ static struct {
     int motion, motion_on;
     int64_t motion_retry_ns, used_ns;
     uint64_t input_sig;
+    unsigned rested;   /* (hookshot) the sticks' axes seen at rest since it was opened, a bit each: only those steer */
+    signed char held[4];   /* (the way each axis was last held, -1, 0 or 1: one held the other way has passed its rest) */
     uint32_t serial;
     float bias[3], bias_t;
     int has_bias;
@@ -73,6 +75,7 @@ static int motion_head, motion_count, motion_live;
 static volatile LONG gyro_status;   /* 0 no controller, 1 controllers but none with a gyro, 2 one with a gyro */
 
 int32_t hos_stick_axis(int16_t v, int zone);   /* nn_hid.c: the menu's Stick dead zone, as XInput's pads */
+int32_t hos_stick_scale(int32_t v, int percent);   /* nn_hid.c: Left/Right stick speed percent */
 
 static int32_t stick_value(int16_t v, int flip, int zone) {
     const int32_t a = hos_stick_axis(v, zone);
@@ -310,6 +313,8 @@ static void pads_poll(void) {
                 pads[slot].motion_on = 0;
                 pads[slot].motion_retry_ns = 0;
                 pads[slot].used_ns = now, pads[slot].input_sig = 0;   /* (just connected: the one about to be used) */
+                pads[slot].rested = 0;
+                memset(pads[slot].held, 0, sizeof pads[slot].held);
                 pads[slot].serial = ++pads_opened;
                 pads[slot].has_bias = 0;
                 hos_log("hid: controller \"%s\" connected (SDL)%s", hos_sdl_pad_name(gc),
@@ -345,13 +350,28 @@ static void pads_poll(void) {
                 if (hos_sdl_pad_button(gc, k)) b |= 1ULL << k;
             if (hos_sdl_pad_axis(gc, AX_LT) > 8000) b |= 1ULL << HOS_PAD_LTRIGGER;
             if (hos_sdl_pad_axis(gc, AX_RT) > 8000) b |= 1ULL << HOS_PAD_RTRIGGER;
+            /* DualSense / DualShock 4 touchpad click. SDL numbers it 20. Unbound, it opens the Insert menu. */
+            if (hos_sdl_pad_button(gc, 20)) b |= 1ULL << HOS_PAD_TOUCHPAD;
             const int inv_x = rx_option(16, 0);
             const int inv_y = rx_option(17, 0);
             const int z = rx_option(11, 0);   /* (the menu's Stick dead zone: nn_hid.c's hos_stick_axis) */
-            const int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x, z),
-                                  stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1, z)};
+            const int l_sens = rx_option(HOS_OPT_STICK_L_SENS, 100);
+            const int r_sens = rx_option(HOS_OPT_STICK_R_SENS, 100);
+            int32_t v[4] = {stick_value(hos_sdl_pad_axis(gc, AX_LX), 0, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_LY), 1, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_RX), inv_x, z),
+                            stick_value(hos_sdl_pad_axis(gc, AX_RY), inv_y ? 0 : 1, z)};
+            /* (hookshot) An axis steers once it has been seen at rest (inside the dead zone) since the pad was opened. */
+            for (int k = 0; k < 4; k++) {
+                const signed char way = (signed char)(v[k] > 0 ? 1 : v[k] < 0 ? -1 : 0);
+                if (!way || (pads[i].held[k] && way != pads[i].held[k])) pads[i].rested |= 1u << k;
+                pads[i].held[k] = way;
+                if (!(pads[i].rested >> k & 1)) v[k] = 0;
+            }
+            v[0] = hos_stick_scale(v[0], l_sens);
+            v[1] = hos_stick_scale(v[1], l_sens);
+            v[2] = hos_stick_scale(v[2], r_sens);
+            v[3] = hos_stick_scale(v[3], r_sens);
             for (int k = 0; k < 4; k++)
                 if ((v[k] < 0 ? -v[k] : v[k]) > (s[k] < 0 ? -s[k] : s[k])) s[k] = v[k];
             {   /* (motion: the pad last used; a stick counts by which way it is pushed, not by how far) */

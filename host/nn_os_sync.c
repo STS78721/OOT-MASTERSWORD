@@ -6,6 +6,7 @@
    initializers) is created on first use. Mutexes are always recursive: relocking a non-recursive nn::os mutex
    would be a game bug on hardware anyway. */
 #include "hos.h"
+#include "../gpu/vk/compat/hookshot_env.h"
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
@@ -19,10 +20,12 @@ typedef struct Obj {
     int kind;
     SRWLOCK lk;
     CONDITION_VARIABLE cv;
+    CONDITION_VARIABLE qput_cv;
     /* mutex / rwlock */
     HosThread *owner;
     int count, readers;
     int mwait;   /* mutex: threads asleep on it (or about to be): unlock wakes only then */
+    int cwait;   /* event / semaphore: threads asleep on cv */
     /* event / timer */
     int signaled, autoclear;
     int64_t due_ns, period_ns;
@@ -31,6 +34,7 @@ typedef struct Obj {
     /* queue */
     uint64_t *q;
     int qcap, qhead, qlen;
+    int qget_wait, qput_wait, qpeek_wait;
     /* condvar */
     uint64_t gen;
     /* (EvilOOT) Horizon's handoff: mutex: condition variable waiters a signal has woken that the mutex is owed to;
@@ -191,8 +195,15 @@ static Obj *obj_lookup(uint64_t key, int kind);
    of the shared table and a cache miss on a scattered object). Game threads use a few objects over and over: a small
    direct-mapped cache per thread answers those. An entry holds while its object is still that address's and of the
    kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off. */
+static Obj *obj_nockpt(uint64_t key, int kind);
 static Obj *obj(uint64_t key, int kind) {
     hos_vcore_checkpoint();   /* (virtual cores: every nn::os call, where a better waiter takes the core) */
+    return obj_nockpt(key, kind);
+}
+/* obj without the checkpoint, for lookups under a host lock: a checkpoint there can give the core up and wait for one
+   while the lock is held, and a thread that holds a core can then block on that lock (wait_any's scan under mw_lock vs
+   poke_multiwait: a stall until the 250 ms vcore escape) */
+static Obj *obj_nockpt(uint64_t key, int kind) {
     /* (hookshot: 128 still missed: obj_lookup was the busiest leaf in dense Kokiri, 3.2% of all samples, 4.3% of the instants when one
        thread alone ran; each actor has its own mutexes) */
     static _Thread_local struct { uint64_t key; Obj *o; } cache[1024];
@@ -244,6 +255,7 @@ static Obj *obj_lookup(uint64_t key, int kind) {
         }
         InitializeSRWLock(&o->lk);
         InitializeConditionVariable(&o->cv);
+        InitializeConditionVariable(&o->qput_cv);
         __atomic_store_n(&o->key, key, __ATOMIC_RELAXED);
         __atomic_store_n(&o->kind, kind, __ATOMIC_RELEASE);
         insert_locked(o);
@@ -287,6 +299,16 @@ typedef struct { uint64_t key; int n; } MwWatched;
 static MwWatched *mw_watched;
 static int mw_nwatched, mw_capwatched;
 static int mw_watch_incomplete;   /* failed registration: keep old global wakes for this process */
+static uint64_t mw_bloom;          /* 64-bit 2-probe Bloom filter of mw_watched keys for lock-free fast rejection */
+static inline uint64_t mw_key_bits(uint64_t key) {
+    const uint64_t h = (key * 0x9E3779B97F4A7C15ULL) >> 52;
+    return (1ULL << (h & 63)) | (1ULL << ((h >> 6) & 63));
+}
+static void mw_rebuild_bloom_locked(void) {
+    uint64_t b = 0;
+    for (int i = 0; i < mw_nwatched; i++) b |= mw_key_bits(mw_watched[i].key);
+    __atomic_exchange_n(&mw_bloom, b, __ATOMIC_SEQ_CST);
+}
 static int mw_watched_at_locked(uint64_t key) {
     for (int i = 0; i < mw_nwatched; i++)
         if (mw_watched[i].key == key) return i;
@@ -297,52 +319,55 @@ static void mw_watch_add_locked(uint64_t key) {
     if (i >= 0) { mw_watched[i].n++; return; }
     if (mw_nwatched == mw_capwatched) {
         MwWatched *w = (MwWatched *)realloc(mw_watched, (mw_capwatched ? mw_capwatched * 2 : 16) * sizeof *w);
-        if (!w) { mw_watch_incomplete = 1; return; }
+        if (!w) { __atomic_store_n(&mw_watch_incomplete, 1, __ATOMIC_SEQ_CST); return; }
         mw_watched = w;
         mw_capwatched = mw_capwatched ? mw_capwatched * 2 : 16;
     }
     mw_watched[mw_nwatched].key = key, mw_watched[mw_nwatched].n = 1;
     mw_nwatched++;
+    mw_rebuild_bloom_locked();
 }
 static void mw_watch_remove_locked(uint64_t key) {
     const int i = mw_watched_at_locked(key);
-    if (i >= 0 && --mw_watched[i].n <= 0) mw_watched[i] = mw_watched[--mw_nwatched];
+    if (i >= 0 && --mw_watched[i].n <= 0) {
+        mw_watched[i] = mw_watched[--mw_nwatched];
+        mw_rebuild_bloom_locked();
+    }
 }
 /* o: the object that changed. Only an object some holder links into a multi-wait can make a WaitAny ready, so the
    others no longer wake every WaitAny: each event, semaphore or queue change anywhere woke them all, and OoT's three
    nn.npln threads (offline: their own events never set) woke ~8,500 times a second each to sleep again, 57% of the game's
-   context switches. The check is under mw_lock, as Link and WaitAny's scan are: a link before it is seen here, one after
-   it is followed by a scan that sees the stored state. HOS_MW_WAKE=all: every change, as before */
+   context switches. A 64-bit Bloom filter rejects unwatched objects lock-free before touching mw_lock.
+   HOS_MW_WAKE=all: every change, as before */
 static void poke_multiwait(Obj *o) {
     static int all = -1;
     if (all < 0) all = getenv("HOS_MW_WAKE") && !strcmp(getenv("HOS_MW_WAKE"), "all");
     if (!InterlockedCompareExchange(&mw_waiting, 0, 0)) return;
-    AcquireSRWLockExclusive(&mw_lock);
+    if (!all && !__atomic_load_n(&mw_watch_incomplete, __ATOMIC_RELAXED) && o) {
+        const uint64_t bits = mw_key_bits(o->key);
+        if ((__atomic_load_n(&mw_bloom, __ATOMIC_SEQ_CST) & bits) != bits) return;
+    }
+    AcquireSRWLockShared(&mw_lock);
     const int wake = all || mw_watch_incomplete || !o || mw_watched_at_locked(o->key) >= 0;
-    ReleaseSRWLockExclusive(&mw_lock);
+    ReleaseSRWLockShared(&mw_lock);
     if (wake) WakeAllConditionVariable(&mw_cv);
 }
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
 #include <emmintrin.h>
 static int64_t spin_ns(void) {
-    static int64_t ns = -1;
-    if (ns < 0) {
-        const char *e = getenv("HOS_SPIN_US");
-        ns = (e ? atoll(e) : 20) * 1000;
-    }
-    return ns;
+    return hos_spin_ns();   /* (#2709) serial vs other threads; HOS_SPIN_US / HOS_SPIN_OTHER_US */
 }
 static int spin_begin(Obj *o, int *misses) {
     if (spin_ns() <= 0) return 0;
     static int adaptive = -1;
     if (adaptive < 0) adaptive = getenv("HOS_SPIN_ALWAYS") == NULL;
     *misses = __atomic_load_n(&o->spin_misses, __ATOMIC_RELAXED);
-    return !(adaptive && *misses >= 4 && (__atomic_add_fetch(&o->spin_waits, 1, __ATOMIC_RELAXED) & 31));
+    return !(adaptive && *misses >= 2 && (__atomic_add_fetch(&o->spin_waits, 1, __ATOMIC_RELAXED) & 63));
 }
 static void spin_end(Obj *o, int misses, int ok) {
     if (ok) __atomic_store_n(&o->spin_misses, 0, __ATOMIC_RELAXED);
-    else if (misses < 4) __atomic_store_n(&o->spin_misses, misses + 1, __ATOMIC_RELAXED);
+    else if (misses < 2) __atomic_store_n(&o->spin_misses, misses + 1, __ATOMIC_RELAXED);
 }
 static void spin_until_set(Obj *o, volatile int *flag) {
     int misses;
@@ -441,12 +466,12 @@ static void cv_enter(Obj *cv, Obj *m) {
     if (cv->cv_waiting && cv->cv_mutex != m) cv->cv_mixed = 1;
     if (!cv->cv_waiting) cv->cv_mixed = 0;
     cv->cv_mutex = m;
-    cv->cv_waiting++;
+    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);   /* (atomic: a signal reads it without cv->lk) */
 }
 /* a waiter out (cv->lk held): whether a signal reserved its mutex m for it. A reservation made on another mutex (a
    waiter with a different one came in after the signal) is given back: never left owed to nobody */
 static int cv_leave(Obj *cv, Obj *m) {
-    cv->cv_waiting--;
+    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
     if (cv->cv_owed <= 0) return 0;
     Obj *r = cv->cv_owed_mutex[--cv->cv_owed];
     if (r == m) return 1;
@@ -568,14 +593,23 @@ HLE(_ZN2nn2os28IsMutexLockedByCurrentThreadEPKNS0_9MutexTypeE) {
 /* ---- condition variable ---------------------------------------------------------------------------------- */
 HLE(_ZN2nn2os27InitializeConditionVariableEPNS0_21ConditionVariableTypeE) { fresh(ARG(0), K_COND); }
 HLE(_ZN2nn2os25FinalizeConditionVariableEPNS0_21ConditionVariableTypeE) { drop(ARG(0)); }
+/* (#2708) A signal with no waiter returns at once (~2,500 signals/frame). HOS_CV_SIGNAL_ALWAYS=1: every signal takes the lock. */
+static int cv_signal_always(void) {
+    static int v = -1;
+    int on = __atomic_load_n(&v, __ATOMIC_RELAXED);
+    if (on < 0) __atomic_store_n(&v, on = env_on("HOS_CV_SIGNAL_ALWAYS"), __ATOMIC_RELAXED);
+    return on;
+}
 HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     Obj *cv = obj(ARG(0), K_COND);
     if (watched_cv(ARG(0))) watch_log("signal", watch_mutex(), ARG(0), c, NULL);
+    if (!__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST) && !cv_signal_always()) return;
     AcquireSRWLockExclusive(&cv->lk);
+    const int had_waiters = cv->cv_waiting > 0;
     cv_reserve(cv);
     cv->gen++;
     ReleaseSRWLockExclusive(&cv->lk);
-    WakeConditionVariable(&cv->cv);
+    if (had_waiters) WakeConditionVariable(&cv->cv);
 }
 HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
@@ -609,9 +643,14 @@ static void event_init(uint64_t key, int signaled, int clear_mode) {
 static void event_signal(Obj *e) {
     AcquireSRWLockExclusive(&e->lk);
     e->signaled = 1;
+    const int waiters = e->cwait;
+    const int single = e->autoclear || waiters == 1;
     if (wake_lat_on()) e->sig_ns = hos_now_ns();
     ReleaseSRWLockExclusive(&e->lk);
-    WakeAllConditionVariable(&e->cv);
+    if (waiters > 0) {
+        if (single) WakeConditionVariable(&e->cv);
+        else WakeAllConditionVariable(&e->cv);
+    }
     poke_multiwait(e);
 }
 static void event_clear(Obj *e) {
@@ -665,12 +704,31 @@ static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
     AcquireSRWLockExclusive(&e->lk);
     const int spun = !was_set && e->signaled;
     while (!e->signaled) {
-        if (try_only || (timeout_ns > 0 && !wait_until(e, deadline))) break;
-        if (timeout_ns <= 0) hos_cv_sleep(&e->cv, &e->lk, INFINITE);
+        if (try_only) break;
+        if (timeout_ns > 0) {
+            e->cwait++;
+            const int ok = wait_until(e, deadline);
+            if (e->cwait > 0) e->cwait--;
+            if (!ok) break;
+        } else {
+            e->cwait++;
+            hos_cv_sleep(&e->cv, &e->lk, INFINITE);
+            if (e->cwait > 0) e->cwait--;
+        }
         slept = 1;
     }
     int got = e->signaled;
     if (got && !try_only && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - e->sig_ns : 0);
+    if (got && e->autoclear) e->signaled = 0;
+    ReleaseSRWLockExclusive(&e->lk);
+    return got;
+}
+
+/* event_wait(e, 0, 1) without its spin, sleep and wake-latency note: for WaitAny's scan, which holds mw_lock and
+   may make no scheduling point (vcore checkpoint, yield, sleep) there. Set: taken (cleared when auto-clear) */
+static int event_peek(Obj *e) {
+    AcquireSRWLockExclusive(&e->lk);
+    const int got = e->signaled;
     if (got && e->autoclear) e->signaled = 0;
     ReleaseSRWLockExclusive(&e->lk);
     return got;
@@ -874,7 +932,11 @@ static void sema_init(uint64_t key, int initial, int max) {
 static void sema_acquire(Obj *s) {
     spin_until_set(s, &s->sem);
     AcquireSRWLockExclusive(&s->lk);
-    while (s->sem <= 0) hos_cv_sleep(&s->cv, &s->lk, INFINITE);
+    while (s->sem <= 0) {
+        s->cwait++;
+        hos_cv_sleep(&s->cv, &s->lk, INFINITE);
+        if (s->cwait > 0) s->cwait--;
+    }
     s->sem--;
     ReleaseSRWLockExclusive(&s->lk);
 }
@@ -882,8 +944,12 @@ static void sema_release(Obj *s, int n) {
     AcquireSRWLockExclusive(&s->lk);
     s->sem += n;
     if (s->sem_max && s->sem > s->sem_max) s->sem = s->sem_max;
+    const int waiters = s->cwait;
     ReleaseSRWLockExclusive(&s->lk);
-    WakeAllConditionVariable(&s->cv);
+    if (waiters > 0) {
+        if (n == 1 || waiters == 1) WakeConditionVariable(&s->cv);
+        else WakeAllConditionVariable(&s->cv);
+    }
     poke_multiwait(s);
 }
 HLE(_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii) { sema_init(ARG(0), (int)ARG(1), (int)ARG(2)); }
@@ -919,7 +985,9 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
     AcquireSRWLockExclusive(&q->lk);
     while (q->qlen == q->qcap) {
         if (try_only) { ReleaseSRWLockExclusive(&q->lk); return 0; }
-        hos_cv_sleep(&q->cv, &q->lk, INFINITE);
+        q->qput_wait++;
+        hos_cv_sleep(&q->qput_cv, &q->lk, INFINITE);
+        if (q->qput_wait > 0) q->qput_wait--;
     }
     if (jam) {
         q->qhead = (q->qhead + q->qcap - 1) % q->qcap;
@@ -928,9 +996,13 @@ static int queue_put(Obj *q, uint64_t v, int jam, int try_only) {
         q->q[(q->qhead + q->qlen) % q->qcap] = v;
     }
     q->qlen++;
+    const int rwait = q->qget_wait, pwait = q->qpeek_wait;
     if (wake_lat_on()) q->sig_ns = hos_now_ns();
     ReleaseSRWLockExclusive(&q->lk);
-    WakeAllConditionVariable(&q->cv);
+    if (rwait > 0) {
+        if (!pwait) WakeConditionVariable(&q->cv);
+        else WakeAllConditionVariable(&q->cv);
+    }
     poke_multiwait(q);
     return 1;
 }
@@ -943,19 +1015,27 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
     AcquireSRWLockExclusive(&q->lk);
     const int spun = !was_set && q->qlen;
     while (!q->qlen) {
-        if (timeout_ns == 0 || (timeout_ns > 0 && !wait_until(q, deadline))) { ReleaseSRWLockExclusive(&q->lk); return 0; }
-        if (timeout_ns < 0) hos_cv_sleep(&q->cv, &q->lk, INFINITE);
+        if (timeout_ns == 0) { ReleaseSRWLockExclusive(&q->lk); return 0; }
+        q->qget_wait++;
+        if (!take) q->qpeek_wait++;
+        const int ok = timeout_ns > 0 ? wait_until(q, deadline) : (hos_cv_sleep(&q->cv, &q->lk, INFINITE), 1);
+        if (q->qget_wait > 0) q->qget_wait--;
+        if (!take && q->qpeek_wait > 0) q->qpeek_wait--;
+        if (!ok) { ReleaseSRWLockExclusive(&q->lk); return 0; }
         slept = 1;
     }
     if (timeout_ns != 0 && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - q->sig_ns : 0);
     *out = q->q[q->qhead];
+    int wwait = 0;
     if (take) {
         q->qhead = (q->qhead + 1) % q->qcap;
         q->qlen--;
+        wwait = q->qput_wait;
     }
     ReleaseSRWLockExclusive(&q->lk);
     if (take) {
-        WakeAllConditionVariable(&q->cv);
+        if (wwait == 1) WakeConditionVariable(&q->qput_cv);
+        else if (wwait > 1) WakeAllConditionVariable(&q->qput_cv);
         poke_multiwait(q);
     }
     return 1;
@@ -1060,14 +1140,15 @@ static void holder(Ctx *c, int what) {
     h->sem_max = what;   /* the kind of object watched (Obj fields reused: a holder has no semaphore) */
 }
 /* Ready now? Consumes an auto-clear event's signal, as the kernel does when a wait is satisfied by it. */
+/* (under mw_lock: lookups without the vcore checkpoint, obj_nockpt) */
 static int holder_ready(Obj *h) {
     switch (h->sem_max) {
-    case H_EVENT: return event_wait(obj(h->event, K_EVENT), 0, 1);
-    case H_TIMER: { Obj *t = obj(h->event, K_TIMER); return t->due_ns && hos_now_ns() >= t->due_ns; }
+    case H_EVENT: return event_peek(obj_nockpt(h->event, K_EVENT));
+    case H_TIMER: { Obj *t = obj_nockpt(h->event, K_TIMER); return t->due_ns && hos_now_ns() >= t->due_ns; }
     case H_THREAD: return 0;   /* thread exit is not tracked as an object yet */
-    case H_SEMA: { Obj *s = obj(h->event, K_SEMA); return s->sem > 0; }
-    case H_QUEUE_NOT_EMPTY: { Obj *q = obj(h->event, K_QUEUE); return q->qlen > 0; }
-    case H_QUEUE_NOT_FULL: { Obj *q = obj(h->event, K_QUEUE); return q->qlen < q->qcap; }
+    case H_SEMA: { Obj *s = obj_nockpt(h->event, K_SEMA); return s->sem > 0; }
+    case H_QUEUE_NOT_EMPTY: { Obj *q = obj_nockpt(h->event, K_QUEUE); return q->qlen > 0; }
+    case H_QUEUE_NOT_FULL: { Obj *q = obj_nockpt(h->event, K_QUEUE); return q->qlen < q->qcap; }
     default: return 0;         /* native handles: never, without a kernel behind them */
     }
 }
@@ -1126,7 +1207,7 @@ static uint64_t wait_any(uint64_t multiwait, int64_t timeout_ns) {
         for (int i = 0; i < mw->nlinks && !found; i++) {
             if (holder_ready(mw->links[i])) found = mw->links[i]->key;
             else if (mw->links[i]->sem_max == H_TIMER) {
-                const int64_t due = obj(mw->links[i]->event, K_TIMER)->due_ns;
+                const int64_t due = obj_nockpt(mw->links[i]->event, K_TIMER)->due_ns;
                 if (due && due < wake) wake = due;
             }
         }

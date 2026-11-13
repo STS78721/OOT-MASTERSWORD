@@ -133,24 +133,19 @@ static int valid_app_id(const char *s) {
         if (*s < '0' || *s > '9') return 0;
     return 1;
 }
-/* the application id: HOS_DISCORD_APP_ID, then hookshot_options.ini's discord_app_id=, then the default */
+/* the application id: HOS_DISCORD_APP_ID, then options.ini's discord_app_id=, then the default */
 static void read_app_id(char *out, size_t cap) {
     snprintf(out, cap, "%s", HOOKSHOT_DISCORD_APP_ID_DEFAULT);
     char path[1024];
-    const DWORD n = hos_game_path_a(path, (DWORD)sizeof path);
-    char *slash = n ? (strrchr(path, '\\') ? strrchr(path, '\\') : strrchr(path, '/')) : NULL;
-    if (slash) {
-        snprintf(slash + 1, (size_t)(path + sizeof path - slash - 1), "hookshot_options.ini");
-        FILE *f = fopen(path, "r");
-        if (f) {
-            char line[128];
-            while (fgets(line, sizeof line, f))
-                if (!strncmp(line, "discord_app_id=", 15)) {
-                    line[strcspn(line, "\r\n")] = 0;
-                    if (valid_app_id(line + 15)) snprintf(out, cap, "%s", line + 15);
-                }
-            fclose(f);
-        }
+    FILE *f = hos_open_options_r(path, (DWORD)sizeof path);
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "discord_app_id=", 15)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (valid_app_id(line + 15)) snprintf(out, cap, "%s", line + 15);
+            }
+        fclose(f);
     }
     const char *e = getenv("HOS_DISCORD_APP_ID");
     if (e && valid_app_id(e)) snprintf(out, cap, "%s", e);

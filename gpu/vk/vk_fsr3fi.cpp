@@ -327,7 +327,7 @@ uint32_t asked() {
         return e && *e ? std::max(0, atoi(e)) : -1;
     }();
     if (env >= 0) return env ? 1u : 0u;
-    return opts.framegen == 2 ? 1u : 0u;
+    return (opts.fg_backend == 4 && opts.framegen == 2) ? 1u : 0u;
 }
 
 /// A memory dependency over the whole queue, in the synchronization2 form this renderer loads.

@@ -415,13 +415,7 @@ static void binds_load(void) {
     }
     binds_default();
     char path[MAX_PATH];
-    const DWORD len = hos_game_path_a(path, MAX_PATH);
-    char *slash = len ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/') */
-    FILE *f = NULL;
-    if (slash) {
-        snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
-        f = fopen(path, "r");
-    }
+    FILE *f = hos_open_options_r(path, MAX_PATH);   /* mastersword_options.ini, else hookshot_options.ini */
     int changed = 0;
     if (f) {
         char line[80];
@@ -460,7 +454,7 @@ static void binds_load(void) {
             }
         }
     }
-    if (changed) hos_log("hid: %d controls from hookshot_options.ini", changed);
+    if (changed) hos_log("hid: %d controls from options.ini", changed);
     InterlockedExchange(&state, 2);
 }
 int hos_binding(int set, int button, int slot) {
@@ -503,6 +497,17 @@ int32_t hos_stick_axis(int16_t v, int zone) {
     static const int32_t cut[6] = {7849, 1638, 3277, 4915, 6553, 9830};
     const int32_t a = v < -32767 ? -32767 : v, t = cut[(unsigned)zone < 6 ? zone : 0];
     return (a > t || a < -t) ? a : 0;
+}
+
+/* Left / right stick speed (HOS_OPT_STICK_L_SENS / HOS_OPT_STICK_R_SENS): percent of deflection, 100 = stock */
+int32_t hos_stick_scale(int32_t v, int percent) {
+    if (!v || percent == 100) return v;
+    if (percent < 10) percent = 10;
+    if (percent > 500) percent = 500;
+    const long long n = (long long)v * percent / 100;
+    if (n > 32767) return 32767;
+    if (n < -32767) return -32767;
+    return (int32_t)n;
 }
 
 static void pads_read(uint64_t *buttons, int32_t stick[4]) {
@@ -571,9 +576,15 @@ static void pads_read(uint64_t *buttons, int32_t stick[4]) {
         int32_t v[4];
         int rx_option(int id, int otherwise);
         const int zone = rx_option(11, 0);   /* (the menu's Stick dead zone) */
+        const int l_sens = rx_option(HOS_OPT_STICK_L_SENS, 100);
+        const int r_sens = rx_option(HOS_OPT_STICK_R_SENS, 100);
         for (int i = 0; i < 4; i++) v[i] = hos_stick_axis(thumb[i], zone);
         if (rx_option(16, 0)) v[2] = -v[2];
         if (rx_option(17, 0)) v[3] = -v[3];
+        v[0] = hos_stick_scale(v[0], l_sens);
+        v[1] = hos_stick_scale(v[1], l_sens);
+        v[2] = hos_stick_scale(v[2], r_sens);
+        v[3] = hos_stick_scale(v[3], r_sens);
         stick_max(s, v);
     }
     InterlockedExchange(&pad_raw_now, (LONG)raw);
@@ -670,6 +681,7 @@ static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int 
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
+    void hos_mouse_native_stick(int held);
     scripted_input(buttons, stick);
     /* A scripted run (a test) takes no input from the player's devices until 5 s after its last press (a variable
        left set in a shell no longer leaves the game without controls), and otherwise the pads count only
@@ -714,16 +726,21 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         if (bound_down(i, 0)) *buttons |= 1ULL << i;
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
-       stick; also the stick while the player camera does not run (the pause menu, other cameras: mouse_native.c) */
+       stick; also the stick while the game does not give the camera free control (a menu, a lock-on, the pause menu,
+       other cameras: mouse_native.c) and while a button it takes the stick for is held: ZR (the bow's aim), L (the
+       item wheel) or R, where the mouse points as it does in As the stick */
     static const char *native_env;
     static int native_looked;
     if (!native_looked) native_looked = 1, native_env = getenv("HOS_MOUSE_NATIVE");
     const int native = native_env ? atoi(native_env) != 0 : rx_option(6, 0);
     int hos_mouse_native(void);
+    void hos_mouse_native_free(int free);
+    const uint64_t game_stick = (1ULL << B_ZR) | (1ULL << B_L) | (1ULL << B_R);
     int captured = 0, as_stick = !native;
     if (native) {
         mouse_setup();
         mouse_sens_keys();
+        hos_mouse_native_free(!(*buttons & game_stick));
         captured = hos_mouse_native();
         if (captured < 0) captured = 0, as_stick = 1;
     }
@@ -742,6 +759,9 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
                              (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
                              cx * 32767, cy * 32767};
     stick_max(stick, keys);
+    /* (hookshot, mouse_native.c) the keys and the pads are the right stick too: while they turn the camera, its angles are
+       the native mouse's new start, so the two do not undo each other */
+    hos_mouse_native_stick(stick[2] != 0 || stick[3] != 0);
 }
 
 static void vibration_send(uint64_t handle, uint64_t value);

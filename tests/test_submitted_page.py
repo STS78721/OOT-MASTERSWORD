@@ -1,7 +1,11 @@
 """A replay read reuses the last answer for that page until a stamp or a new capture.
 
 Once a capture exists, every uniform word took the pool lock to ask whether its page
-was in one. python -I -B tests/test_submitted_page.py [--cxx g++]
+was in one. The answers are kept per page, 32 a thread: a handle program reads a word
+of a uniform buffer on one page and a word of a storage buffer on another, and with
+one page kept every such read missed. Only "in no capture" is kept: a captured page's
+words are copied from the capture at each read, not a 4 KB copy of the page a thread.
+python -I -B tests/test_submitted_page.py [--cxx g++]
 """
 import argparse
 import subprocess
@@ -32,6 +36,16 @@ def main():
     lock_at = read.index("std::lock_guard lk(pools_mu)")
     if reuse_at > lock_at:
         raise SystemExit("the page is looked up under the pool lock before the cache")
+    if read.count("submitted_page_for(page0)") != 1:
+        raise SystemExit("memory_read_as_submitted does not look its page up in the per-page cache")
+    if "page0 == page1 && from == 0" not in read:
+        raise SystemExit("memory_read_as_submitted keeps an answer for a page a capture holds")
+    struct = block(source, "struct SubmittedPage {") + ";"
+    count = source[source.index("constexpr int kSubmittedPages"):]
+    count = count[:count.index(";") + 1]
+    slot = block(source, "inline SubmittedPage& submitted_page_for(")
+    pages = source[source.index("thread_local SubmittedPage submitted_pages["):]
+    pages = pages[:pages.index(";") + 1]
     for name in ("void memory_stamp(", "void memory_collect_written(", "bool take_capture("):
         body = block(source, name)
         if "cap_view_bump()" not in body:
@@ -41,13 +55,26 @@ def main():
 #include <cstdlib>
 #define CHECK(x) do {{ if (!(x)) {{ std::fprintf(stderr, "FAIL:%d %s\\n", __LINE__, #x); std::exit(1); }} }} while (0)
 {fn}
+{struct}
+{count}
+{pages}
+{slot}
 int main() {{
     CHECK(submitted_page_reuse(9, 4, 7, 9, 4, 7));
     CHECK(!submitted_page_reuse(9, 4, 8, 9, 4, 7));
     CHECK(!submitted_page_reuse(9, 5, 7, 9, 4, 7));
     CHECK(!submitted_page_reuse(10, 4, 7, 9, 4, 7));
     CHECK(!submitted_page_reuse(9, 4, 7, 9, 4, 0));
-    std::printf("PASS: a captured page is reused only for that generation\\n");
+    // (a page and its neighbour, and pages a slot-count apart, keep separate answers: a uniform and a storage word read in
+    // turn hit both)
+    CHECK((kSubmittedPages & (kSubmittedPages - 1)) == 0);
+    // (no copy of a page in a slot: the table is a few hundred bytes of TLS a thread, not 128 KB)
+    CHECK(sizeof(submitted_pages) <= 1024);
+    for (uint64_t p = 0; p < (1u << 20); p++) {{
+        CHECK(&submitted_page_for(p) != &submitted_page_for(p + 1));
+        CHECK(&submitted_page_for(p) != &submitted_page_for(p + kSubmittedPages));
+    }}
+    std::printf("PASS: a captured page is reused only for that generation; neighbouring pages keep their own; no page copies kept\\n");
 }}
 '''
     with tempfile.TemporaryDirectory(prefix="submitted-page-") as tmp:

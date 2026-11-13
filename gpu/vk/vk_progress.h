@@ -124,7 +124,7 @@ inline StartupView startup_view(const StartupState& s) {
         return v;
     }
     if (s.finished) {
-        if (s.secs >= 1.0) v.title = "Starting the game";
+        if (s.secs >= 1.0) v.title = "Shaders are ready";
         return v;
     }
     if (s.secs < 1.0) return v;

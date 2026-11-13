@@ -1,0 +1,28 @@
+---
+description: MasterSword smoke/FG work discipline — no file swaps; golden DLL; surgical diffs; plan before restore
+alwaysApply: true
+---
+
+# MasterSword smoke discipline
+
+## Sticky (read every turn)
+
+- **ABI:** smoke `mastersword.exe` is **host ABI 10**; VK DLL is built as **11**. Accept host 10/11/4; echo `table.version = h->version`. Log: `vk: host ABI 10 (DLL 11)`.
+- **Load:** exe loads **`mastersword_vk.dll`** (not `hookshot_vk.dll`).
+- **Golden smoke binary:** `C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b\mastersword_vk.dll.bak_4x50` — last known-good Streamline + MasterSword menu + startup screen (~6.3 MB). Label: **golden = bak_4x50**.
+- **Do not touch** `gpu/vk/vk_menu.cpp` / MasterSword menu rows unless the user task is explicitly about the menu.
+- **FG fix (source):** never wait on busy OutSet; `synth_multiplier` caps stand-in at 3x at ≥1440p; DLSS MFG menu max 4x.
+
+## Hard rules
+
+1. **No whole-file `git checkout` / stash restore / bak deploy** unless the user explicitly says so. **Surgical diffs only.**
+2. Golden bak is for **emergency play copy only** — never treat it as the source of truth for edits. Do not overwrite golden.
+3. When the tree is fragile: **one task per turn** (e.g. only OutSet wait, or only startup_screen wiring).
+4. **Plan mode first** before any restore, wholesale rebuild strategy, or ABI/menu/DLSS integration change.
+5. Prefer patching the **current MasterSword working tree** over restoring snapshots. If compile fails, fix the missing symbol surgically — do not swap in HEAD/stash files en masse.
+
+## Smoke path
+
+`C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b\`
+
+Desktop bat: `MasterSword DLSS Test.bat` → that folder, `RX_BACKEND=vulkan`, `mastersword.exe`.
