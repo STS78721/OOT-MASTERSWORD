@@ -9,8 +9,10 @@
 #include <bit>
 #include <span>
 #include <cassert>
+#include <stdexcept>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <string_view>
 #include <unordered_map>
@@ -157,7 +159,9 @@ public:
 
     Stream& operator<<(Id value) {
         if (value.value == 0) {
-            std::abort();
+            // (super build) thrown, not std::abort(): a program whose SPIR-V would name an undefined value is not
+            // translated (the caller's catch says so), rather than ending the process with nothing in the log
+            throw std::runtime_error("sirit: an operand with no SPIR-V definition (null Id)");
         }
         return *this << value.value;
     }
@@ -238,6 +242,8 @@ public:
     }
 
     Id operator<<(EndOp) {
+        // Structures with identical members can have different layout decorations.
+        if (stream.words[stream.op_index] == static_cast<u32>(spv::Op::OpTypeStruct)) return stream << EndOp{};
         const auto begin = stream.words.data();
         std::vector<u32> declarations(begin + stream.op_index, begin + stream.insert_index);
 

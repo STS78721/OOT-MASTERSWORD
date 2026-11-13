@@ -99,6 +99,10 @@ void IREmitter::Barrier() {
     Inst(Opcode::Barrier);
 }
 
+void IREmitter::SubgroupBarrier() {
+    Inst(Opcode::SubgroupBarrier);
+}
+
 void IREmitter::WorkgroupMemoryBarrier() {
     Inst(Opcode::WorkgroupMemoryBarrier);
 }
@@ -331,6 +335,10 @@ void IREmitter::SetPatch(Patch patch, const F32& value) {
 
 U32 IREmitter::IsbeRead(const U32& address) {
     return Inst<U32>(Opcode::IsbeRead, address);
+}
+
+U32 IREmitter::IsbeReadOutput(const U32& address) {
+    return Inst<U32>(Opcode::IsbeReadOutput, address);
 }
 
 void IREmitter::IsbeWriteAttribute(const U32& address, const U32& value) {
@@ -1542,6 +1550,10 @@ U32U64 IREmitter::GlobalAtomicExchange(const U64& pointer_offset, const U32U64& 
     default:
         ThrowInvalidType(pointer_offset.Type());
     }
+}
+
+U32 IREmitter::GlobalAtomicCompareExchange(const U64& pointer_offset, const U32& comparator, const U32& value) {
+    return Inst<U32>(Opcode::GlobalAtomicCompareExchange32, pointer_offset, comparator, value);
 }
 
 F32 IREmitter::GlobalAtomicF32Add(const U64& pointer_offset, const Value& value,

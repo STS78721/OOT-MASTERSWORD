@@ -7,7 +7,9 @@
 #include "vk_internal.h"
 #include <vk_mem_alloc.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <vector>
 
 namespace mkwvk {
 
@@ -35,7 +37,42 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
 // memory type the pool's is not, are allocated as before.
 VmaPool image_pool = VK_NULL_HANDLE;
 bool image_pool_tried = false;
-constexpr uint64_t kImageBlock = 128ull << 20;
+// (RX_VK_IMAGE_BLOCK_MB=<n>, 16 and up: the block's size. VMA keeps one block empty for the next image, 128 MB of VRAM that a 64 MB block
+// would halve, at twice the memory objects: the driver allows ~4096, the imported pools take ~2400)
+const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : 128u) << 20;
+
+// (hookshot) and the render targets' images in blocks of their own (texture_get's for a target: OoT's transient ones, made and let go
+// all the time). In the same blocks as the textures that stay, each one gone left a hole beside a texture that kept its block: the
+// pool's 47-54 blocks (6-6.9 GB) held 1.9-3.6 GB of images in Kokiri Forest, VRAM sat at 93-98% of what the driver allows, and an
+// image made there then took 30-70 ms (RTX 5070). RX_VK_TARGET_BLOCKS=0: in the textures' blocks, as before
+VmaPool target_image_pool = VK_NULL_HANDLE;
+bool target_pool_tried = false;
+VmaPool images_pool();
+VmaPool target_images_pool() {
+    if (target_pool_tried) return target_image_pool;
+    target_pool_tried = true;
+    static const bool off = getenv("RX_VK_TARGET_BLOCKS") && !atoi(getenv("RX_VK_TARGET_BLOCKS"));
+    if (off || !images_pool()) return VK_NULL_HANDLE;
+    VkImageCreateInfo rep{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // (the image pool's representative image: the same memory type)
+    rep.imageType = VK_IMAGE_TYPE_2D;
+    rep.format = VK_FORMAT_R8G8B8A8_UNORM;
+    rep.extent = {256, 256, 1};
+    rep.mipLevels = rep.arrayLayers = 1;
+    rep.samples = VK_SAMPLE_COUNT_1_BIT;
+    rep.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    uint32_t type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VmaPoolCreateInfo pi{};
+    pi.memoryTypeIndex = type;
+    pi.blockSize = kImageBlock;
+    if (vmaCreatePool(vma, &pi, &target_image_pool) != VK_SUCCESS) target_image_pool = VK_NULL_HANDLE;
+    logf("vk: render targets' images from blocks of their own (%llu MB, memory type %u)%s", (unsigned long long)(kImageBlock >> 20),
+         type, target_image_pool ? "" : ": not made");
+    return target_image_pool;
+}
 
 VmaPool images_pool() {
     if (image_pool_tried) return image_pool;
@@ -55,27 +92,146 @@ VmaPool images_pool() {
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
-    if (vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
-    logf("vk: images from a pool of %llu MB blocks (memory type %u)%s", (unsigned long long)(kImageBlock >> 20), type,
-         image_pool ? "" : ": not made");
+    {   // (hookshot, RX 7800 XT: part of the blocks made now, at the start, not when the game first needs them. Each is a vkAllocateMemory of
+        // 128 MB, ~170 ms on AMD's driver, on the replay thread: ~70 of them in a walk across Hyrule Field, the frame rate dropping to the low
+        // 40s whenever new ground came in. 15% of the card's memory, 2 to 24 blocks; RX_VK_IMAGE_PREALLOC=<blocks>: that many, 0: none)
+        uint64_t heap = 0;
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+            if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max<uint64_t>(heap, dev.memory.memoryHeaps[h].size);
+        // (0.1.9c, upstream's rule, lost in this tree: when the textures (RX_VK_COMPACT) or the render targets
+        // (RX_VK_TARGET_BLOCKS) have blocks of their own, what is left here is a handful of DLSS, frame-generation and scratch
+        // images, and the 15% sat empty: 18 blocks, 2304 MB, holding 641 MB on an RTX 5070 Ti at 4K, while the textures past
+        // their budget were evicted and made again in a loop at the driver's limit)
+        const char* ce = getenv("RX_VK_COMPACT");
+        const char* te = getenv("RX_VK_TARGET_BLOCKS");
+        const bool split = (!ce || atoi(ce) != 0) || !(te && !atoi(te));
+        uint64_t n = split ? 0 : std::clamp<uint64_t>(heap / 100 * 15 / kImageBlock, 2, 24);
+        if (const char* e = getenv("RX_VK_IMAGE_PREALLOC")) n = (uint64_t)std::max(0, atoi(e));
+        pi.minBlockCount = (size_t)n;
+        if (n && vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) {   // (no room for them: as before, made as needed)
+            pi.minBlockCount = 0;
+            image_pool = VK_NULL_HANDLE;
+        }
+    }
+    if (!image_pool && vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
+    logf("vk: images from a pool of %llu MB blocks (memory type %u), %zu made at the start%s", (unsigned long long)(kImageBlock >> 20), type,
+         (size_t)pi.minBlockCount, image_pool ? "" : ": not made");
     return image_pool;
 }
 
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation) {
+// (hookshot) The sampled textures' own pool, when they are compacted (unless RX_VK_COMPACT=0): VMA's defragmentation asks to move any
+// allocation of the pool it works on, and only vk_texture.cpp's images can be moved (it knows what they hold and who uses
+// them) or kept from being freed while a pass is open. The render targets' images stay in their blocks above; DLSS's, the
+// frame interpolation's and the scratch ones in the images' pool
+VmaPool texture_pool = VK_NULL_HANDLE;
+bool texture_pool_tried = false;
+VmaPool textures_pool() {
+    if (texture_pool_tried) return texture_pool;
+    texture_pool_tried = true;
+    VkImageCreateInfo rep{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // (the image pool's representative image: the same memory type)
+    rep.imageType = VK_IMAGE_TYPE_2D;
+    rep.format = VK_FORMAT_R8G8B8A8_UNORM;
+    rep.extent = {256, 256, 1};
+    rep.mipLevels = rep.arrayLayers = 1;
+    rep.samples = VK_SAMPLE_COUNT_1_BIT;
+    rep.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    uint32_t type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VmaPoolCreateInfo pi{};
+    pi.memoryTypeIndex = type;
+    pi.blockSize = kImageBlock;
+    if (vmaCreatePool(vma, &pi, &texture_pool) != VK_SUCCESS) texture_pool = VK_NULL_HANDLE;
+    logf("vk: textures from a pool of their own, %llu MB blocks (RX_VK_COMPACT)%s", (unsigned long long)(kImageBlock >> 20),
+         texture_pool ? "" : ": not made");
+    return texture_pool;
+}
+bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes) {
+    if (!texture_pool) return false;
+    VmaStatistics st{};
+    vmaGetPoolStatistics(vma, texture_pool, &st);
+    *block_bytes = st.blockBytes, *free_bytes = st.blockBytes - std::min(st.blockBytes, st.allocationBytes);
+    return true;
+}
+
+// ---- the textures' pool compacted: VMA's defragmentation context and its open pass ----
+namespace {
+VmaDefragmentationContext compact_ctx = VK_NULL_HANDLE;
+VmaDefragmentationPassMoveInfo compact_pass{};
+bool compact_in_pass = false;
+bool compact_over(uint64_t* freed_bytes, uint32_t* freed_blocks) {
+    VmaDefragmentationStats st{};
+    vmaEndDefragmentation(vma, compact_ctx, &st);
+    compact_ctx = VK_NULL_HANDLE;
+    if (freed_bytes) *freed_bytes = st.bytesFreed;
+    if (freed_blocks) *freed_blocks = st.deviceMemoryBlocksFreed;
+    return false;
+}
+}
+bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass) {
+    if (compact_ctx || !texture_pool) return false;
+    VmaDefragmentationInfo di{};
+    di.pool = texture_pool;
+    di.maxBytesPerPass = max_bytes_a_pass;
+    di.maxAllocationsPerPass = max_moves_a_pass;
+    return vmaBeginDefragmentation(vma, &di, &compact_ctx) == VK_SUCCESS;
+}
+bool image_compact_active() { return compact_ctx != VK_NULL_HANDLE; }
+bool image_compact_pass(std::vector<ImageMove>& moves, uint64_t* freed_bytes, uint32_t* freed_blocks) {
+    moves.clear();
+    if (!compact_ctx || compact_in_pass) return false;
+    const VkResult r = vmaBeginDefragmentationPass(vma, compact_ctx, &compact_pass);
+    if (r != VK_INCOMPLETE) return compact_over(freed_bytes, freed_blocks);   // (VK_SUCCESS: nothing left to move; or an error)
+    compact_in_pass = true;
+    for (uint32_t i = 0; i < compact_pass.moveCount; i++) moves.push_back({compact_pass.pMoves[i].srcAllocation});
+    return true;
+}
+bool image_compact_bind(size_t i, VkImage image) {
+    return compact_in_pass && i < compact_pass.moveCount &&
+           vmaBindImageMemory(vma, compact_pass.pMoves[i].dstTmpAllocation, image) == VK_SUCCESS;
+}
+void image_compact_ignore(size_t i) {
+    if (compact_in_pass && i < compact_pass.moveCount)
+        compact_pass.pMoves[i].operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
+}
+bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks) {
+    if (!compact_ctx || !compact_in_pass) return false;
+    compact_in_pass = false;
+    if (vmaEndDefragmentationPass(vma, compact_ctx, &compact_pass) == VK_INCOMPLETE) return true;
+    return compact_over(freed_bytes, freed_blocks);
+}
+
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
     // and takes the RAM the game and everything else on the machine need)
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    if (dedicated) {   // (a memory object of its own, which freeing gives back whole: a pool's block is kept by VMA when it empties)
+        VmaAllocationCreateInfo dai = ai;
+        dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
-    if (VmaPool pool = no_pool ? VK_NULL_HANDLE : images_pool()) {
+    if (VmaPool pool = no_pool ? VK_NULL_HANDLE
+                       : textures && textures_pool() ? textures_pool()
+                       : target && target_images_pool() ? target_images_pool() : images_pool()) {
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
         if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    if (ai.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) {
+        static std::atomic<int> told_budget{0};
+        if (told_budget++ < 10) logf("vk: image over budget, retrying without WITHIN_BUDGET");
+        VmaAllocationCreateInfo vai = ai;
+        vai.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        if (vmaCreateImage(vma, &ci, &vai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    }
     // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
     // to system memory instead, slow but drawn
     if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
@@ -89,14 +245,32 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
 void destroy_image(VkImage image, VmaAllocation allocation) {
     vmaDestroyImage(vma, image, allocation);
 }
+uint64_t allocation_size(VmaAllocation allocation) {
+    VmaAllocationInfo info{};
+    if (allocation) vmaGetAllocationInfo(vma, allocation, &info);
+    return info.size;
+}
+bool allocation_device_memory(VmaAllocation allocation, VkDeviceMemory* memory, VkDeviceSize* offset) {
+    if (!allocation || !memory) return false;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(vma, allocation, &info);
+    if (!info.deviceMemory) return false;
+    *memory = info.deviceMemory;
+    if (offset) *offset = info.offset;
+    return true;
+}
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
-                   VmaAllocation& allocation, void** mapped) {
+                   VmaAllocation& allocation, void** mapped, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
     if (host_visible) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    // (a buffer with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT gets VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT from VMA:
+    // vma_init sets VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT)
+    static const bool blocks = getenv("RX_VK_BLOCK_BUFFERS") != nullptr;
+    if (dedicated && !blocks) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
@@ -105,25 +279,37 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
 /// A buffer in cached host memory, mapped: written on one thread, read back on the CPU too (the captures: the game's
 /// threads copy pages into it, the replay reads texture pages out of it and the GPU copies the rest from it)
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
-                          void** mapped) {
+                          void** mapped, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;   // (its own memory object: no part of a 64 MB block left unused)
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
     return true;
 }
+bool host_cached(VmaAllocation allocation) {
+    VkMemoryPropertyFlags f = 0;
+    if (allocation) vmaGetAllocationMemoryProperties(vma, allocation, &f);
+    return (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+}
 void flush_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaFlushAllocation(vma, allocation, 0, size);
+}
+void flush_mapped_range(VmaAllocation allocation, uint64_t offset, uint64_t size) {
+    if (size) vmaFlushAllocation(vma, allocation, offset, size);
+}
+void invalidate_mapped(VmaAllocation allocation, uint64_t size) {
+    if (size) vmaInvalidateAllocation(vma, allocation, 0, size);
 }
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
     vmaDestroyBuffer(vma, buffer, allocation);
 }
-bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation) {
+bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -131,9 +317,22 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     return vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, nullptr) == VK_SUCCESS;
 }
 /// (every heap: what VMA has in blocks and allocations there, what the process uses of it, its budget; one line)
+void vma_log_image_blocks() {
+    for (VmaPool pool : {image_pool, target_image_pool, texture_pool}) {
+        if (!pool) continue;
+        VmaDetailedStatistics d{};
+        vmaCalculatePoolStatistics(vma, pool, &d);
+        logf("vk: image blocks%s: %u blocks %llu MB, %u images %llu MB; %u free ranges, the largest %llu MB",
+             pool == target_image_pool ? " (render targets)" : pool == texture_pool ? " (textures, compacted)" : "", d.statistics.blockCount,
+             (unsigned long long)(d.statistics.blockBytes >> 20), d.statistics.allocationCount,
+             (unsigned long long)(d.statistics.allocationBytes >> 20), d.unusedRangeCount,
+             (unsigned long long)(d.unusedRangeSizeMax >> 20));
+    }
+}
 void vma_log_heaps() {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);
@@ -160,6 +359,20 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     *used = u, *budget = t;
     if (block_free) *block_free = f;
     return t != 0;
+}
+
+/// The system-memory heaps the GPU reaches: what the process uses there (the imported guest memory too: pinned by the
+/// driver) and what the driver allows it, asked now (a new frame index makes VMA ask the driver again); false when unknown
+bool system_heap_usage(uint64_t* used, uint64_t* budget) {
+    static uint32_t frame = 0;
+    vmaSetCurrentFrameIndex(vma, ++frame);
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    uint64_t u = 0, t = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (!(dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) u += b[h].usage, t += b[h].budget;
+    *used = u, *budget = t;
+    return dev.memory_budget && t != 0;
 }
 
 } // namespace mkwvk

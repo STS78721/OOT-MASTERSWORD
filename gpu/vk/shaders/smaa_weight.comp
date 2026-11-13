@@ -1,0 +1,119 @@
+#version 450
+// SMAA blending-weight calculation (iryoku/smaa Medium, orthogonal only).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D edgesTex;
+layout(binding = 1) uniform sampler2D areaTex;
+layout(binding = 2) uniform sampler2D searchTex;
+layout(binding = 3, rgba8) uniform writeonly image2D blendTex;
+layout(push_constant) uniform P {
+    vec4 metrics; // 1/w, 1/h, w, h
+} pc;
+
+const int MAX_STEPS = 8;
+const vec2 AREATEX_PIXEL_SIZE = 1.0 / vec2(160.0, 560.0);
+const float AREATEX_SUBTEX = 1.0 / 7.0;
+const vec2 SEARCHTEX_SIZE = vec2(66.0, 33.0);
+const vec2 SEARCHTEX_PACKED = vec2(64.0, 16.0);
+
+float search_length(vec2 e, float offset) {
+    vec2 scale = SEARCHTEX_SIZE * vec2(0.5, -1.0) + vec2(-1.0, 1.0);
+    vec2 bias = SEARCHTEX_SIZE * vec2(offset, 1.0) + vec2(0.5, -0.5);
+    return textureLod(searchTex, scale / SEARCHTEX_PACKED * e + bias / SEARCHTEX_PACKED, 0.0).r;
+}
+
+float search_x_left(vec2 texcoord, float end) {
+    vec2 e = vec2(0.0, 1.0);
+    for (int i = 0; i < MAX_STEPS; i++) {
+        if (texcoord.x <= end) break;
+        e = textureLod(edgesTex, texcoord, 0.0).rg;
+        texcoord += vec2(-2.0, 0.0) * pc.metrics.xy;
+        if (e.r <= 0.8281) break;
+    }
+    float offset = -(255.0 / 127.0) * search_length(e, 0.0) + 3.25;
+    return texcoord.x + pc.metrics.x * offset;
+}
+
+float search_x_right(vec2 texcoord, float end) {
+    vec2 e = vec2(0.0, 1.0);
+    for (int i = 0; i < MAX_STEPS; i++) {
+        if (texcoord.x >= end) break;
+        e = textureLod(edgesTex, texcoord, 0.0).rg;
+        texcoord += vec2(2.0, 0.0) * pc.metrics.xy;
+        if (e.r <= 0.8281) break;
+    }
+    float offset = -(255.0 / 127.0) * search_length(e, 0.5) + 3.25;
+    return texcoord.x - pc.metrics.x * offset;
+}
+
+float search_y_up(vec2 texcoord, float end) {
+    vec2 e = vec2(1.0, 0.0);
+    for (int i = 0; i < MAX_STEPS; i++) {
+        if (texcoord.y <= end) break;
+        e = textureLod(edgesTex, texcoord, 0.0).rg;
+        texcoord += vec2(0.0, -2.0) * pc.metrics.xy;
+        if (e.g <= 0.8281) break;
+    }
+    float offset = -(255.0 / 127.0) * search_length(e.gr, 0.0) + 3.25;
+    return texcoord.y + pc.metrics.y * offset;
+}
+
+float search_y_down(vec2 texcoord, float end) {
+    vec2 e = vec2(1.0, 0.0);
+    for (int i = 0; i < MAX_STEPS; i++) {
+        if (texcoord.y >= end) break;
+        e = textureLod(edgesTex, texcoord, 0.0).rg;
+        texcoord += vec2(0.0, 2.0) * pc.metrics.xy;
+        if (e.g <= 0.8281) break;
+    }
+    float offset = -(255.0 / 127.0) * search_length(e.gr, 0.5) + 3.25;
+    return texcoord.y - pc.metrics.y * offset;
+}
+
+vec2 area(vec2 dist, float e1, float e2) {
+    vec2 texcoord = vec2(16.0) * round(4.0 * vec2(e1, e2)) + dist;
+    texcoord = AREATEX_PIXEL_SIZE * texcoord + 0.5 * AREATEX_PIXEL_SIZE;
+    texcoord.y += AREATEX_SUBTEX * 0.0;
+    return textureLod(areaTex, texcoord, 0.0).rg;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(pc.metrics.zw);
+    if (any(greaterThanEqual(p, size))) return;
+
+    vec2 texcoord = (vec2(p) + 0.5) * pc.metrics.xy;
+    vec2 e = textureLod(edgesTex, texcoord, 0.0).rg;
+    vec4 weights = vec4(0.0);
+
+    if (e.g > 0.0) {
+        vec2 off0 = texcoord + vec2(-0.25, -0.125) * pc.metrics.xy;
+        vec2 off1 = texcoord + vec2(1.25, -0.125) * pc.metrics.xy;
+        float left_end = texcoord.x - 2.0 * float(MAX_STEPS) * pc.metrics.x;
+        float right_end = texcoord.x + 2.0 * float(MAX_STEPS) * pc.metrics.x;
+        vec2 d;
+        d.x = search_x_left(off0, left_end);
+        d.y = search_x_right(off1, right_end);
+        d = abs(round(pc.metrics.z * d - texcoord.xx));
+        vec2 sqrt_d = sqrt(d);
+        float e1 = textureLod(edgesTex, vec2(texcoord.x - d.x * pc.metrics.x, texcoord.y), 0.0).r;
+        float e2 = textureLod(edgesTex, vec2(texcoord.x + d.y * pc.metrics.x, texcoord.y), 0.0).r;
+        weights.rg = area(sqrt_d, e1, e2);
+    }
+
+    if (e.r > 0.0) {
+        vec2 off0 = texcoord + vec2(-0.125, -0.25) * pc.metrics.xy;
+        vec2 off1 = texcoord + vec2(-0.125, 1.25) * pc.metrics.xy;
+        float up_end = texcoord.y - 2.0 * float(MAX_STEPS) * pc.metrics.y;
+        float down_end = texcoord.y + 2.0 * float(MAX_STEPS) * pc.metrics.y;
+        vec2 d;
+        d.x = search_y_up(off0, up_end);
+        d.y = search_y_down(off1, down_end);
+        d = abs(round(pc.metrics.w * d - texcoord.yy));
+        vec2 sqrt_d = sqrt(d);
+        float e1 = textureLod(edgesTex, vec2(texcoord.x, texcoord.y - d.x * pc.metrics.y), 0.0).g;
+        float e2 = textureLod(edgesTex, vec2(texcoord.x, texcoord.y + d.y * pc.metrics.y), 0.0).g;
+        weights.ba = area(sqrt_d, e1, e2);
+    }
+
+    imageStore(blendTex, p, weights);
+}

@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -307,6 +308,14 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
     const u32 element{static_cast<u32>(attr) % 4};
     if (IR::IsGeneric(attr)) {
         const u32 index{IR::GenericAttributeIndex(attr)};
+        if (ctx.stage == Stage::Fragment && ctx.runtime_info.point_coord_generics.test(index)) {
+            // (hookshot) the point sprite's coordinate in place of the generic (RuntimeInfo::point_coord_generics)
+            if (element < 2) {
+                return ctx.OpLoad(ctx.F32[1],
+                                  ctx.OpAccessChain(ctx.input_f32, ctx.point_coord, ctx.Const(element)));
+            }
+            return ctx.Const(element == 3 ? 1.0f : 0.0f);
+        }
         const auto& generic{ctx.input_generics.at(index)};
         if (!ValidId(generic.id)) {
             // Attribute is disabled or varying component is not written
@@ -314,7 +323,16 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
         }
         const Id pointer{
             AttrPointer(ctx, generic.pointer_type, vertex, generic.id, ctx.Const(element))};
-        const Id value{ctx.OpLoad(generic.component_type, pointer)};
+        Id value{ctx.OpLoad(generic.component_type, pointer)};
+        if (ctx.stage == Stage::Fragment && ctx.noperspective_as_smooth_inputs[index]) {
+            // Written times Position.w and interpolated perspective-correct: undo with 1/w.
+            // Only float inputs are marked, and DefineInputs forces FragCoord for them.
+            ASSERT(generic.load_op == InputGenericLoadOp::None && ValidId(ctx.input_position));
+            const Id frag_w{ctx.OpLoad(
+                ctx.F32[1],
+                ctx.OpAccessChain(ctx.input_f32, ctx.input_position, ctx.Const(3u)))};
+            value = ctx.OpFMul(ctx.F32[1], value, frag_w);
+        }
         return [&ctx, generic, value]() {
             switch (generic.load_op) {
             case InputGenericLoadOp::Bitcast:
@@ -422,13 +440,6 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, [[maybe_un
         value = ctx.OpBitcast(output->type, value);
     }
 
-    static constexpr IR::Attribute cd0 = IR::Attribute::ClipDistance0;
-    static constexpr IR::Attribute cd7 = IR::Attribute::ClipDistance7;
-
-    if (attr >= cd0 && attr <= cd7) {
-        const u32 idx = (u32) attr - (u32) cd0;
-        clip_distance_written.set(idx);
-    }
     ctx.OpStore(output->pointer, value);
 }
 
@@ -491,6 +502,10 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
     const AttributeType type{ctx.runtime_info.color_output_types[index]};
     if (type == AttributeType::Float) {
         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
+        if (frag_nan_guard) {   // (amd-fix, mma_layout.h) NaN -> 0, the rest clamped to +-1e30
+            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-1e30f)), ctx.Const(1e30f))};
+            value = ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), clamped);
+        }
         ctx.OpStore(pointer, value);
     } else if (type == AttributeType::UnsignedInt) {
         const Id pointer{ctx.OpAccessChain(ctx.output_u32, ctx.frag_color.at(index), component_id)};
@@ -554,7 +569,16 @@ void EmitSetOFlag(EmitContext&) {
 }
 
 Id EmitWorkgroupId(EmitContext& ctx) {
-    return ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+    const Id id{ctx.OpLoad(ctx.U32[3], ctx.workgroup_id)};
+    if (ctx.mesh_fallback && ctx.stage == Stage::Mesh && ctx.runtime_info.mesh_fallback_task) {
+        // (hookshot) a fallback mesh workgroup is a slot (its task's map gives it, EmitMeshPrologue): its id is its index in its
+        // task, as a task launches them from 0
+        const Id slot{Sirit::ValidId(ctx.mesh_fallback_slot) ? ctx.mesh_fallback_slot
+                                                             : ctx.OpCompositeExtract(ctx.U32[1], id, 0U)};
+        const Id x{ctx.OpUMod(ctx.U32[1], slot, ctx.Const(ctx.runtime_info.mesh_fallback_task_threads))};
+        return ctx.OpCompositeConstruct(ctx.U32[3], x, ctx.u32_zero_value, ctx.u32_zero_value);
+    }
+    return id;
 }
 
 Id EmitLocalInvocationId(EmitContext& ctx) {

@@ -5,6 +5,7 @@
    there. TPIDRRO_EL0 (thread-local region): 0x200 bytes; the SDK's nn::os keeps the current ThreadType* at
    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
 #include "hos.h"
+#include "../gpu/vk/compat/hookshot_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
@@ -27,13 +28,16 @@ struct HosThread {
     uint64_t core_mask;
     uint64_t tls_slots[HOS_TLS_SLOTS];
     char name[48];
+    int serial;   /* (#2709) frame serial thread (MainThread / Presentation Thread): longer wait spin */
     HANDLE handle;
     int started;
     /* the kernel side (hos_svc.c): this thread's Horizon handle and the event it blocks on */
     uint32_t kernel_handle;
     HANDLE wake;
-    /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued */
-    int vc_held, vc_last, vc_queued;
+    /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued, and
+       whether it has run without one since an escape (vc_acquire; until its next block, hos_vcore_away, or the next
+       hos_vcore_back) */
+    int vc_held, vc_last, vc_queued, vc_escaped;
     volatile int vc_kick;
     int64_t vc_since;
     CONDITION_VARIABLE vc_cv;
@@ -41,6 +45,7 @@ struct HosThread {
        switched to a guest fiber */
     Ctx *volatile run_ctx;
     void *host_fiber;
+    volatile int mmcss_want, mmcss_done;
 };
 
 /* The SDK's own mutexes (InternalCriticalSection) tag a lock word with the owner's handle, read from
@@ -138,6 +143,7 @@ static CONDITION_VARIABLE log_cv = CONDITION_VARIABLE_INIT;
 static char *log_q[2048];
 static int log_head, log_count;
 static volatile LONG log_async = -1;
+static volatile DWORD log_writer;   /* log_main's thread */
 
 static int log_take_locked(char **out) {
     int n = 0;
@@ -149,20 +155,60 @@ static int log_take_locked(char **out) {
     return n;
 }
 
+/* (hookshot) A batch goes out in one write. stderr is unbuffered (hos_main.c), so each line was a write of its own: 30-90 a
+   second in play, every one extending the log file. With the game on a slow disk (a SATA SSD, 90% full) those writes kept
+   the disk busy: its 4 KB reads took 10-200 ms where they take 0.4 ms, and what the game read from it meanwhile (a page of
+   its own code, a file of the game's) waited as long: the long frames of a session. */
 static void log_write(char **lines, int n) {
-    for (int i = 0; i < n; i++) {
-        fputs(lines[i], stderr);
-        free(lines[i]);
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += strlen(lines[i]);
+    char *all = n > 1 ? (char *)malloc(total + 1) : NULL;
+    if (all) {
+        size_t at = 0;
+        for (int i = 0; i < n; i++) {
+            const size_t len = strlen(lines[i]);
+            memcpy(all + at, lines[i], len);
+            at += len;
+            free(lines[i]);
+        }
+        fwrite(all, 1, total, stderr);
+        free(all);
+    } else {   /* (one line, or no memory for the batch: line by line) */
+        for (int i = 0; i < n; i++) {
+            fputs(lines[i], stderr);
+            free(lines[i]);
+        }
     }
     fflush(stderr);
+}
+
+/* (hookshot) and the writer waits a little after the line it is woken for, so the lines of that time go out together: a few
+   writes a second however many lines there are. A queue half full goes out at once, before a burst can fill it (a full
+   queue has the thread that logs write the line itself). HOS_LOG_BATCH_MS=<ms> (default 250, at most 2000; 0: the lines
+   there are at each wake, as before). Nothing waiting is lost: every way out writes the queue first (log_flush,
+   log_crash_filter), and the writer holds no lock while it waits */
+enum { LOG_BATCH_FULL = 1024 };
+static DWORD log_batch_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        const char *e = getenv("HOS_LOG_BATCH_MS");
+        const int v = e && *e ? atoi(e) : 250;
+        ms = v < 0 ? 0 : v > 2000 ? 2000 : v;
+    }
+    return (DWORD)ms;
 }
 
 static DWORD WINAPI log_main(void *p) {
     (void)p;
     static char *batch[2048];
+    log_writer = GetCurrentThreadId();
     for (;;) {
         AcquireSRWLockExclusive(&log_lock);
         while (!log_count) SleepConditionVariableSRW(&log_cv, &log_lock, INFINITE, 0);
+        /* (log_queue wakes it at each line: until the time is up or the queue half full) */
+        const ULONGLONG until = GetTickCount64() + log_batch_ms();
+        for (ULONGLONG now; log_count < LOG_BATCH_FULL && (now = GetTickCount64()) < until;)
+            SleepConditionVariableSRW(&log_cv, &log_lock, (DWORD)(until - now), 0);
         const int n = log_take_locked(batch);
         AcquireSRWLockExclusive(&log_write_lock);
         ReleaseSRWLockExclusive(&log_lock);
@@ -171,8 +217,24 @@ static DWORD WINAPI log_main(void *p) {
     }
 }
 
+/* the queued lines straight to the handle (crash paths: no CRT stream, no write lock) */
+static void log_drain_raw(void) {
+    if (!TryAcquireSRWLockExclusive(&log_lock)) return;
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    while (log_count) {
+        const char *line = log_q[log_head];
+        DWORD written;
+        WriteFile(err, line, (DWORD)strlen(line), &written, NULL);
+        log_head = (log_head + 1) % 2048;
+        log_count--;
+    }
+    ReleaseSRWLockExclusive(&log_lock);
+}
+
 static void log_flush(void) {
     if (log_async <= 0) return;
+    /* (a crash report on the writer itself, in its own write: it holds log_write_lock) */
+    if (GetCurrentThreadId() == log_writer) { log_drain_raw(); return; }
     static char *batch[2048];
     AcquireSRWLockExclusive(&log_write_lock);
     AcquireSRWLockExclusive(&log_lock);
@@ -185,31 +247,31 @@ static void log_flush(void) {
 static LPTOP_LEVEL_EXCEPTION_FILTER log_prev_filter;
 
 static LONG WINAPI log_crash_filter(EXCEPTION_POINTERS *e) {
-    if (TryAcquireSRWLockExclusive(&log_write_lock)) {
-        if (TryAcquireSRWLockExclusive(&log_lock)) {
-            HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-            while (log_count) {
-                const char *line = log_q[log_head];
-                DWORD written;
-                WriteFile(err, line, (DWORD)strlen(line), &written, NULL);
-                log_head = (log_head + 1) % 2048;
-                log_count--;
-            }
-            ReleaseSRWLockExclusive(&log_lock);
-        }
-        ReleaseSRWLockExclusive(&log_write_lock);
+    if (GetCurrentThreadId() == log_writer) log_drain_raw();
+    else {
+        /* the writer may be in the middle of a batch: it finishes first (at most 2 s: a write stuck on the disk), then the
+           rest of the queue goes out (before: the queue was left unwritten whenever the writer was busy) */
+        int got = 0;
+        for (int i = 0; i < 2000 && !(got = TryAcquireSRWLockExclusive(&log_write_lock)); i++) Sleep(1);
+        log_drain_raw();
+        if (got) ReleaseSRWLockExclusive(&log_write_lock);
     }
     return log_prev_filter ? log_prev_filter(e) : EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Lines are written by log_main, not by the thread that logs: a write that blocks (a console; the log file while the
+   disk is busy: the render thread was seen held 140-310 ms in one line's write) holds no game thread. Nothing queued is
+   lost when the game ends or crashes: hos_fatal, report_crash/report_fatal (mkw_glue.c), log_crash_filter,
+   svcExitProcess, the window's close and the process's exit (atexit) write the queue first. HOS_LOG_SYNC=1: each line
+   written by the thread that logs it, as files and pipes were before */
 static int log_queue(const char *line) {
     if (log_async < 0) {
         AcquireSRWLockExclusive(&log_lock);
         if (log_async < 0) {
-            DWORD mode;
-            int on = !getenv("HOS_LOG_SYNC") && GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mode);
+            int on = !getenv("HOS_LOG_SYNC");
             if (on && !CreateThread(NULL, 0, log_main, NULL, 0, NULL)) on = 0;
             if (on) log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
+            if (on) atexit(log_flush);
             log_async = on;
         }
         ReleaseSRWLockExclusive(&log_lock);
@@ -400,10 +462,11 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->handle, 0, FALSE,
                     DUPLICATE_SAME_ACCESS);   /* a real handle, for the profiler */
     SetThreadDescription(GetCurrentThread(), L"MainThread");   /* (HOS_SAMPLE finds threads by it) */
+    cur = t;
     hos_thread_pin(t->handle, t->name);
+    { void hos_thread_mmcss_tag(HosThread *t, const char *name); hos_thread_mmcss_tag(t, t->name); }
     setup_guest(t);
     t->ctx.x[31] = (t->stack + stack_size) & ~15ULL;
-    cur = t;
     track(t);
     hos_vcore_back();   /* (virtual cores: before any guest code) */
     return &t->ctx;
@@ -412,6 +475,7 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
 static DWORD WINAPI thread_main(void *p) {
     HosThread *t = (HosThread *)p;
     cur = t;
+    { void hos_thread_mmcss_tag(HosThread *t, const char *name); hos_thread_mmcss_tag(t, t->name); }
     Ctx *c = &t->ctx;
     c->x[0] = t->arg;
     c->x[30] = 0;
@@ -485,7 +549,12 @@ void hos_thread_start(HosThread *t) {
 void hos_thread_join(HosThread *t) {
     if (!t->handle) return;
     const int away = hos_vcore_away();
-    WaitForSingleObject(t->handle, INFINITE);
+    /* (EvilOOT, 11-07: a freeze after Load, one thread joining another for good: a join of over 10 s says who joins whom, once) */
+    if (WaitForSingleObject(t->handle, 10000) == WAIT_TIMEOUT) {
+        HosThread *self = hos_self();
+        hos_log("thread %s: joining %s for 10 s", self ? hos_thread_name(self) : "?", t->name);
+        WaitForSingleObject(t->handle, INFINITE);
+    }
     if (away) hos_vcore_back();
 }
 
@@ -495,16 +564,47 @@ void hos_thread_destroy(HosThread *t) {
         if (threads[i] == t) { threads[i] = threads[--nthreads]; break; }
     ReleaseSRWLockExclusive(&threads_lock);
     if (t->handle) CloseHandle(t->handle);
+    if (t->wake) CloseHandle(t->wake);
     free(t);
+}
+
+/* (#2709) Frame serial threads: OoT's game thread (sead::MainThread) and Presentation Thread. A frame waits on each
+   in turn, so a late wait ends the frame late — they keep a longer spin (hos_spin_ns). */
+static int serial_name(const char *name) {
+    return name && (strstr(name, "MainThread") || !strcmp(name, "Presentation Thread"));
+}
+int hos_thread_serial(const HosThread *t) {
+    return t && __atomic_load_n(&t->serial, __ATOMIC_RELAXED);
+}
+/* HOS_SPIN_US (default 20 µs) on serial threads; HOS_SPIN_OTHER_US (default 5 µs, capped by HOS_SPIN_US) on others.
+   Idle workers were burning most of a flat 20 µs spin. HOS_SPIN_OTHER_US=20 restores the old one-spin-for-all. */
+int64_t hos_spin_ns(void) {
+    static int64_t both = -1;   /* serial ns << 32 | other ns */
+    int64_t b = __atomic_load_n(&both, __ATOMIC_RELAXED);
+    if (b < 0) {
+        const char *e = getenv("HOS_SPIN_US"), *o = getenv("HOS_SPIN_OTHER_US");
+        int64_t s = e ? atoll(e) : 20, other = o ? atoll(o) : 5;
+        s = (s < 0 ? 0 : s > 1000000 ? 1000000 : s) * 1000;
+        other = (other < 0 ? 0 : other > 1000000 ? 1000000 : other) * 1000;
+        if (other > s) other = s;
+        b = (s << 32) | (other & 0xffffffffll);
+        __atomic_store_n(&both, b, __ATOMIC_RELAXED);
+    }
+    return hos_thread_serial(hos_self()) ? (b >> 32) : (b & 0xffffffffll);
 }
 
 void hos_thread_set_name(HosThread *t, const char *name) {
     snprintf(t->name, sizeof t->name, "%s", name);
+    __atomic_store_n(&t->serial, serial_name(t->name), __ATOMIC_RELAXED);
     if (t->handle) {
         wchar_t w[48];
         MultiByteToWideChar(CP_UTF8, 0, t->name, -1, w, 48);
         SetThreadDescription(t->handle, w);
         hos_thread_pin(t->handle, t->name);
+    }
+    if (t) {
+        void hos_thread_mmcss_tag(HosThread *t, const char *name);
+        hos_thread_mmcss_tag(t, t->name);
     }
 }
 
@@ -535,12 +635,200 @@ static const NameSpec *match_name_spec(const NameSpec *s, int n, const char *nam
 /* The last physical core (its logical processors' mask), kept for the Vulkan back end's replay thread (gpu/vk
    vk_replay.cpp pins it there): the game's threads run on the others. The replay is on the frame's critical path
    (MKW waits for the last frame's GPU work before it submits the next), and on a core shared with game threads
-   it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none. */
+   it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none.
+   (hookshot) On a CPU with cores of more than one kind, the last core of the fastest kind: the last core of all is an
+   efficiency core on Intel's hybrid CPUs (an i7-12700K's logical processors 16-19), the slowest place for the replay
+   (an i7-13700K's Kokiri Forest: 48.7 fps with it there, 60 on a performance core). EfficiencyClass is higher the faster
+   the core, and the same for every core of a CPU of one kind (the last core, as before). Only with 4+ cores of the
+   fastest kind (8+ logical processors always have them on a CPU of one kind): a laptop's 2 performance cores and 8
+   efficiency ones (i5-1235U) would keep one of the two from the game; then none is kept. The calling thread's
+   processor group's cores: the masks the affinity calls take are its group's. Windows only: Linux keeps the last core,
+   as before. */
+/* (hookshot) The cores that share the largest L3, on a CPU whose cores do not all share one of the same size: AMD's X3D CPUs
+   with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D) have the 3D V-Cache on one CCD only (96 MB against 32 MB). Windows
+   moves a game there only when its Game Bar knows the program as a game; this one it does not know, so its threads ran on
+   both, and the replay's reserved core (the last one) is on the CCD without the cache. On a 9950X3D (SMT off), Castle Town's
+   market (2,300 draws): the replay 11.5-12.3 ms a frame and 57-58 fps as it was (the slowest two seconds 54), 10.1-10.5 ms and
+   59.9 fps (58.7) with the game's threads kept to the first CCD. So they are kept to those cores. 0 for none: one L3 for all, L3s
+   of one size (a 7950X, both CCDs alike), L3s that do not all share as many logical processors (a hybrid CPU's two kinds of
+   core: a Ryzen AI 9 HX 370 has 4 Zen 5 cores on a 16 MB L3 and 8 Zen 5c on an 8 MB one, and the game is not squeezed onto the 4;
+   an X3D's CCDs are alike but for the cache), or fewer than 8 cores on the largest (the 12-core 7900X3D and 9900X3D have 6 there:
+   not measured, left as they were). Measured with SMT off only: with it the 8 cores are 16 logical processors.
+   HOS_CACHE_CORES=0: none. Windows only, as the reserved core's choice above: Linux keeps the last core, which on these CPUs is
+   on the CCD without the cache.
+   (the choice: each L3's logical processor mask and size, n of them, and each core's mask, ncores of them.
+   tests/test_reserved_core.py) */
+static uint64_t pick_cache_cores(const uint64_t *masks, const uint64_t *sizes, int n, const uint64_t *cores, int ncores) {
+    uint64_t best = 0, most = 0, least = ~0ull;
+    int width = 0, alike = 1;   /* (how many logical processors an L3 is shared by, and whether all are shared by as many) */
+    for (int i = 0; i < n; i++) {
+        if (!masks[i] || !sizes[i]) continue;
+        if (!width) width = __builtin_popcountll(masks[i]);
+        else if (__builtin_popcountll(masks[i]) != width) alike = 0;
+        if (sizes[i] > most) most = sizes[i], best = masks[i];
+        else if (sizes[i] == most) best |= masks[i];   /* (several of the largest size: all of them) */
+        if (sizes[i] < least) least = sizes[i];
+    }
+    if (!best || least == most || !alike) return 0;
+    int physical = 0;
+    for (int i = 0; i < ncores; i++) physical += (cores[i] & best) != 0;
+    if (physical < 8) return 0;
+    return best;
+}
+/* (the choice: the cores' logical processor masks and EfficiencyClass, n of them; 0 for none. tests/test_reserved_core.py) */
+static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *classes, int n) {
+    uint64_t last = 0;
+    int best = -1, fast = 0, logical = 0;
+    for (int i = 0; i < n; i++) {
+        if (!masks[i]) continue;
+        logical += __builtin_popcountll(masks[i]);
+        if ((int)classes[i] > best) {
+            best = classes[i], last = masks[i], fast = 1;
+        } else if ((int)classes[i] == best) {
+            fast++;
+            if (masks[i] > last) last = masks[i];
+        }
+    }
+    if (logical < 8 || fast < 4) return 0;
+    return last;
+}
+#if defined(_WIN32)
+/* (pick_cache_cores over the calling thread's group's L3 caches; 0: no such split, or HOS_CACHE_CORES=0) */
+uint64_t hos_cache_cpus(void) {
+    static uint64_t mask = ~0ull;
+    if (mask != ~0ull) return mask;
+    mask = 0;
+    if (getenv("HOS_CACHE_CORES") && !atoi(getenv("HOS_CACHE_CORES"))) return mask;
+    static uint64_t masks[64], sizes[64], cores[256];
+    DWORD len = 0;
+    int n = 0, ncores = 0;
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    if (GetLogicalProcessorInformationEx(RelationCache, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return mask;
+    char *buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && n < 64;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationCache && e->Cache.Level == 3 && e->Cache.GroupMask.Group == group) {
+                masks[n] = (uint64_t)e->Cache.GroupMask.Mask;
+                sizes[n] = e->Cache.CacheSize;
+                n++;
+            }
+            at += e->Size;
+        }
+    free(buf);
+    len = 0;   /* (and the group's cores: how many of them the largest L3 has) */
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return mask;
+    buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && ncores < 256;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group)
+                cores[ncores++] = (uint64_t)e->Processor.GroupMask[0].Mask;
+            at += e->Size;
+        }
+    free(buf);
+    mask = pick_cache_cores(masks, sizes, n, cores, ncores);
+    if (mask) {
+        uint64_t most = 0, least = ~0ull;
+        for (int i = 0; i < n; i++) {
+            if (sizes[i] > most) most = sizes[i];
+            if (sizes[i] && sizes[i] < least) least = sizes[i];
+        }
+        hos_log("threads: the game's on logical processors %#llx, the cores that share the largest L3 (%llu MB; the others' is "
+                "%llu MB). HOS_CACHE_CORES=0: every core", (unsigned long long)mask, (unsigned long long)(most >> 20),
+                (unsigned long long)(least >> 20));
+    }
+    return mask;
+}
+/* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
+static uint64_t last_fastest_core(int *cores) {
+    static uint64_t masks[256];
+    static unsigned char classes[256];
+    DWORD len = 0;
+    int n = 0;
+    *cores = 0;
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    char *buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && n < 256;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group) {
+                masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
+                classes[n] = e->Processor.EfficiencyClass;
+                n++;
+            }
+            at += e->Size;
+        }
+    free(buf);
+    *cores = n;
+    return pick_reserved_core(masks, classes, n);
+}
+/* (0.1.9c) The cores of the fastest kind on a hybrid CPU (Intel's P-cores beside E-cores): their logical processors, or 0 on a
+   CPU of one kind, with fewer than 4 of the fastest, or HOS_P_CORES=0. A Core Ultra 7 270K Plus: P-cores at logical processors
+   0, 1, 10-13, 22 and 23, E-cores at 2-9 and 14-21. The calling thread's processor group, as the reserved core's choice */
+int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c: the Insert menu's mastersword_options.ini) */
+uint64_t hos_fast_cpus(void) {
+    static uint64_t mask = ~0ull;
+    if (mask != ~0ull) return mask;
+    mask = 0;
+    /* (the Insert / F1 menu's "Intel Hybrid CPU Patch", hybrid_cpu=, on unless 0; read once, at start. HOS_P_CORES over it) */
+    if (getenv("HOS_P_CORES") ? !atoi(getenv("HOS_P_CORES")) : !hos_ini_option("hybrid_cpu", 1)) {
+        hos_log("threads: Intel Hybrid CPU Patch off: the game's threads on any core");
+        return mask;
+    }
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    DWORD len = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return mask;
+    char *buf = (char *)malloc(len);
+    uint64_t fast = 0;
+    int best = -1, kinds = 0, nfast = 0;
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group) {
+                const int c = e->Processor.EfficiencyClass;
+                if (c > best) kinds += best >= 0, best = c, fast = 0, nfast = 0;
+                else if (c < best) kinds |= 1;
+                if (c == best) fast |= (uint64_t)e->Processor.GroupMask[0].Mask, nfast++;
+            }
+            at += e->Size;
+        }
+    free(buf);
+    if (kinds && nfast >= 4) {
+        mask = fast;
+        hos_log("threads: a hybrid CPU: %d cores of the fastest kind at logical processors %#llx; the frame's threads are kept "
+                "there (HOS_P_CORES=0: anywhere)", nfast, (unsigned long long)mask);
+    }
+    return mask;
+}
+#endif
 uint64_t hos_reserved_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
     mask = 0;
     if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return mask;
+#if defined(_WIN32)
+    /* (hookshot) none where the game is kept to the cores of the largest L3 (hos_cache_cpus): they are 8 cores on the CPUs
+       measured (a 9950X3D, SMT off), and with one of them kept for the replay the game's threads had 7. In the market the replay
+       then took 9.8-10.0 ms a frame but the frame rate stayed at 56.9-57.4; with the 8 shared, 10.1-10.5 ms and 59.9 fps.
+       HOS_RESERVE_CORE=1: the last core of the fastest kind is kept all the same, as on other CPUs. That is normally a core of
+       the other CCD, not the cache core of the 9.8-10.0 ms above, and the game's threads then have all of the cache cores */
+    if (hos_cache_cpus() && !(getenv("HOS_RESERVE_CORE") && atoi(getenv("HOS_RESERVE_CORE")))) return mask;
+    {
+        int cores = 0;
+        const uint64_t fast = last_fastest_core(&cores);
+        if (cores) return mask = fast;
+    }
+#endif
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
     DWORD len = sizeof info;
     if (!GetLogicalProcessorInformation(info, &len)) return mask;
@@ -555,12 +843,110 @@ uint64_t hos_reserved_cpus(void) {
     return mask;
 }
 
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+/* (0.1.8) Windows 11 hybrid P-core / MMCSS registration & per-thread Anti-EcoQoS:
+   Process-level SetProcessInformation disables EcoQoS globally, but Windows 11 Thread Director can still park borderless
+   windowed threads on Intel E-cores or non-V-Cache CCDs unless critical latency threads disable per-thread execution-speed
+   throttling and register with MMCSS ("Games" / "Pro Audio"). Only critical latency threads register so background worker
+   threads can still use E-cores without competing with MainThread / Presentation / Audio. HOS_NO_MMCSS=1 disables. */
+static int hos_mmcss_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("HOS_NO_MMCSS") || !atoi(getenv("HOS_NO_MMCSS"));
+    return on;
+}
+/* 0 = background/worker, 1 = Games (frame-critical), 2 = Pro Audio (real-time audio) */
+static int hos_mmcss_classify(const char *name) {
+    if (!name || !*name) return 0;
+    if (strstr(name, "Audio") || strstr(name, "audio") || strstr(name, "Sound") || strstr(name, "aac") ||
+        strstr(name, "Voice"))
+        return 2;
+    if (!strcmp(name, "MainThread") || strstr(name, "::MainThread") || strstr(name, "Presentation") ||
+        strstr(name, "VSync") || strstr(name, "Display"))
+        return 1;
+    return 0;
+}
+static void hos_disable_thread_throttling(HANDLE h) {
+    typedef BOOL(WINAPI * SetThreadInfoFn)(HANDLE, int, const void *, DWORD);
+    static SetThreadInfoFn fn = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (k32) fn = (SetThreadInfoFn)(void *)GetProcAddress(k32, "SetThreadInformation");
+        resolved = 1;
+    }
+    if (fn && h) {
+        struct { ULONG version, control, state; } s = {1, 1 /* EXECUTION_SPEED */, 0};
+        fn(h, 4 /* ThreadPowerThrottling */, &s, sizeof s);
+    }
+}
+static void hos_mmcss_apply_self(HosThread *t) {
+    const int kind = t ? t->mmcss_want : 0;
+    if (!kind || t->mmcss_done == kind || !hos_mmcss_on()) return;
+    t->mmcss_done = kind;
+    hos_disable_thread_throttling(GetCurrentThread());
+    typedef HANDLE(WINAPI * AvSetCharsFn)(LPCWSTR, LPDWORD);
+    typedef BOOL(WINAPI * AvSetPrioFn)(HANDLE, int);
+    static AvSetCharsFn pAvSetChars = NULL;
+    static AvSetPrioFn pAvSetPrio = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        HMODULE av = LoadLibraryW(L"avrt.dll");
+        if (av) {
+            pAvSetChars = (AvSetCharsFn)(void *)GetProcAddress(av, "AvSetMmThreadCharacteristicsW");
+            pAvSetPrio = (AvSetPrioFn)(void *)GetProcAddress(av, "AvSetMmThreadPriority");
+        }
+        resolved = 1;
+    }
+    if (pAvSetChars) {
+        DWORD idx = 0;
+        HANDLE avh = pAvSetChars(kind == 2 ? L"Pro Audio" : L"Games", &idx);
+        if (avh && pAvSetPrio) pAvSetPrio(avh, kind == 2 ? 2 /* CRITICAL */ : 1 /* HIGH */);
+    }
+}
+void hos_thread_mmcss_tag(HosThread *t, const char *name) {
+    if (!t || !hos_mmcss_on()) return;
+    const int kind = hos_mmcss_classify(name);
+    if (!kind) return;
+    t->mmcss_want = kind;
+    if (t->handle) hos_disable_thread_throttling(t->handle);
+    if (cur == t) hos_mmcss_apply_self(t);
+}
+#else
+void hos_thread_mmcss_tag(HosThread *t, const char *name) { (void)t; (void)name; }
+static void hos_mmcss_apply_self(HosThread *t) { (void)t; }
+#endif
+
 void hos_thread_pin(void *h, const char *name) {
     const uint64_t reserved = hos_reserved_cpus();
-    if (reserved) {
+#if defined(_WIN32)
+    const uint64_t cache = hos_cache_cpus();   /* (hookshot: the cores of the largest L3, when the CPU's differ) */
+#else
+    const uint64_t cache = 0;
+#endif
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    /* (0.1.9c) the frame's own threads (MainThread, Presentation, VSync, Display: the MMCSS "Games" ones) on the P-cores of a
+       hybrid CPU: Windows put them on E-cores at times, and a frame thread there ran its work ~1.5-2x slower. HOS_P_CORES=0:
+       anywhere.
+       And every other game thread too (HOS_GAME_P_CORES=0: only the frame's): the Switch 2 gives a game six identical cores
+       with their own L2 each, and the game's threads are timed for that; at most six of them run at once (the virtual cores),
+       which the P-cores less the renderer's reserved one hold. On E-cores some ran at half speed, the frames came late and
+       timing-bound work went wrong (a 270K Plus: the frame threads on P-cores alone took most of the glitches away). Not OoT's
+       OptimizeChangeBank, the lowest-priority walker that never stops: it may run anywhere */
+    static int game_p = -1;
+    if (game_p < 0) game_p = !getenv("HOS_GAME_P_CORES") || atoi(getenv("HOS_GAME_P_CORES")) != 0;
+    const int frame_thread = hos_mmcss_classify(name) == 1;
+    const int game_thread = game_p && name && !strstr(name, "OptimizeChange");
+    const uint64_t fast = frame_thread || game_thread ? hos_fast_cpus() : 0;
+#else
+    const uint64_t fast = 0;
+#endif
+    if (reserved || cache || fast) {
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-        if ((uint64_t)proc & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        uint64_t may = (uint64_t)proc;
+        if (cache && (may & cache)) may &= cache;
+        if (fast && (may & fast & ~reserved)) may &= fast;
+        if (may & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)(may & ~reserved));
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;
@@ -577,6 +963,22 @@ void hos_thread_pin(void *h, const char *name) {
                                   THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST};
     if ((p = match_name_spec(prios, nprios, name)) && p->value >= -2 && p->value <= 2)
         SetThreadPriority(h, levels[p->value + 2]);
+    else if (strstr(name, "OptimizeChange") && !getenv("HOS_OCB_NORMAL")) {
+        /* (OoT's OptimizeChangeBank (guest priority 27, a background thread) walks every placed object of the
+           area by name, again and again (Kokiri: ~344 names, ~250k lookups a second). On the console it only gets the
+           time nothing more important wants; at the host's normal priority it took the renderer's and the driver's
+           cores and the frame waited (Kokiri, RX 6600 + 5600G: 17-20 fps; lowest: 21-28). HOS_OCB_NORMAL=1: as before) */
+        SetThreadPriority(h, THREAD_PRIORITY_LOWEST);
+    }
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    else if (hos_mmcss_on()) {
+        const int kind = hos_mmcss_classify(name);
+        if (kind) {
+            hos_disable_thread_throttling((HANDLE)h);
+            SetThreadPriority(h, kind == 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+#endif
 }
 
 /* ---- time ------------------------------------------------------------------------------------------------ */
@@ -597,19 +999,37 @@ int64_t hos_now_ns(void) {
     return (int64_t)((now.QuadPart / freq.QuadPart) * 1000000000LL + (now.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart);
 }
 
-static void sleep_ns(int64_t ns);
-/* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) */
-void hos_sleep_ns(int64_t ns) {
+static void sleep_ns(int64_t ns, int guest);
+/* How sleeps under a millisecond wait: 0, all yield until their time; 1, the game's own (SleepThread) wait on the timer,
+   which wakes about 0.5 ms late, and the host's (the frame limiter, the audio renderer) yield; 2, all wait on the timer.
+   asked: the value of HOS_SHORT_SLEEP_TIMER, NULL when it is not set; set, it is read by env_on's rule (on: the timer for
+   all, 2; off: yielding for all, 0). threads: the logical processors this process may run on, 0 when not known. Not set:
+   1 with SHORT_SLEEP_TIMER_THREADS of them or fewer, which is no more than the game's six cores, else 0.
+   OoT's idle job workers sleep 20 us and look again, about 7,600 times a second, and a yielding loop keeps a processor
+   busy for each: with so few processors that is time the frame's threads need. Measured with the game held to part of a
+   5700X3D: on 4 threads Hyrule Field went from 47 to 51 fps and lost its long frames (over 250 ms in 2 of 4 runs
+   yielding, in none with the timer), Kokiri's worst frame went from 53-422 ms to 30 ms; on 6 the frame rate stayed and a
+   frame's CPU time fell 9 %. On 8 threads and more yielding stays: with the timer for all sleeps there were no long
+   frames either way and Kokiri lost 0.2 fps under its cap, and the timer made TOTK's 20 us waits for its job workers 25x
+   longer, ~2000 a second on the frame's critical path. */
+enum { SHORT_SLEEP_TIMER_THREADS = 6 };
+static int hos_short_sleep_timer(const char *asked, int threads) {
+    if (asked) return env_value_off(asked) ? 0 : 2;
+    return threads > 0 && threads <= SHORT_SLEEP_TIMER_THREADS ? 1 : 0;
+}
+/* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) guest: the game's own sleep */
+static void sleep_away(int64_t ns, int guest) {
     if (ns <= 0) {
         hos_vcore_yield();
         SwitchToThread();
         return;
     }
     const int away = hos_vcore_away();
-    sleep_ns(ns);
+    sleep_ns(ns, guest);
     if (away) hos_vcore_back();
 }
-static void sleep_ns(int64_t ns) {
+void hos_sleep_ns(int64_t ns) { sleep_away(ns, 0); }
+static void sleep_ns(int64_t ns, int guest) {
     /* A high-resolution waitable timer (one per thread) sleeps to within ~0.5 ms without spinning; Sleep() rounds to
        the timer resolution, so without one the last millisecond is spun (threads that sleep in short steps, the
        vibration thread for one, used 15% of a core spinning). */
@@ -636,11 +1056,28 @@ static void sleep_ns(int64_t ns) {
     while (hos_now_ns() < until) sched_yield();
     return;
 #endif
-    /* Under a millisecond: yielded away until the time (the timer's ~0.5 ms granularity made TOTK's 20 us waits for
-       its job workers 25x longer, ~2000 a second on the frame's critical path). HOS_SHORT_SLEEP_TIMER=1: as before */
+    /* Under a millisecond: yielded away until the time, or the timer for the game's own sleeps where the processors
+       are few (hos_short_sleep_timer). HOS_SHORT_SLEEP_TIMER=1: the timer always, 0: never, not set: by the processors */
     static int short_timer = -1;
-    if (short_timer < 0) short_timer = getenv("HOS_SHORT_SLEEP_TIMER") != NULL;
-    if (ns < 1000000 && !short_timer) {
+    if (short_timer < 0) {
+        int threads = 0;
+#if defined(_WIN32)   /* (measured on Windows only: elsewhere the timer when asked for) */
+        /* (with more than one processor group the mask is one group's, not the process's: not known then) */
+        DWORD_PTR proc = 0, sys = 0;
+        if (GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
+            threads = __builtin_popcountll((uint64_t)proc);
+#endif
+        const int how = hos_short_sleep_timer(getenv("HOS_SHORT_SLEEP_TIMER"), threads);
+        /* (the line says what was chosen, before any thread has made its timer: where the high-resolution timer cannot
+           be made, Windows before 10 1803, a short sleep falls through to the yield loop at the end and nothing changes) */
+        static volatile LONG told;
+        if (how && !InterlockedExchange(&told, 1))
+            hos_log("sleep: %s sleeps under a millisecond wait on the timer where Windows has the high-resolution one "
+                    "(%d logical processors; HOS_SHORT_SLEEP_TIMER=0: all yield)",
+                    how == 2 ? "all" : "the game's", threads);
+        short_timer = how;
+    }
+    if (ns < 1000000 && short_timer < (guest ? 1 : 2)) {
         while (hos_now_ns() < until)
             if (!SwitchToThread()) YieldProcessor();
         return;
@@ -663,6 +1100,10 @@ static void sleep_ns(int64_t ns) {
 
 /* ---- nn::os threads -------------------------------------------------------------------------------------- */
 static HosThread *thread_arg(Ctx *c, uint64_t tt) {
+    /* (the calling thread's own ThreadType, the usual case: GetThreadPriority(GetCurrentThread()) ~2,400 times a frame in
+       Hyrule from the navigation workers: its record, without the scan of every thread under threads_lock; the SDK reads
+       the priority from the ThreadType itself) */
+    if (cur && cur->guest_tt == tt) return cur;
     HosThread *t = hos_thread_of(tt);
     if (!t) hos_fatal(c, "unknown nn::os::ThreadType %#llx", (unsigned long long)tt);
     return t;
@@ -745,10 +1186,10 @@ void hos_sleep_logged(int64_t ns, uint64_t lr) {
     }
     if (poll_cap && ns > poll_cap && ns <= 100000) ns = poll_cap;
     static int on = -1;
-    if (on < 0) on = getenv("HOS_SLEEP_LOG") != NULL;
-    if (!on) { hos_sleep_ns(ns); return; }
+    if (on < 0) on = env_on("HOS_SLEEP_LOG");
+    if (!on) { sleep_away(ns, 1); return; }
     const int64_t t0 = hos_now_ns();
-    hos_sleep_ns(ns);
+    sleep_away(ns, 1);
     const int64_t took = hos_now_ns() - t0;
     static SRWLOCK lk = SRWLOCK_INIT;
     static struct { uint64_t lr; int64_t n, asked, slept; } tab[64];
@@ -1117,8 +1558,9 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
 static void vc_acquire(HosThread *t) {
     static int64_t esc_better = -1, esc_eq, slice;
     if (esc_better < 0) {
-        esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 250000);
-        esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 250000);
+        /* (#2127 / #1929) 2 s default: 250 ms escaped 6–8×/run on waits that finish alone within ~1.2 s */
+        esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 2000000);
+        esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 2000000);
         slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
     }
     AcquireSRWLockExclusive(&vc_lock);
@@ -1164,6 +1606,7 @@ static void vc_acquire(HosThread *t) {
         const int64_t waited = hos_now_ns() - t0;
         if (waited > (worst ? esc_better : esc_eq)) {
             vc_dequeue(t);
+            t->vc_escaped = 1;
             vc_st.escapes++;
             static int logged;
             if (logged < 40) {
@@ -1213,16 +1656,35 @@ static void vc_yield(HosThread *t, int strict) {
     vc_release(t);
     vc_acquire(t);
 }
+/* 1 when the caller is to take a core again after its block (hos_vcore_back): it gave its core up, or it has run without
+   one since an escape. An escape lasts until the thread's next block, as every other thread waits for a core after one;
+   it took none again before, so an escaped thread ran with no core, and the core number of a core another thread held,
+   for the rest of its life (issue 1929) */
 int hos_vcore_away(void) {
     HosThread *t = cur;
-    if (!hos_vcores_on() || !t || !t->vc_held) return 0;
+    if (!hos_vcores_on() || !t) return 0;
+    if (!t->vc_held) {
+        const int escaped = t->vc_escaped;   /* (only the outermost block of nested ones takes the core again) */
+        t->vc_escaped = 0;
+        return escaped;
+    }
     vc_release(t);
     return 1;
 }
 void hos_vcore_back(void) {
     HosThread *t = cur;
-    if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
+    if (t && t->mmcss_want != t->mmcss_done) hos_mmcss_apply_self(t);
+    if (!hos_vcores_on() || !t) return;
+    /* after it the thread holds a core or has escaped again (vc_acquire sets the flag again): the escape the flag stood
+       for has ended, also at a back without its away (a thread's start). A flag left up while a core is held would make
+       a later inner block's away answer 1 and take a core in the middle of the outer block */
+    t->vc_escaped = 0;
+    if (!t->vc_held) vc_acquire(t);
 }
+/* Lifted code calls this from its interrupt polls with the loop's guest registers still in host registers (a64_poll_cur,
+   mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
+   read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
+   stall dump of a thread spinning in a polled loop shows such older registers for the same reason. */
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
     if (t && t->vc_kick) vc_yield(t, t->vc_kick == 1);

@@ -4,9 +4,12 @@
    no emulated GPU, so the renderer is the only way to a picture.
    HOS_HEADLESS=1: no window (scripted runs; the renderer draws offscreen). Closing the window ends the run.
    HOS_WINDOW_NOACTIVATE=1: the window opens behind the one in front (test runs do not take the keyboard).
-   HOS_WINDOW_SIZE=<w>x<h>: the client area (default 1280x720 at 96 dpi). F11: fullscreen.
+   HOS_WINDOW_SIZE=<w>x<h>: the client area (default 1280x720 at 96 dpi). F11 or Alt+Enter: fullscreen.
    Mouse: a click in the window captures the mouse (hidden, kept in the window), Esc or leaving the window releases
-   it (nn_hid.c reads its motion). */
+   it (nn_hid.c reads its motion). While the Insert menu is open the mouse is free (the cursor shown, for the menu's
+   clicks: hos_mouse_pointer) and the game gets none of it; the capture it had comes back when the menu closes.
+   Auto-hide: when focused and the cursor is idle in the client (~1.5 s windowed; immediate in fullscreen until moved),
+   the OS cursor is hidden so controller/keyboard play is not blocked by a stuck arrow. Off with HOS_AUTO_HIDE_CURSOR=0. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +17,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "../gpu/render/rx.h"
+void rx_close_asked(void);   /* host/rx_backend.c */
+#include "../gpu/vk/vk_api.h"
+#include "display_pointer.h"
+
+void hos_relaunch_ask(void);        /* (host/hos_relaunch.c) */
+void hos_window_closed_exit(void);
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
@@ -25,7 +34,8 @@ static int renderer;   /* the renderer presents into the window */
 /* mouse capture: raw motion accumulated here, taken by nn_hid.c */
 static volatile LONG mouse_dx, mouse_dy;
 static volatile LONG mouse_captured;
-static int cursor_hidden;
+static int cursor_hidden;   /* ShowCursor(FALSE) last applied (capture and/or idle auto-hide) */
+static int fullscreen;      /* ahead of cursor_should_hide */
 
 int hos_mouse_take(int32_t *dx, int32_t *dy) {
     *dx = InterlockedExchange(&mouse_dx, 0);
@@ -33,8 +43,119 @@ int hos_mouse_take(int32_t *dx, int32_t *dy) {
     return mouse_captured;
 }
 
+/* (mouse_native.c) motion taken and not used, put back for the next taker (the player camera's) */
+void hos_mouse_give_back(int32_t dx, int32_t dy) {
+    InterlockedExchangeAdd(&mouse_dx, dx);
+    InterlockedExchangeAdd(&mouse_dy, dy);
+}
+
+/* the free mouse, for the Insert menu (gpu/vk/vk_api.h MkwVkPointer): set on the window's thread, read on the renderer's */
+static HosPointer pointer = HOS_POINTER_INIT;
+static int menu_open, captured_before_menu;
+static int pointer_tracking;
+
+/* Auto-hide the OS cursor while playing (foreground client area). Insert menu and window chrome keep it.
+   HOS_AUTO_HIDE_CURSOR=0: off. ShowCursor / SetWindowPos can inject a synthetic WM_MOUSEMOVE at the same pixel —
+   wake only on >= 2 px screen delta so idle-hide does not blink. */
+enum { kAutoHideIdleMs = 1500, kAutoHideWakePx = 2 };
+static int auto_hide_cursor = -1;
+static POINT auto_hide_last_pt;
+static int auto_hide_last_valid;
+static ULONGLONG auto_hide_last_move_ms;
+static int auto_hide_force_now;   /* fullscreen enter / focus / menu close: hide without waiting for idle */
+
+static int auto_hide_enabled(void) {
+    if (auto_hide_cursor < 0)
+        auto_hide_cursor = !getenv("HOS_AUTO_HIDE_CURSOR") || atoi(getenv("HOS_AUTO_HIDE_CURSOR")) != 0;
+    return auto_hide_cursor;
+}
+
+static void cursor_set_hidden(int hide) {
+    if (hide == cursor_hidden) return;
+    ShowCursor(hide ? FALSE : TRUE);
+    cursor_hidden = hide;
+    if (hide) {
+        POINT at;
+        if (GetCursorPos(&at)) auto_hide_last_pt = at, auto_hide_last_valid = 1;
+    }
+}
+
+static int cursor_in_client(HWND w, POINT *screen_out) {
+    POINT at = {0};
+    RECT rc = {0};
+    if (!GetCursorPos(&at) || !GetClientRect(w, &rc)) return 0;
+    if (WindowFromPoint(at) != w) return 0;
+    POINT client = at;
+    if (!ScreenToClient(w, &client)) return 0;
+    if (client.x < 0 || client.y < 0 || client.x >= rc.right || client.y >= rc.bottom) return 0;
+    if (screen_out) *screen_out = at;
+    return 1;
+}
+
+static int cursor_should_hide(HWND w) {
+    if (mouse_captured) return 1;
+    if (!auto_hide_enabled() || menu_open || IsIconic(w) || GetForegroundWindow() != w) return 0;
+    if (!cursor_in_client(w, NULL)) return 0;
+    if (auto_hide_force_now) return 1;
+    if (fullscreen) {
+        /* Fullscreen: hide at once until a deliberate move; after a move, idle 1.5 s then hide again. */
+        if (!auto_hide_last_move_ms) return 1;
+        return GetTickCount64() - auto_hide_last_move_ms >= kAutoHideIdleMs;
+    }
+    /* Windowed foreground: idle 1.5 s inside the client. */
+    return auto_hide_last_move_ms && GetTickCount64() - auto_hide_last_move_ms >= kAutoHideIdleMs;
+}
+
+static void cursor_tick(HWND w) {
+    cursor_set_hidden(cursor_should_hide(w));
+}
+
+/* Real mouse motion (>= 2 px). Synthetic ShowCursor/SetWindowPos moves at the same pixel do not wake. */
+static void cursor_note_motion(HWND w) {
+    POINT at;
+    if (!GetCursorPos(&at)) return;
+    if (!auto_hide_last_valid) {
+        auto_hide_last_pt = at;
+        auto_hide_last_valid = 1;
+        return;
+    }
+    const int dx = at.x - auto_hide_last_pt.x, dy = at.y - auto_hide_last_pt.y;
+    const int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    if (adx < kAutoHideWakePx && ady < kAutoHideWakePx) return;
+    auto_hide_last_pt = at;
+    auto_hide_last_move_ms = GetTickCount64();
+    auto_hide_force_now = 0;
+    cursor_tick(w);
+}
+
+static void cursor_hide_now(HWND w) {
+    auto_hide_force_now = 1;
+    auto_hide_last_move_ms = 0;
+    cursor_tick(w);
+}
+
+int hos_mouse_pointer(MkwVkPointer *out) { return hos_pointer_take(&pointer, out); }
+
+/* Query on the DPI-aware window thread: moving/resizing with a stationary cursor also changes its client point. */
+static void pointer_update(HWND w, uint32_t pressed, int wheel) {
+    if (mouse_captured) return;   /* mouse_capture cleared the mailbox on entry */
+    RECT rc = {0};
+    POINT at = {0};
+    const int sampled = GetClientRect(w, &rc) && GetCursorPos(&at);
+    const int over = sampled && WindowFromPoint(at) == w;
+    const int valid = sampled && ScreenToClient(w, &at);
+    MkwVkPointer sample = {0};
+    sample.x = at.x, sample.y = at.y, sample.width = rc.right, sample.height = rc.bottom;
+    sample.held = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? HOS_MOUSE_LEFT : 0) |
+                  ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? HOS_MOUSE_RIGHT : 0) |
+                  ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? HOS_MOUSE_MIDDLE : 0);
+    sample.pressed = pressed, sample.wheel = wheel;
+    const int inside = at.x >= 0 && at.y >= 0 && at.x < rc.right && at.y < rc.bottom;
+    hos_pointer_publish(&pointer, sample, valid && !mouse_captured && !IsIconic(w) &&
+                        GetForegroundWindow() == w && ((inside && over) || GetCapture() == w));
+}
+
 static HANDLE renderer_up;
-static int fullscreen;
 static WINDOWPLACEMENT windowed_place;
 
 static void set_fullscreen(HWND w, int on) {
@@ -59,6 +180,8 @@ static void set_fullscreen(HWND w, int on) {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     }
     hos_log("display: %s", on ? "fullscreen (F11 for a window)" : "windowed");
+    if (on && !menu_open && !mouse_captured) cursor_hide_now(w);
+    else cursor_tick(w);
 }
 
 static void dpi_aware_thread(void) {
@@ -81,21 +204,113 @@ static void mouse_capture(HWND w, int on) {
     InterlockedExchange(&mouse_dx, 0);
     InterlockedExchange(&mouse_dy, 0);
     if (on) {
+        hos_pointer_reset(&pointer);
+        if (pointer_tracking) {
+            TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE | TME_CANCEL, w, 0};
+            TrackMouseEvent(&t);
+            pointer_tracking = 0;
+        }
         RECT rc;
         GetClientRect(w, &rc);
         MapWindowPoints(w, NULL, (POINT *)&rc, 2);
         ClipCursor(&rc);
-        if (!cursor_hidden) { ShowCursor(FALSE); cursor_hidden = 1; }
+        cursor_set_hidden(1);
     } else {
         ClipCursor(NULL);
-        if (cursor_hidden) { ShowCursor(TRUE); cursor_hidden = 0; }
+        /* Idle auto-hide may still want the cursor gone — do not force-show. */
+        cursor_tick(w);
     }
+    pointer_update(w, 0, 0);
+}
+
+/* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
+static void menu_mouse(HWND w, int open) {
+    if (open == menu_open) return;
+    menu_open = open;
+    if (open) {
+        captured_before_menu = (int)mouse_captured;
+        mouse_capture(w, 0);
+        hos_pointer_reset(&pointer);
+        pointer_update(w, 0, 0);
+        auto_hide_force_now = 0;
+        auto_hide_last_move_ms = GetTickCount64();
+        cursor_set_hidden(0);   /* Insert overlay needs a visible cursor */
+    } else {
+        if (captured_before_menu && GetForegroundWindow() == w) mouse_capture(w, 1);
+        captured_before_menu = 0;
+        if (fullscreen && !mouse_captured) cursor_hide_now(w);
+        else cursor_tick(w);
+    }
+}
+static void menu_press(HWND w, LPARAM lp, LONG bit) {   /* (a click while the menu is open: the menu's) */
+    (void)lp;
+    SetCapture(w);   /* a drag past the window edge still reaches it */
+    pointer_update(w, (uint32_t)bit, 0);
 }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_TIMER:
+    case WM_MOUSEMOVE: {
+        if (mouse_captured) return 0;
+        if (!pointer_tracking) {
+            TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
+            pointer_tracking = TrackMouseEvent(&t) != 0;
+        }
+        cursor_note_motion(w);
+        pointer_update(w, 0, 0);
         return 0;
+    }
+    case WM_NCMOUSEMOVE:
+        /* Title bar / borders: keep the OS cursor for window controls. */
+        auto_hide_force_now = 0;
+        auto_hide_last_move_ms = GetTickCount64();
+        cursor_set_hidden(0);
+        break;
+    case WM_MOUSELEAVE:
+        pointer_tracking = 0;
+        pointer_update(w, 0, 0);
+        cursor_tick(w);
+        return 0;
+    case WM_MOUSEWHEEL:
+        pointer_update(w, 0, menu_open ? GET_WHEEL_DELTA_WPARAM(wp) : 0);
+        return 0;
+    case WM_RBUTTONDOWN:
+        if (menu_open) menu_press(w, lp, HOS_MOUSE_RIGHT);
+        return 0;
+    case WM_MBUTTONDOWN:
+        if (menu_open) menu_press(w, lp, HOS_MOUSE_MIDDLE);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+        if (GetCapture() == w && !(wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) ReleaseCapture();
+        pointer_update(w, 0, 0);
+        return 0;
+    case WM_APP + 8:   /* (the Insert menu opened or closed: gpu/vk/vk_menu.cpp) */
+        menu_mouse(w, (int)wp);
+        return 0;
+    case WM_TIMER: {
+        pointer_update(w, 0, 0);
+        cursor_tick(w);
+        /* Controller play is not Windows input — keep the display awake while foreground (#1538).
+           HOS_KEEP_DISPLAY=0: Windows' timeout as before. */
+        static ULONGLONG last_awake;
+        static int keep = -1;
+        if (keep < 0) keep = !getenv("HOS_KEEP_DISPLAY") || atoi(getenv("HOS_KEEP_DISPLAY")) != 0;
+        const ULONGLONG now = GetTickCount64();
+        if (keep && renderer && now - last_awake >= 30000 && GetForegroundWindow() == w && !IsIconic(w)) {
+            last_awake = now;
+            SetThreadExecutionState(ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+        }
+        return 0;
+    }
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_SCREENSAVE && !(wp & SCF_ISSECURE) &&
+            renderer && GetForegroundWindow() == w && !IsIconic(w)) {
+            BOOL secure = TRUE;   /* unknown or protected policy keeps Windows' normal handling */
+            if (SystemParametersInfoA(SPI_GETSCREENSAVESECURE, 0, &secure, 0) && !secure) return 0;
+        }
+        break;
     case WM_INPUT: {
         RAWINPUT ri;
         UINT size = sizeof ri;
@@ -107,12 +322,29 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcA(w, msg, wp, lp);
     }
     case WM_LBUTTONDOWN:
-        if (renderer && !mouse_captured) mouse_capture(w, 1);
+        if (menu_open) menu_press(w, lp, HOS_MOUSE_LEFT);
+        else if (renderer && !mouse_captured) mouse_capture(w, 1);
         return 0;
-    case WM_KEYDOWN:
+    case WM_KEYDOWN: {
+        extern void hos_vk_note_key_press(unsigned key);
+        if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
-        if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+        if (wp == VK_F11 && !(lp & (1 << 30))) {
+            /* Bare F11 only — Shift/Ctrl/Alt+F11 (e.g. RTSS overlay) must reach other apps (#1608). */
+            const int mod = (GetKeyState(VK_SHIFT) | GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU)) & 0x8000;
+            if (!mod) set_fullscreen(w, !fullscreen);
+        }
         return 0;
+    }
+    case WM_SYSKEYDOWN:   /* Alt+Enter, as on Linux (display_sdl.c); other Alt keys (Alt+F4) go on to Windows */
+        if (wp == VK_RETURN && (lp & (1 << 29))) {
+            if (!(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+            return 0;
+        }
+        break;
+    case WM_SYSCHAR:   /* (its character: without this Windows beeps, as for an Alt key with no menu) */
+        if (wp == '\r') return 0;
+        break;
     case WM_APP + 7:   /* (the Insert menu's row) */
         set_fullscreen(w, (int)wp);
         return 0;
@@ -122,21 +354,35 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowPos(w, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        pointer_update(w, 0, 0);
         return 0;
+    case WM_SETFOCUS:
+        pointer_update(w, 0, 0);
+        if (fullscreen && !menu_open && !mouse_captured) cursor_hide_now(w);
+        else {
+            if (!fullscreen) auto_hide_last_move_ms = GetTickCount64(), auto_hide_force_now = 0;
+            cursor_tick(w);
+        }
+        break;
     case WM_KILLFOCUS:
     case WM_CANCELMODE:
         mouse_capture(w, 0);
+        hos_pointer_reset(&pointer);
+        auto_hide_force_now = 0;
+        cursor_set_hidden(0);   /* unfocused: never leave the cursor hidden for other apps */
         break;
     case WM_SETCURSOR:
-        if (mouse_captured && LOWORD(lp) == HTCLIENT) {
+        if (LOWORD(lp) == HTCLIENT && (mouse_captured || cursor_hidden)) {
             SetCursor(NULL);
             return TRUE;
         }
         break;
     case WM_MOVE:
         if (mouse_captured) { mouse_capture(w, 0); mouse_capture(w, 1); }   /* (the clip follows the window) */
+        pointer_update(w, 0, 0);
         break;
     case WM_SIZE:
+        pointer_update(w, 0, 0);
         if (mouse_captured) { mouse_capture(w, 0); mouse_capture(w, 1); }
         if (renderer) rx_resize(LOWORD(lp), HIWORD(lp));
         return 0;
@@ -148,20 +394,29 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_ERASEBKGND:
         return renderer ? 1 : DefWindowProcA(w, msg, wp, lp);
+    case WM_APP + 9:   /* (the Insert menu's Restart now: closed as by the player, then started again: host/hos_relaunch.c) */
+        hos_relaunch_ask();
+        /* fall through */
     case WM_CLOSE:
-        hos_log("display: window closed, exiting");
-        hos_log_flush();
-        ExitProcess(0);
+        rx_close_asked();   /* (a start still preparing the shaders keeps what it made) */
+        hos_window_closed_exit();
         return 0;
     }
     return DefWindowProcA(w, msg, wp, lp);
+}
+
+static void display_start_failed(const char *operation) {
+    const DWORD error = GetLastError();
+    hos_log("display: %s failed (error %lu)", operation, (unsigned long)error);
+    hos_log_flush();
+    ExitProcess(1);
 }
 
 static DWORD WINAPI display_main(void *p) {
     (void)p;
     {   /* (nothing is typed here. Windows' text services, set up under DefWindowProc as the window was sized, ended the process: a
            fail-fast in CoreMessaging, called from textinputframework) */
-        HMODULE imm = LoadLibraryA("imm32.dll");
+        HMODULE imm = LoadLibraryExA("imm32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);   /* (hookshot: System32's only) */
         BOOL (WINAPI *ime_off)(DWORD) = imm ? (BOOL (WINAPI *)(DWORD))GetProcAddress(imm, "ImmDisableIME") : NULL;
         if (ime_off) ime_off((DWORD)-1);
     }
@@ -172,11 +427,12 @@ static DWORD WINAPI display_main(void *p) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));   /* (nx2/make_icon.py; none in a build without the picture) */
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = "Hookshot";
+    wc.lpszClassName = "MasterSword";
     RegisterClassA(&wc);
     dpi_aware_thread();
     extern float hos_aspect_ratio;
-    int win_w = hos_aspect_ratio > 1.8f ? (int)(720 * hos_aspect_ratio + 0.5f) : 1280, win_h = 720;
+    /* (the picture's shape when Monitor's shape set one, wider or narrower than 16:9: 960 x 720 for 4:3, 1720 x 720 for 21:9) */
+    int win_w = hos_aspect_ratio > 0.0f ? (int)(720 * hos_aspect_ratio + 0.5f) : 1280, win_h = 720;
     if (getenv("HOS_WINDOW_SIZE")) {
         int w = 0, h = 0;
         if (sscanf(getenv("HOS_WINDOW_SIZE"), "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64) win_w = w, win_h = h;
@@ -184,8 +440,9 @@ static DWORD WINAPI display_main(void *p) {
     RECT r = {0, 0, win_w, win_h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     const int noactivate = getenv("HOS_WINDOW_NOACTIVATE") != NULL;
-    hwnd = CreateWindowA("Hookshot", HOS_GAME_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    hwnd = CreateWindowA("MasterSword", HOS_GAME_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                          CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) display_start_failed("CreateWindowA");
     if (window_dpi(hwnd) != 96) {
         const UINT dpi = window_dpi(hwnd);
         RECT s = {0, 0, (LONG)(win_w * dpi / 96), (LONG)(win_h * dpi / 96)};
@@ -200,6 +457,9 @@ static DWORD WINAPI display_main(void *p) {
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(hwnd, 1);
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);
+    auto_hide_last_move_ms = GetTickCount64();
+    pointer_update(hwnd, 0, 0);
+    cursor_tick(hwnd);
     renderer = rx_start(hwnd);
     if (!renderer) hos_log("display: no WebGPU device: the window stays black");
     SetEvent(renderer_up);
@@ -216,7 +476,7 @@ static DWORD WINAPI display_main(void *p) {
    shaders were being prepared (80 s on a first start) was lost: that run had no ambient light, black foliage and dark characters. The
    game itself goes on starting as it did: held at the start instead, it left holes in the ground */
 void hos_renderer_wait(void) {
-    if (getenv("HOS_NO_RENDERER_WAIT")) return;   /* (a test: the game's first GPU work no longer waits for the renderer, as before lighting-fix) */
+    { const char *e = getenv("HOS_NO_RENDERER_WAIT"); if (e && atoi(e) != 0) return; }   /* (=0: the wait, as without it) */   /* (a test: the game's first GPU work no longer waits for the renderer, as before lighting-fix) */
     if (renderer_up) WaitForSingleObject(renderer_up, INFINITE);
 }
 
@@ -226,5 +486,8 @@ void hos_display_start(void) {
         return;
     }
     renderer_up = CreateEventA(NULL, TRUE, FALSE, NULL);
-    CreateThread(NULL, 0, display_main, NULL, 0, NULL);
+    if (!renderer_up) display_start_failed("CreateEventA");
+    HANDLE thread = CreateThread(NULL, 0, display_main, NULL, 0, NULL);
+    if (!thread) display_start_failed("CreateThread");
+    CloseHandle(thread);
 }

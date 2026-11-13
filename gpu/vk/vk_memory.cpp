@@ -6,14 +6,18 @@
 // title and importing each is a buffer, a memory object and a device address (tens of seconds taken at one submit,
 // on the render thread, in the first frame). The table of pools is cheap to keep current (host->gpu_pools: two
 // numbers each) and is refreshed when its generation changes, at a submit.
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <map>
+#include <set>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <vector>
 #include <condition_variable>
+#include "vk_menu.h"
 #include <deque>
 #include <unordered_map>
 #include <thread>
@@ -23,15 +27,40 @@
 #include <windows.h>
 
 #include "vk_internal.h"
+#include "hookshot_env.h"
 #include "vk_texture.h"   // (upload_command_buffer)
+#include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
+#include "import_hold.h"
+#include "mirror_trim.h"
+#include "wb_learn.h"
+#include "retired_give_back.h"
+#ifdef __linux__
+#include <cerrno>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#include "shaders/wb_diff_comp_spv.h"
+#include "vram_pressure.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
 namespace {
+
+// Every raw imported-buffer destruction goes through here, including unpublished allocation rollback.
+// Published imports reach it only at the existing completion/eviction gates; no additional GPU wait.
+void destroy_import_buffer(VkBuffer buffer) {
+    release_texel_buffer_views(buffer);
+    vkDestroyBuffer(dev.device, buffer, nullptr);
+}
 
 struct Pool {
     uint64_t lo = 0, hi = 0;   // guest range imported (aligned outwards)
     uint64_t range_lo = 0, range_hi = 0;   // (the game's pool range it was found for: pool_of's last hit)
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::vector<VkDeviceMemory> pieces;   // (a pool imported as several dma-bufs: the ones after `memory`)
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceAddress address = 0;
     // its VRAM mirror (see "the VRAM mirror" below)
@@ -45,6 +74,29 @@ struct Pool {
     uint64_t direct_write_epoch = 0;   // (the part that last wrote it in guest memory, before it had a mirror)
     uint64_t retired_value = 0;  // (retired: the submission that may still use it)
     bool was_mirrored = false;   // (its mirror was given back: its pages stay in the captures, for the next one)
+    // (hookshot) the GPU wrote it past what is copied back (memory_note_gpu_write: a bare entry's guessed range, the pointer
+    // table's, a wide binding's): that is in its mirror alone, so the mirror is never given back (mirrors_give_back)
+    bool gpu_only = false;
+    // (and the GPU wrote it through a binding of its mirror, copied back or not: after a save reload, the mirrors of such pools
+    // given back and made again left cyan in play and over the Start menu (RX 5500M, gone with RX_VK_MIRROR_KEEP=1); kept too)
+    bool gpu_written = false;
+    bool inherit_lost = false;   // (retired, and the pool that took it in made no mirror in time to copy its GPU contents)
+    // (EvilOOT) retired with its mirror on: the pool that took it in copies the GPU's contents from it when its own mirror is
+    // made (mirror_make), and until then the mirror stays (mirrors_give_back)
+    bool inherit_pending = false;
+    uint64_t dead_since = 0;   // (the submission its mirror was first mostly outside every game pool: mirror_trim.h)
+    uint8_t trims = 0;         // (how often its range was trimmed)
+    uint64_t trim_epoch = 0;   // (the submission its range was last trimmed in)
+    bool trimmed = false;      // (retired by a trim: its mirror stays until every live part has its own)
+    uint64_t retired_epoch = 0;
+    int64_t retired_ms = 0;      // (retired: when, import_now_ms; where its import waits before going back, the wait counts from here)
+    bool prefetched = false;     // (amd-fix) imported ahead by the background thread, not bound yet
+    // (hookshot) the write-back's diff: what guest memory holds of the pool, in VRAM, and the pages of it known to be so
+    VkBuffer shadow = VK_NULL_HANDLE;
+    VmaAllocation shadow_alloc = nullptr;
+    VkDeviceAddress shadow_address = 0;
+    std::vector<uint64_t> shadow_known;   // (a bit a page)
+    bool shadow_wanted = false;   // (its write-back was worth one: one given back under VRAM pressure is made again)
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
@@ -53,6 +105,7 @@ struct GuestPool {
 };
 
 std::vector<GuestPool> guest_pools;   // by lo, from the host
+std::atomic<uint64_t> guest_pools_gen{1};   // (bumped when that table is replaced: a span cached without the lock goes stale)
 std::map<uint64_t, Pool> imported;    // by lo, made on first use
 Pool* last_pool = nullptr;            // (the last pool_of hit: draws in a row bind buffers of the same pools)
 extern Pool* pool_cache[4096];
@@ -66,7 +119,25 @@ struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken
 SrwMutex pools_mu;
 uint32_t generation = ~0u;
 uint64_t align = 4096;
+uint64_t max_import_size = UINT64_MAX;
 int failures = 0;
+ImportHolds import_holds;          // (issue 218: a failed import is not tried again for ImportHolds::kGapMs)
+std::mutex import_holds_mu;
+thread_local bool import_cooling = false;
+thread_local VkResult import_result = VK_SUCCESS;
+
+int64_t import_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+bool import_on_hold(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(import_holds_mu);
+    import_cooling = !import_holds.allow(lo, hi, import_now_ms());
+    return import_cooling;
+}
+void import_remember_failure(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(import_holds_mu);
+    import_holds.deny_for(lo, hi, import_now_ms());
+}
 
 constexpr VkBufferUsageFlags kUsage =
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
@@ -74,7 +145,218 @@ constexpr VkBufferUsageFlags kUsage =
     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
     VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
 
+#ifdef __linux__
+// Guest memory handed to the GPU as a dma-buf over the game's own pages: the window is a memfd's (host/hos_main.c),
+// and /dev/udmabuf makes a dma-buf of a range of it, which the device imports like any other. The pages are the same ones
+// the game reads and writes (nothing is copied), pinned once when it is made. A host-pointer import (VK_EXT_external_memory_host)
+// is a userptr buffer object to amdgpu, whose pages the kernel looks up again at every command submission, and RADV puts every
+// buffer object in every submission: with ~1.5 GB of pools imported that was 15-45 ms a submission in Kokiri Forest,
+// 3-8 fps with 11 ms of GPU work. A pool larger than udmabuf's size limit (/sys/module/udmabuf/parameters/size_limit_mb,
+// 64 MB unless raised) is made of several dma-bufs of at most that size, bound one after another into a sparse buffer, so the
+// pool is still one buffer with one device address and nobody has to raise the limit. RX_VK_NO_DMABUF=1: host pointers only,
+// as before; RX_VK_DMABUF_PIECE_MB=<n>: pieces of at most n MB (to try the sparse path with the limit raised)
+struct UdmabufCreate { uint32_t memfd, flags; uint64_t offset, size; };
+constexpr unsigned long kUdmabufCreate = (1ul << 30) | (sizeof(UdmabufCreate) << 16) | ('u' << 8) | 0x42;   // (_IOW('u', 0x42, ...))
+int dmabuf_memfd = -2, dmabuf_dev = -1, dmabuf_failures = 0;
+uint64_t dmabuf_limit = 0;
+
+/// The memory of guest [lo, lo + size) as an imported dma-buf; VK_NULL_HANDLE when udmabuf or the import refused it
+VkDeviceMemory dma_buf_memory(uint64_t lo, uint64_t size) {
+    UdmabufCreate c{(uint32_t)dmabuf_memfd, 1 /* UDMABUF_FLAGS_CLOEXEC */, lo, size};
+    const int fd = ioctl(dmabuf_dev, kUdmabufCreate, &c);
+    if (fd < 0) {
+        if (dmabuf_failures++ < 8)
+            logf("vk: guest %#llx..%#llx: no udmabuf (errno %d)", (unsigned long long)lo, (unsigned long long)(lo + size), errno);
+        return VK_NULL_HANDLE;
+    }
+    static uint32_t type = UINT32_MAX;   // (the same for every dma-buf of the window: asked once)
+    if (type == UINT32_MAX) {
+        VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+        if (vkGetMemoryFdPropertiesKHR(dev.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) == VK_SUCCESS) {
+            for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)   // (host visible, coherent, first)
+                if ((fp.memoryTypeBits >> i & 1) &&
+                    (dev.memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                    type = i;
+            for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)
+                if (fp.memoryTypeBits >> i & 1) type = i;
+        }
+        if (type == UINT32_MAX) {
+            close(fd);
+            if (dmabuf_failures++ < 8) logf("vk: a dma-buf of guest memory has no memory type");
+            return VK_NULL_HANDLE;
+        }
+    }
+    VkImportMemoryFdInfoKHR im{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+    im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    im.fd = fd;
+    VkMemoryAllocateFlagsInfo fl{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    fl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    im.pNext = &fl;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &im;
+    ai.allocationSize = size;
+    ai.memoryTypeIndex = type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    const VkResult r = vkAllocateMemory(dev.device, &ai, nullptr, &memory);
+    if (r != VK_SUCCESS) {   // (the fd is the caller's again when the import fails)
+        close(fd);
+        if (dmabuf_failures++ < 8)
+            logf("vk: guest %#llx..%#llx: its dma-buf not imported (VkResult %d)", (unsigned long long)lo,
+                 (unsigned long long)(lo + size), (int)r);
+        return VK_NULL_HANDLE;
+    }
+    return memory;
+}
+
+/// A pool larger than a dma-buf may be: a sparse buffer, each `piece` bytes of it bound to its own dma-buf
+bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t piece, Pool& p) {
+    VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.pNext = &eb;
+    bi.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
+    bi.size = hi - lo;
+    bi.usage = kUsage;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) {
+        if (dmabuf_failures++ < 8) logf("vk: pool %#llx..%#llx: no sparse buffer for its dma-bufs", (unsigned long long)lo, (unsigned long long)hi);
+        return false;
+    }
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(dev.device, buffer, &req);
+    // (each piece starts at a multiple of the sparse block size; the last runs to the end of what the buffer needs, past hi
+    // when the size rounds up: the window's next pages, which the buffer never reaches)
+    const uint64_t align = std::max<uint64_t>(req.alignment, 4096);
+    piece = piece / align * align;
+    const uint64_t end = lo + req.size;
+    if (!piece || (req.size & 4095) || end > host->guest_size()) {
+        destroy_import_buffer(buffer);
+        if (dmabuf_failures++ < 8)
+            logf("vk: pool %#llx..%#llx: sparse block %llu, size %llu: not in dma-bufs of %llu", (unsigned long long)lo,
+                 (unsigned long long)hi, (unsigned long long)req.alignment, (unsigned long long)req.size, (unsigned long long)piece);
+        return false;
+    }
+    std::vector<VkDeviceMemory> memories;
+    std::vector<VkSparseMemoryBind> binds;
+    for (uint64_t off = 0; off < req.size; off += piece) {
+        const uint64_t n = std::min(piece, req.size - off);
+        const VkDeviceMemory m = dma_buf_memory(lo + off, n);
+        if (!m) break;
+        memories.push_back(m);
+        binds.push_back({off, n, m, 0, 0});
+    }
+    VkResult res = VK_ERROR_UNKNOWN;
+    if (binds.size() == (req.size + piece - 1) / piece) {
+        VkSparseBufferMemoryBindInfo bb{buffer, (uint32_t)binds.size(), binds.data()};
+        VkBindSparseInfo si{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+        si.bufferBindCount = 1;
+        si.pBufferBinds = &bb;
+        static VkFence fence = VK_NULL_HANDLE;   // (the background importer and the recording thread can both import)
+        static std::mutex fence_mu;
+        std::lock_guard fk(fence_mu);
+        if (!fence) {
+            VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            vkCreateFence(dev.device, &fi, nullptr, &fence);
+        }
+        {   // (on the queue, as the sparse textures' binds: nothing uses the new buffer yet, so no wait for earlier work)
+            std::lock_guard qk(dev.present_mu);
+            queue_flush_locked();
+            res = vkQueueBindSparse(dev.queue, 1, &si, fence);
+        }
+        if (res == VK_SUCCESS) {
+            res = vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(dev.device, 1, &fence);
+        }
+    }
+    if (res != VK_SUCCESS) {
+        destroy_import_buffer(buffer);
+        for (VkDeviceMemory m : memories) vkFreeMemory(dev.device, m, nullptr);
+        if (dmabuf_failures++ < 8)
+            logf("vk: pool %#llx..%#llx: its %zu dma-bufs not bound (VkResult %d)", (unsigned long long)lo, (unsigned long long)hi,
+                 memories.size(), (int)res);
+        return false;
+    }
+    p.lo = lo, p.hi = hi, p.buffer = buffer, p.memory = memories[0];
+    p.pieces.assign(memories.begin() + 1, memories.end());
+    return true;
+}
+
+bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
+    static uint64_t piece = 0;
+    if (dmabuf_memfd == -2) {
+        dmabuf_memfd = -1;
+        typedef int (*MemfdFn)(void);
+        const MemfdFn fn = getenv("RX_VK_NO_DMABUF") ? nullptr : (MemfdFn)dlsym(RTLD_DEFAULT, "hos_posix_guest_memfd");
+        const int fd = fn ? fn() : -1;
+        if (fd >= 0 && dev.dma_buf_import && vkGetMemoryFdPropertiesKHR) dmabuf_dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        if (fd >= 0 && dmabuf_dev >= 0) {
+            dmabuf_memfd = fd;
+            dmabuf_limit = 64ull << 20;
+            if (FILE* f = fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+                unsigned long long mb = 0;
+                if (fscanf(f, "%llu", &mb) == 1 && mb) dmabuf_limit = mb << 20;
+                fclose(f);
+            }
+            piece = dmabuf_limit;
+            if (const char* e = getenv("RX_VK_DMABUF_PIECE_MB"))
+                if (atoll(e) > 0) piece = std::min<uint64_t>(piece, (uint64_t)atoll(e) << 20);
+        }
+        logf("vk: guest memory as dma-bufs: %s", dmabuf_memfd >= 0 ? "yes" : !fn ? "no (no memfd window, or RX_VK_NO_DMABUF)"
+                 : fd < 0 ? "no (the window is anonymous memory)" : !dev.dma_buf_import ? "no (VK_EXT_external_memory_dma_buf)"
+                 : "no (/dev/udmabuf cannot be opened)");
+        if (dmabuf_memfd >= 0)
+            logf("vk: dma-bufs of at most %llu MB (udmabuf's limit %llu MB); larger pools %s", (unsigned long long)(piece >> 20),
+                 (unsigned long long)(dmabuf_limit >> 20),
+                 dev.sparse_buffers ? "are several, in a sparse buffer" : "are host-pointer imports (no sparse binding)");
+    }
+    if (dmabuf_memfd < 0 || (lo & 4095) || (hi & 4095)) return false;
+    if (hi - lo > piece) {
+        if (!dev.sparse_buffers || !import_dma_buf_pieces(lo, hi, piece, p)) return false;
+    } else {
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.pNext = &eb;
+        bi.size = hi - lo;
+        bi.usage = kUsage;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
+        const VkDeviceMemory memory = dma_buf_memory(lo, hi - lo);
+        // Allocation alone does not make the buffer usable. A failed bind owns both resources,
+        // but must leave no partial import for the host-pointer fallback to publish.
+        if (!memory || vkBindBufferMemory(dev.device, buffer, memory, 0) != VK_SUCCESS) {
+            destroy_import_buffer(buffer);
+            if (memory) vkFreeMemory(dev.device, memory, nullptr);
+            return false;
+        }
+        p.lo = lo, p.hi = hi, p.buffer = buffer, p.memory = memory;
+    }
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = p.buffer;
+    p.address = vkGetBufferDeviceAddress(dev.device, &da);
+    if (getenv("RX_VK_LOG_ADDR"))   // (as import_pool's: which buffer a device fault's address is in)
+        logf("vk: addr dma-buf %#llx..%#llx at gpu %#llx..%#llx", (unsigned long long)lo, (unsigned long long)hi,
+             (unsigned long long)p.address, (unsigned long long)(p.address + (hi - lo)));
+    static int64_t n = 0, bytes = 0, sparse = 0;
+    n++, bytes += (int64_t)(hi - lo), sparse += !p.pieces.empty();
+    if (n <= 4 || n % 64 == 0 || (!p.pieces.empty() && sparse <= 4))
+        logf("vk: pool %#llx..%#llx a dma-buf%s (%lld so, %lld in pieces, %lld MB)", (unsigned long long)lo, (unsigned long long)hi,
+             p.pieces.empty() ? "" : "s in a sparse buffer", (long long)n, (long long)sparse, (long long)(bytes >> 20));
+    return true;
+}
+#endif
+
 bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
+    import_cooling = false;
+    import_result = VK_SUCCESS;
+    if (import_on_hold(lo, hi)) return false;   // (tried recently and failed: not again until the hold ends)
+    if (hi <= lo || hi - lo > max_import_size) {
+        logf("vk: import %#llx..%#llx exceeds the device's allocation/buffer limit", (unsigned long long)lo,
+             (unsigned long long)hi);
+        import_remember_failure(lo, hi);
+        return false;
+    }
     p.lo = lo;
     p.hi = hi;
     uint8_t* ptr = host->guest_base() + lo;
@@ -96,28 +378,46 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     } report{t0, t1, t2, t3, t4};
     // (pages the game has not touched yet may be only reserved: committed now, as the pool's memory is usable; a range
     // committed already is left alone: the call took milliseconds in the game's huge reservation)
+    // (#3043) one query first: when the whole import is already one committed region, skip the heap walk
     {
-        for (uint8_t* q = ptr; q < ptr + bytes;) {
-            MEMORY_BASIC_INFORMATION mi{};
-            if (VirtualQuery(q, &mi, sizeof mi) != sizeof mi) break;
-            uint8_t* end = std::min((uint8_t*)mi.BaseAddress + mi.RegionSize, ptr + bytes);
-            if (mi.State == MEM_RESERVE) VirtualAlloc(q, (size_t)(end - q), MEM_COMMIT, PAGE_READWRITE);
-            q = end;
+        MEMORY_BASIC_INFORMATION first{};
+        if (VirtualQuery(ptr, &first, sizeof first) == sizeof first && first.State == MEM_COMMIT &&
+            (uint8_t*)first.BaseAddress + first.RegionSize >= ptr + bytes) {
+            // already committed through the end of this import
+        } else {
+            for (uint8_t* q = ptr; q < ptr + bytes;) {
+                MEMORY_BASIC_INFORMATION mi{};
+                if (VirtualQuery(q, &mi, sizeof mi) != sizeof mi) break;
+                uint8_t* end = std::min((uint8_t*)mi.BaseAddress + mi.RegionSize, ptr + bytes);
+                if (mi.State == MEM_RESERVE) VirtualAlloc(q, (size_t)(end - q), MEM_COMMIT, PAGE_READWRITE);
+                q = end;
+            }
         }
     }
+#ifdef __linux__
+    if (import_dma_buf(lo, hi, p)) {
+        t1 = t2 = t3 = t4 = clk::now();
+        return true;
+    }
+#endif
     // (the host allocations' memory type: the same for every pointer, asked once)
     static uint32_t type = UINT32_MAX;
     if (type == UINT32_MAX) {
         VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         if (vkGetMemoryHostPointerPropertiesEXT(dev.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr,
-                                                &hp) != VK_SUCCESS)
+                                                &hp) != VK_SUCCESS) {
+            import_remember_failure(lo, hi);
             return false;
+        }
         for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)   // (host visible, coherent)
             if ((hp.memoryTypeBits >> i & 1) &&
                 (dev.memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
                     (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
                 type = i;
-        if (type == UINT32_MAX) return false;
+        if (type == UINT32_MAX) {
+            import_remember_failure(lo, hi);
+            return false;
+        }
     }
     t1 = clk::now();
     VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
@@ -126,7 +426,10 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     bi.pNext = &eb;
     bi.size = bytes;
     bi.usage = kUsage;
-    if (vkCreateBuffer(dev.device, &bi, nullptr, &p.buffer) != VK_SUCCESS) return false;
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &p.buffer) != VK_SUCCESS) {
+        import_remember_failure(lo, hi);
+        return false;
+    }
     t2 = clk::now();
     VkImportMemoryHostPointerInfoEXT im{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
     im.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -138,16 +441,23 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     ai.pNext = &im;
     ai.allocationSize = bytes;
     ai.memoryTypeIndex = type;
-    if (vkAllocateMemory(dev.device, &ai, nullptr, &p.memory) != VK_SUCCESS) {
-        vkDestroyBuffer(dev.device, p.buffer, nullptr);
-        p.buffer = VK_NULL_HANDLE;
+    const VkResult allocated = vkAllocateMemory(dev.device, &ai, nullptr, &p.memory);
+    t3 = clk::now();
+    const VkResult bound = allocated == VK_SUCCESS ? vkBindBufferMemory(dev.device, p.buffer, p.memory, 0) : allocated;
+    if (bound != VK_SUCCESS) {
+        import_result = bound;
+        destroy_import_buffer(p.buffer);
+        if (allocated == VK_SUCCESS) vkFreeMemory(dev.device, p.memory, nullptr);
+        p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE;
+        import_remember_failure(lo, hi);
         return false;
     }
-    t3 = clk::now();
-    vkBindBufferMemory(dev.device, p.buffer, p.memory, 0);
     VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     da.buffer = p.buffer;
     p.address = vkGetBufferDeviceAddress(dev.device, &da);
+    if (getenv("RX_VK_LOG_ADDR"))   // (diagnostics: which buffer a device fault's address is in)
+        logf("vk: addr import %#llx..%#llx at gpu %#llx..%#llx", (unsigned long long)lo, (unsigned long long)hi,
+             (unsigned long long)p.address, (unsigned long long)(p.address + (hi - lo)));
     t4 = clk::now();
     return true;
 }
@@ -158,13 +468,90 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
 // pools come and go, before the submissions that can reach them
 uint64_t* guest_pages = nullptr;
 uint64_t guest_pages_address = 0;
+VkBuffer guest_pages_buffer = VK_NULL_HANDLE;
+// (hookshot, 11-07) A change to the table made while a submission is recorded goes into that submission's upload commands, after
+// the mirror copies it records there, instead of into the table at once: the table is read by the GPU, and work submitted
+// before (still running, or queued) read the new entries early. A pool's range zeroed at its merge read as unmapped (zero
+// counts: the culling's foliage gone for a frame), and a mirror made but not yet filled read as garbage: the foliage
+// culling 53caac5f looped on a count from it until Windows reset the driver (the device lost of ~1 start in 5, always
+// after pool merges, 2 s after the GPU stopped)
+struct TableRun { uint64_t first, count, address; };
+thread_local std::vector<TableRun> table_pending;
+thread_local bool table_defer = false;
 void guest_pages_set(uint64_t lo, uint64_t hi, uint64_t address) {
     if (!guest_pages) return;
+    // (on by default since 11-08: 14 of 14 starts without the device lost, against ~1 in 7 written at once; one-frame flashes
+    // 0-1 bright / 4 dark in two 40 s Kokiri runs, as many as without it, and the same fps. One earlier run with 21 dark ones was
+    // the runs' spread, not this. RX_VK_TABLE_NOW=1: written at once, as before)
+    static const bool now = getenv("RX_VK_TABLE_NOW") != nullptr;
     // (two windows, as spirv_emit_context.cpp reads them: 8 GB from 0x1000000000, then 4 GB from 0x7f00000000)
     const struct { uint64_t base, bytes, first; } windows[] = {{0x1000000000ull, 8ull << 30, 0}, {0x7f00000000ull, 4ull << 30, (8ull << 30) >> 12}};
-    for (const auto& w : windows)
-        for (uint64_t a = std::max(lo, w.base) & ~0xFFFull; a < std::min(hi, w.base + w.bytes); a += 0x1000)
-            guest_pages[w.first + ((a - w.base) >> 12)] = address ? address + (a - lo) : 0;
+    for (const auto& w : windows) {
+        const uint64_t a0 = std::max(lo, w.base) & ~0xFFFull, a1 = std::min(hi, w.base + w.bytes);
+        if (a0 >= a1) continue;
+        const uint64_t first = w.first + ((a0 - w.base) >> 12), count = (a1 - a0 + 0xFFF) >> 12;
+        const uint64_t at = address ? address + (a0 - lo) : 0;
+        if (table_defer && !now) {
+            table_pending.push_back({first, count, at});
+            continue;
+        }
+        for (uint64_t i = 0; i < count; i++) guest_pages[first + i] = at ? at + (i << 12) : 0;
+    }
+}
+void memory_table_begin() {
+    if (!table_pending.empty()) {   // (left by a recording that never ended: written now)
+        table_defer = false;
+        for (const TableRun& r : table_pending)
+            for (uint64_t i = 0; i < r.count; i++) guest_pages[r.first + i] = r.address ? r.address + (i << 12) : 0;
+        table_pending.clear();
+    }
+    table_defer = guest_pages != nullptr;
+}
+// (at the end of the recording's uploads: the changes, the last one for each page, as transfers into the table; the
+// upload command buffer's barriers order them after the work submitted before and before this submission's)
+bool memory_table_flush() {
+    table_defer = false;
+    if (table_pending.empty()) return false;
+    std::vector<std::pair<uint64_t, uint64_t>> pages;
+    try {
+        size_t n = 0;
+        for (const TableRun& r : table_pending) n += (size_t)r.count;
+        pages.reserve(n);
+        for (const TableRun& r : table_pending)
+            for (uint64_t i = 0; i < r.count; i++) pages.push_back({r.first + i, r.address ? r.address + (i << 12) : 0});
+    } catch (const std::bad_alloc&) {
+        static std::atomic<int> said{0};
+        uint64_t n = 0;
+        for (const TableRun& r : table_pending) {
+            n += r.count;
+            for (uint64_t i = 0; i < r.count; i++)
+                if (guest_pages) guest_pages[r.first + i] = r.address ? r.address + (i << 12) : 0;
+        }
+        table_pending.clear();
+        if (said.fetch_add(1) < 8)
+            logf("vk: page table: no memory for this recording's %llu page changes (the commit limit?): written at once",
+                 (unsigned long long)n);
+        return false;
+    }
+    table_pending.clear();
+    std::stable_sort(pages.begin(), pages.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<uint64_t> run;
+    VkCommandBuffer cmd = upload_command_buffer();
+    GprofSpan gp(cmd, "ptable update (guest page table)");
+    gp.items = 0;
+    uint64_t run_first = 0;
+    const auto emit = [&] {
+        if (!run.empty()) vkCmdUpdateBuffer(cmd, guest_pages_buffer, run_first * 8, run.size() * 8, run.data()), gp.items++, gp.bytes += run.size() * 8;
+        run.clear();
+    };
+    for (size_t i = 0; i < pages.size(); i++) {
+        if (i + 1 < pages.size() && pages[i + 1].first == pages[i].first) continue;   // (a later change of the same page wins)
+        if (!run.empty() && (pages[i].first != run_first + run.size() || run.size() == 8192)) emit();
+        if (run.empty()) run_first = pages[i].first;
+        run.push_back(pages[i].second);
+    }
+    emit();
+    return true;
 }
 
 uint64_t memory_guest_pages() {
@@ -178,7 +565,8 @@ uint64_t memory_guest_pages() {
     VmaAllocation a = nullptr;
     void* mapped = nullptr;
     const uint64_t bytes = ((8ull << 30 >> 12) + (4ull << 30 >> 12)) * 8;
-    if (!create_buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, b, a, &mapped) || !mapped) {
+    if (!create_buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                       true, b, a, &mapped, true) || !mapped) {
         logf("vk: no page table of guest memory: pointers in no bound buffer read as 0");
         return 0;
     }
@@ -186,6 +574,7 @@ uint64_t memory_guest_pages() {
     VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     da.buffer = b;
     guest_pages_address = vkGetBufferDeviceAddress(dev.device, &da);
+    guest_pages_buffer = b;
     std::lock_guard pk(pools_mu);
     guest_pages = (uint64_t*)mapped;
     for (auto& kv : imported) guest_pages_set(kv.second.lo, kv.second.hi, kv.second.address);
@@ -201,17 +590,30 @@ bool memory_init() {
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    hp.pNext = &p11;
+    p11.pNext = &p13;
     p2.pNext = &hp;
     vkGetPhysicalDeviceProperties2(dev.physical, &p2);
     align = std::max<uint64_t>(hp.minImportedHostPointerAlignment, 4096);
+    max_import_size = std::min(p11.maxMemoryAllocationSize, p13.maxBufferSize);
     logf("vk: guest memory imported in place (alignment %llu)", (unsigned long long)align);
     return true;
 }
 
 /// Refresh the guest's pool table (no Vulkan work: pools are imported as they are used)
+std::atomic<int64_t> memsync_lock_wait_ns{0};
+std::atomic<int64_t> memsync_part_ns[3];
 void memory_sync() {
     static std::mutex sync_mu;   // (called from every thread that touches memory)
+    const auto w0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> sync_lk(sync_mu);
+    struct Waited {   // (diagnostics: only the lock waits, added up; nothing else changes)
+        std::chrono::steady_clock::time_point t;
+        ~Waited() {}
+    } waited{w0};
+    memsync_lock_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waited.t).count();
     const uint32_t g = host->maps_generation();
     if (g == generation) return;
     generation = g;
@@ -227,8 +629,11 @@ void memory_sync() {
         next.push_back(p);
     }
     std::sort(next.begin(), next.end(), [](const GuestPool& a, const GuestPool& b) { return a.lo < b.lo; });
+    const auto w1 = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
+    memsync_lock_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w1).count();
     guest_pools.swap(next);
+    guest_pools_gen.fetch_add(1, std::memory_order_relaxed);
     last_pool = nullptr;
     std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
     static int logged;
@@ -247,9 +652,15 @@ std::vector<uint32_t> region_gen(kPages / kRegionPages);
 // (and the generation every page of a region was written at, at least: a large stamp (a storage buffer a dispatch may
 // write, hundreds of MB) marks whole regions, not 512 pages each; it took dispatches 8-150 ms)
 std::vector<uint32_t> region_full(kPages / kRegionPages);
+inline uint32_t load_u32(uint32_t& x) {
+    return std::atomic_ref<uint32_t>(x).load(std::memory_order_acquire);
+}
+inline void store_u32(uint32_t& x, uint32_t v) {
+    std::atomic_ref<uint32_t>(x).store(v, std::memory_order_release);
+}
 inline uint32_t page_gen(uint64_t p) {
     const auto& c = gen_chunks[p / kChunkPages];
-    return std::max(c ? c[p % kChunkPages] : 0u, region_full[p / kRegionPages]);
+    return std::max(c ? load_u32(c[p % kChunkPages]) : 0u, load_u32(region_full[p / kRegionPages]));
 }
 uint32_t gen_now = 1;
 uint64_t pages_collected = 0;
@@ -261,12 +672,15 @@ void stamp_page(uint64_t p, uint32_t g) {
         c.reset(new uint32_t[kChunkPages]);
         std::fill(c.get(), c.get() + kChunkPages, 0u);
     }
-    c[p % kChunkPages] = g;
+    store_u32(c[p % kChunkPages], g);
     region_gen[p / kRegionPages] = g;
 }
 } // namespace
 
+namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
 bool capture_owns(uint64_t guest);
+void shadow_written(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the captures took)
+void shadow_written_collected(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the collection found)
 void memory_collect_written() {
     uint32_t* pages = nullptr;
     const int64_t n = host->collect_written(&pages);
@@ -282,6 +696,11 @@ void memory_collect_written() {
             stamp_page(pages[i], g);
         }
         pages_collected += (uint64_t)n;
+        cap_view_bump();
+        // (hookshot) every page the CPU wrote, captured later or not: unknown to the write-back diff's shadows before this
+        // recording's write-back. With RX_VK_CAPTURE=0 this is the only report of the game's writes (capture_make returns
+        // first); with captures, it is the pages written after this submission's capture (PR 1109's review)
+        shadow_written_collected(pages, n);
     }
     if (pages) host->free_pages(pages);
 }
@@ -293,7 +712,7 @@ bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen) {
     const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
     for (uint64_t r = p0 / kRegionPages; r <= p1 / kRegionPages; r++) {
         if (region_gen[r] <= gen) continue;
-        if (region_full[r] > gen) return true;
+        if (load_u32(region_full[r]) > gen) return true;
         const uint64_t a = std::max(p0, r * kRegionPages), b = std::min(p1, r * kRegionPages + kRegionPages - 1);
         for (uint64_t p = a; p <= b; p++)
             if (page_gen(p) > gen) return true;
@@ -342,6 +761,33 @@ bool gpu_page(uint64_t page) {
     return gpu_pages.count((uint32_t)page) != 0;
 }
 
+// (RX_VK_PROTECT_BARE=1, an experiment for the one-frame foliage flicker and the floating trees) The ranges a shader writes
+// through a table pointer (vk_draw.cpp: a bare entry, only its first 64 bytes marked written) are GPU-written pages the
+// mirror syncs know nothing of: a CPU write anywhere on such a page copied the CPU's whole page over the GPU's records
+// (NX2navi found the same: "trees drawn from records lost that way stretched into columns reaching the sky", and culled
+// foliage drew garbage for a frame). Pages noted here keep the GPU's version when the CPU also wrote them since the
+// pool's last sync. Nothing is copied back to guest memory (that overwrote the CPU's own data beside them once).
+std::mutex prot_mu;
+std::unordered_map<uint32_t, uint32_t> prot_pages;   // page -> gen_now when a shader last wrote through it
+std::atomic<int64_t> st_prot_kept{0};
+bool protect_bare_on() {
+    static const bool v = getenv("RX_VK_PROTECT_BARE") && getenv("RX_VK_PROTECT_BARE")[0] == '1';
+    return v;
+}
+bool prot_page_since(uint64_t page, uint32_t synced) {
+    std::lock_guard lk(prot_mu);
+    const auto it = prot_pages.find((uint32_t)page);
+    return it != prot_pages.end() && it->second >= synced;
+}
+void memory_protect_gpu(uint64_t guest, uint64_t size) {
+    if (!size || !protect_bare_on()) return;
+    const uint64_t p0 = guest >> kPageShift, p1 = (guest + size - 1) >> kPageShift;
+    if (p1 - p0 > 16384) return;   // (64 MB at most: a guess past that is not the GPU's records)
+    std::lock_guard lk(prot_mu);
+    for (uint64_t p = p0; p <= p1; p++) prot_pages[(uint32_t)p] = gen_now;
+    if (prot_pages.size() > 4000000) prot_pages.clear();
+}
+
 void memory_stamp(uint64_t guest, uint64_t size) {
     if (!size) return;
     {   // (RX_VK_LOG_STAMP=<lo>:<hi> (hex guest addresses): the stamps there, 300 lines, with their callers)
@@ -360,12 +806,14 @@ void memory_stamp(uint64_t guest, uint64_t size) {
     const uint64_t p0 = guest >> kPageShift, p1 = std::min((guest + size - 1) >> kPageShift, kPages - 1);
     for (uint64_t p = p0; p <= p1;) {
         if (p % kRegionPages == 0 && p + kRegionPages - 1 <= p1) {   // (a whole region)
-            region_full[p / kRegionPages] = region_gen[p / kRegionPages] = g;
+            store_u32(region_full[p / kRegionPages], g);
+            region_gen[p / kRegionPages] = g;
             p += kRegionPages;
             continue;
         }
         stamp_page(p++, g);
     }
+    cap_view_bump();   // (a replay read's cached page is this generation's answer, not the one from before the write)
 }
 uint64_t memory_pages_collected() {
     return pages_collected;
@@ -387,7 +835,83 @@ struct Capture {
     void* map = nullptr;
     uint64_t bsize = 0;
     size_t nbytes = 0;
+    // (hookshot) "shadow staging": the texture pages of this capture, copied from guest memory into ordinary cached RAM too, for
+    // take_capture's texture shadow to read instead of the buffer above (often write-combined here: CPU reads ~0.3 GB/s).
+    // sidx[i] = the staging slot of pages[i] (4 KB a slot), or -1: that page is read from the buffer. Empty sidx: no staging.
+    std::unique_ptr<uint8_t[]> stage;
+    size_t stage_bytes = 0;
+    std::vector<int32_t> sidx;
+    bool buf_cached = false;   // (its capture buffer's memory is HOST_CACHED: for the staging log line)
 };
+// (the staging blocks, kept for the next capture: a fresh 20 MB block is ~5000 page faults on the game's thread)
+std::mutex stage_mu;   // (a leaf lock)
+std::vector<std::pair<std::unique_ptr<uint8_t[]>, size_t>> stage_free;
+size_t stage_free_bytes = 0;
+bool stage_on() {   // (RX_VK_SHADOW_STAGE=0 / off / false / no: the shadow reads the capture buffer, as before)
+    static const bool on = [] { const char* e = getenv("RX_VK_SHADOW_STAGE"); return !e || !env_value_off(e); }();   // (on unless an off value: env_value_off)
+    return on;
+}
+bool stage_get(Capture& c, size_t need) {   // (a block of at least need bytes into c: a kept one, else a new one)
+    {
+        std::lock_guard lk(stage_mu);
+        size_t best = stage_free.size();
+        for (size_t i = 0; i < stage_free.size(); i++)
+            if (stage_free[i].second >= need && (best == stage_free.size() || stage_free[i].second < stage_free[best].second)) best = i;
+        if (best < stage_free.size()) {
+            c.stage = std::move(stage_free[best].first), c.stage_bytes = stage_free[best].second;
+            stage_free_bytes -= c.stage_bytes;
+            stage_free.erase(stage_free.begin() + best);
+            return true;
+        }
+    }
+    const size_t sz = (need + (1u << 20) - 1) & ~size_t((1u << 20) - 1);   // (rounded to 1 MB: blocks of near sizes fit each other)
+    c.stage.reset(new (std::nothrow) uint8_t[sz]);
+    c.stage_bytes = c.stage ? sz : 0;
+    return c.stage != nullptr;
+}
+void stage_put(Capture& c) {   // (the block back to the kept ones, at most four and 96 MB; else freed)
+    c.sidx.clear();
+    if (!c.stage) return;
+    std::lock_guard lk(stage_mu);
+    static const bool low_spec = env_on("RX_VK_LOW_SPEC");   // (RAM the tight resource there: no block kept)
+    if (!low_spec && stage_free.size() < 4 && stage_free_bytes + c.stage_bytes <= (96ull << 20)) {
+        stage_free_bytes += c.stage_bytes;
+        stage_free.emplace_back(std::move(c.stage), c.stage_bytes);
+    }
+    c.stage.reset(), c.stage_bytes = 0;
+}
+// (hookshot) What a capture's late pages wait for. A late page is one the CPU wrote that work still on the GPU writes back
+// (capture_make). It used to be the page's submission, whose value is done with its last part (issue 997): the whole of the
+// frame before's GPU work, the end of which the next frame's replay then waited for (0.8-2.4 ms a take, on the game's main
+// thread and its presentation thread, once the present no longer held them for the same GPU work). A page written back
+// from a mirror is in guest memory once the part that copies it back is done (memory_end_submission, at each part's end;
+// wb_parts has the part of the page's newest write-back), so:
+// - a page whose part is done is not late at all: the copy made now has the GPU's words;
+// - the other late pages wait for the newest of their parts, when every one of them has a part;
+// - a late page written in place (part 0: no mirror, the later parts of its submission may write guest memory again) keeps
+//   the wait for the submission's value, for all of the capture's late pages, as before.
+// The newest part is the page's last writer among the work recorded so far, the same thing its value said before: a part
+// recorded later that writes the page again is not noted yet either way. RX_VK_CAPTURE_PART=0: the value always, as before
+struct LateWait {
+    uint64_t value = 0;   // (the newest value among the late pages; 0: none is late)
+    uint64_t part = 0;    // (the newest part among them)
+    bool whole = false;   // (one of them has no part: the value is what is waited for)
+    uint64_t wait_part() const { return whole ? 0 : part; }
+};
+/// Counts a page whose write-back's value is past what the GPU has completed. state: vk_part_state of its part (1 done,
+/// 0 submitted, -1 not known), not looked at when part is 0. True when the page is late
+bool late_page(LateWait& w, uint64_t value, uint64_t part, int state) {
+    if (part && state == 1) return false;
+    w.value = std::max(w.value, value);
+    if (part) w.part = std::max(w.part, part);
+    else w.whole = true;
+    return true;
+}
+/// The wait itself: the part when there is one and it is known, else the value. Both give up after 250 ms
+void late_wait(uint64_t value, uint64_t part) {
+    if (part && vk_part_wait(part)) return;
+    vk_timeline_wait(value);
+}
 std::mutex cap_mu;
 std::deque<std::unique_ptr<Capture>> captures;
 std::vector<std::unique_ptr<Capture>> spare;   // (taken ones, their buffers kept)
@@ -434,30 +958,140 @@ bool sync_live() {
     static const bool v = getenv("RX_VK_SYNC_LIVE") != nullptr;
     return v;
 }
+std::atomic<bool> cap_shutting_down{false};     // (set under cap_free_mu when the process starts to exit: after it no worker touches cap_free)
 std::mutex cap_free_mu;   // (the submitting threads take buffers from cap_free, the replay gives them back)
-void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size) {
+uint64_t cap_free_bytes = 0;   // (cap_free_mu)
+// (the spare buffers: 12 and, on a card of 6 GB or less, 32 MB of them; RX_VK_CAP_SPARE_MB=<n>: that many, 0: as before.
+// After a load the retired ones, 40-60 MB each, stayed as spares for good)
+uint64_t cap_spare_max() {
+    static const uint64_t v = [] {
+        if (const char* e = getenv("RX_VK_CAP_SPARE_MB")) return e[0] && atoll(e) ? (uint64_t)atoll(e) << 20 : ~0ull;
+        // (0.1.9c: 128 MB above 6 GB, not unbounded: spares are system memory, and the game's commit already ran ~38 GB on a
+        // 32 GB PC, a big depth target's first read then 367 ms of page faults)
+        uint64_t used = 0, allowed = 0;
+        return vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 32ull << 20 : 128ull << 20;
+    }();
+    return v;
+}
+void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size, bool from_worker = false) {
     std::lock_guard lk(cap_free_mu);
-    if (cap_free.size() < 12 && size <= (64ull << 20)) cap_free.push_back({buffer, alloc, map, size});
-    else destroy_buffer(buffer, alloc);
+    if (from_worker && cap_shutting_down.load()) return;
+    // (hookshot, RX 7800 XT: buffers up to 256 MB are kept for the next capture, not only up to 64 MB: a new one costs ~100 ms of
+    // vkAllocateMemory on AMD's driver. RX_VK_CAPTURE_KEEP_OLD=1: as before)
+    static const bool keep_old = getenv("RX_VK_CAPTURE_KEEP_OLD") != nullptr;
+    if (cap_free.size() < 12 && size <= (keep_old ? 64ull << 20 : 256ull << 20) &&
+        cap_free_bytes + size <= std::min<uint64_t>(cap_spare_max(), keep_old ? ~0ull : 768ull << 20)) {
+        cap_free.push_back({buffer, alloc, map, size});
+        cap_free_bytes += size;
+    } else {
+        destroy_buffer(buffer, alloc);
+    }
 }
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
     cap_bytes -= it->second.size;
     cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
     cap_bufs.erase(it);
 }
+// (a capture's buffer by its size class: 2, 4, 8, then 16 MB and up to the MB. It was never under 16 MB, for captures of ~1 MB:
+// 25 kept ones were 413 MB of host-cached system memory, all resident, and three to a 64 MB block left 14 MB of each unused.
+// RX_VK_CAP_MIN_MB=<n>: the smallest (2), 16: as before. From 16 MB each has a memory object of its own: RX_VK_CAP_BLOCKS=1: not)
+uint64_t cap_buf_size(uint64_t need) {
+    static const uint64_t min = (getenv("RX_VK_CAP_MIN_MB") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_CAP_MIN_MB"))) : 2u) << 20;
+    uint64_t s = min;
+    while (s < need && s < (16ull << 20)) s <<= 1;
+    if (s >= need) return s;
+    // (hookshot: above 16 MB in classes of 32, 64, 128 and 256 MB, so that a buffer given back fits the next capture)
+    static const bool keep_old = getenv("RX_VK_CAPTURE_KEEP_OLD") != nullptr;
+    if (!keep_old)
+        for (const uint64_t cm : {32, 64, 128, 192, 256})   // (stutter: 192 added, a 130-158 MB capture took the 256 MB class)
+            if ((uint64_t)cm << 20 >= need) return (uint64_t)cm << 20;
+    return (need + (1u << 20) - 1) & ~((1ull << 20) - 1);
+}
+// (hookshot, RX_VK_CAP_PREWARM, on by default since the stutter fix; =0: off) The big capture buffers made ahead, on a worker thread. A capture of a scene load holds
+// 16 to 256 MB of the pages the game wrote (texture storage), and its buffer was made on the game's thread, inside capture_make:
+// AMD's driver commits and clears a host-visible memory object when it is allocated, ~0.8 ms a MB, and the log's isolated spikes
+// ("memory sync ... capture 66.8", "capture 107.7", "capture 22.6", "capture 17.4": 5 in a session, each at a load, none in steady
+// play) are that, in proportion to the class (128, 64 and 32 MB classes, and 128, 64 MB). The spares only come back from a capture
+// retired past the 24 kept ones, of whatever size that one was, so a big class is rarely there when a load asks for it. With this
+// a spare of each class of 32, 64 and 128 MB is made in the background once, and again as soon as one is taken.
+bool cap_prewarm_on() {
+    // (stutter: on by default now; RX_VK_CAP_PREWARM=0 turns it off. The log at the scene loads: "capture ... the buffer of 32/64/256 MB 13-41 ms")
+    static const bool v = [] {
+        const char* e = getenv("RX_VK_CAP_PREWARM");
+        const bool on = !e || atoi(e) != 0;
+        logf("vk: capture buffer prewarm (32, 64, 128 MB spares made on a worker) %s (RX_VK_CAP_PREWARM)", on ? "on" : "off");
+        return on;
+    }();
+    return v;
+}
+std::atomic<int> cap_prewarm_busy{0};
+std::atomic<int> cap_prewarm_class_busy[4]{};   // (32, 64, 128 and 192 MB spares being made)
+void cap_exit_note() {
+    std::lock_guard lk(cap_free_mu);   // (a worker inside cap_buf_free finishes first; one after this sees the flag under the same mutex)
+    cap_shutting_down = true;
+}
+int cap_prewarm_index(uint64_t size) { return size <= (32ull << 20) ? 0 : size <= (64ull << 20) ? 1 : size <= (128ull << 20) ? 2 : size <= (192ull << 20) ? 3 : -1; }
+void cap_spare_make(uint64_t size, int index) {
+    VkBuffer b = VK_NULL_HANDLE;
+    VmaAllocation a = nullptr;
+    void* m = nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!cap_shutting_down.load() && create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, b, a, &m, !getenv("RX_VK_CAP_BLOCKS")) && m) {
+        static std::atomic<int> told{0};
+        if (told++ < 8)
+            logf("vk: a %llu MB capture buffer made ahead in %.1f ms, off the game's thread (RX_VK_CAP_PREWARM)", (unsigned long long)(size >> 20),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        // (a spare, within the same limits as any other: past them it is let go. Not once the process is exiting: the list and the device
+        // may be going, and the memory goes with the process)
+        cap_buf_free(b, a, m, size, true);
+    }
+    cap_prewarm_class_busy[index]--;
+    cap_prewarm_busy--;
+}
+/// A spare of at least `size` (32, 64 or 128 MB classes only) is there, or one of its class is being made (cap_free_mu held)
+void cap_prewarm_class(uint64_t size) {
+    if (!cap_prewarm_on()) return;
+    const int index = cap_prewarm_index(size);
+    if (index < 0 || size > cap_spare_max()) return;   // (not the 256 MB class, and not past what spares may hold)
+    static const uint64_t kCls[4] = {32, 64, 128, 192};
+    const uint64_t cls = kCls[index];
+    const uint64_t bytes = cls << 20;
+    for (const FreeBuf& f : cap_free)
+        if (f.size >= bytes) return;
+    if (cap_prewarm_class_busy[index].load() > 0 || cap_prewarm_busy.load() >= 3) return;   // (three at a time: each commits its memory)
+    static const bool exit_hook = [] { return std::atexit(cap_exit_note) == 0; }();
+    (void)exit_hook;
+    cap_prewarm_busy++;
+    cap_prewarm_class_busy[index]++;
+    try {
+        std::thread(cap_spare_make, bytes, index).detach();
+    } catch (...) {   // (no thread: no spare, the capture goes on)
+        cap_prewarm_class_busy[index]--;
+        cap_prewarm_busy--;
+    }
+}
 bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& map, uint64_t& size) {
     std::lock_guard lk(cap_free_mu);
+    if (cap_prewarm_on()) {
+        static bool first = true;
+        if (first) {   // (the first capture: the classes a load asks for)
+            first = false;
+            for (uint64_t c : {32ull << 20, 64ull << 20, 128ull << 20, 192ull << 20}) cap_prewarm_class(c);
+        }
+    }
     size_t best = cap_free.size();
     for (size_t i = 0; i < cap_free.size(); i++)
         if (cap_free[i].size >= need && (best == cap_free.size() || cap_free[i].size < cap_free[best].size)) best = i;
     if (best < cap_free.size()) {
         buffer = cap_free[best].buffer, alloc = cap_free[best].alloc, map = cap_free[best].map, size = cap_free[best].size;
+        cap_free_bytes -= size;
         cap_free.erase(cap_free.begin() + (ptrdiff_t)best);
         return map != nullptr;
     }
-    size = std::max<uint64_t>((need + (1u << 20) - 1) & ~((1ull << 20) - 1), 16ull << 20);
+    size = cap_buf_size(need);
     map = nullptr;
-    return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map) && map;
+    return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
+                                size >= (16ull << 20) && !getenv("RX_VK_CAP_BLOCKS")) && map;
 }
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
 std::mutex cap_ranges_mu;
@@ -522,6 +1156,8 @@ bool capture_on() {
     return on;
 }
 std::atomic<bool> captures_seen{false};
+std::atomic<uint64_t> cap_view_gen{1};   // (bumped when a capture is published or a page is stamped: cached reads go stale)
+void cap_view_bump() { cap_view_gen.fetch_add(1, std::memory_order_release); }
 double st_tk_all, st_tk_stamp, st_tk_copy;   // (memory_take_capture's parts, ms)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
 // ---- texture storage in the capture ----
@@ -564,7 +1200,7 @@ bool tex_spans_changed = false;
 uint64_t tex_merged_bytes = 0;
 
 bool in_tex_merged(uint64_t guest) {   // (shadow_mu held)
-    auto it = std::upper_bound(tex_merged.begin(), tex_merged.end(), std::make_pair(guest, ~0ull));
+    auto it = std::upper_bound(tex_merged.begin(), tex_merged.end(), std::make_pair(guest, ~uint64_t(0)));
     return it != tex_merged.begin() && guest < std::prev(it)->second;
 }
 void shadow_erase(uint32_t page) {   // (shadow_mu held)
@@ -584,13 +1220,19 @@ void shadow_drop_range(uint64_t lo, uint64_t hi) {   // (shadow_mu held)
 /// (the spans unused for 1800 presents dropped with their shadow pages; the rest published for the capture)
 void publish_tex_spans(uint64_t frame) {
     std::lock_guard lk(shadow_mu);
-    for (auto it = tex_spans.begin(); it != tex_spans.end();) {
-        if (frame > it->second.second + 1800) {
-            shadow_drop_range(it->first, it->second.first);
-            it = tex_spans.erase(it);
-            tex_spans_changed = true;
-        } else {
-            ++it;
+    // (a span ages by the present: looked over once a present, not at each of its ~20 submissions, which walked
+    // the ~300 spans every time, 1 ms a frame on a Steam Deck)
+    static uint64_t swept = ~0ull;
+    if (frame != swept) {
+        swept = frame;
+        for (auto it = tex_spans.begin(); it != tex_spans.end();) {
+            if (frame > it->second.second + 1800) {
+                shadow_drop_range(it->first, it->second.first);
+                it = tex_spans.erase(it);
+                tex_spans_changed = true;
+            } else {
+                ++it;
+            }
         }
     }
     if (!tex_spans_changed) return;
@@ -634,11 +1276,40 @@ void memory_note_texture_upload(uint64_t guest, uint64_t size) {
     tex_spans_changed = true;
 }
 
+/// A replay read of one page can reuse what the last read of that page decided, while the page's write generation and
+/// the capture table are the ones that decision was made from.
+bool submitted_page_reuse(uint64_t page, uint32_t page_gen, uint64_t view, uint64_t cached_page, uint32_t cached_gen,
+                          uint64_t cached_view) {
+    return cached_view != 0 && page == cached_page && page_gen == cached_gen && view == cached_view;
+}
+struct SubmittedPage {   // (a page no capture holds, as of pgen and view: the read from guest memory stands)
+    uint64_t page = ~0ull;
+    uint32_t pgen = 0;
+    uint64_t view = 0;
+};
+// (hookshot) 32 of them a thread, by page: a handle program reads a uniform word on one page and a storage buffer word on
+// another, and with one page kept nearly every read missed and took pools_mu (program_for's answer handles). A page a
+// capture holds is not kept: its words are copied from the capture under pools_mu at each read, not the whole 4 KB page
+// into a copy of the thread's own (that copy was a third of the replay's thread in Kokiri Forest on NVIDIA Linux)
+constexpr int kSubmittedPages = 32;
+thread_local SubmittedPage submitted_pages[kSubmittedPages];
+inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its neighbours, and pages 32 apart, in different slots)
+    return submitted_pages[(page + (page >> 5) * 13) & (kSubmittedPages - 1)];
+}
+
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
+    // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. A page in none keeps
+    // that answer until a stamp or a new capture)
     if (!host->gpu_read(gpu, dst, n)) return false;
     if (!n || !capture_on() || !captures_seen.load(std::memory_order_relaxed)) return true;
     const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
     if (!guest) return true;
+    const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
+    const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
+    SubmittedPage& submitted_page = submitted_page_for(page0);
+    if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
+                                               submitted_page.view))
+        return true;
     static std::atomic<int64_t> reads{0}, pages_from{0};
     int64_t from = 0;
     {
@@ -652,12 +1323,24 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
         }
+        if (page0 == page1 && from == 0) {   // (in no capture: guest memory stands for its next words too)
+            submitted_page.page = page0;
+            submitted_page.pgen = page_gen(page0);
+            submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
+        }
     }
     pages_from += from;
     if (++reads % 20000 == 0)
         logf("vk: replay reads of guest memory as submitted: %lld (%lld pages from the captures)", (long long)reads.load(),
              (long long)pages_from.load());
     return true;
+}
+
+uint64_t memory_capture_view() { return cap_view_gen.load(std::memory_order_acquire); }
+uint32_t memory_page_stamp(uint64_t gpu) {
+    const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
+    if (!guest) return 0;
+    return page_gen(guest >> kPageShift);
 }
 
 bool memory_has_shadow(uint64_t guest, uint64_t n) {
@@ -723,11 +1406,109 @@ void memory_drop_shadow(uint64_t guest, uint64_t size) {
     shadow_drop_range(guest, guest + size);
 }
 
+// ---- (EvilBoyce) GPU results by page: the submission that last wrote a page into guest memory ----
+// For invalidate (vk_replay.cpp): a CPU read of GPU results waits until the submission that writes them there is done, as
+// the console's coherent memory has them once that work is. Guest page number -> the recording's timeline value (write-backs
+// from a mirror, and small bindings written in place). RX_VK_NO_READBACK_WAIT=1: none
+namespace {
+std::mutex wb_pages_mu;
+// (each page's value: the timeline value of its last write-back, 0 for never, in chunks of kChunkPages made when a page of
+// the chunk is first written back, as the page generations above. Write-backs are of imported pools only, which lie in the
+// GPU's windows, so few chunks are ever made. Values are never lowered or dropped: the readers (memory_writeback_value's
+// "ever written back" and its value against the GPU's progress, and the capture's wait, the same compare) read one the GPU
+// is past as "written back, nothing to wait for", whatever it is. tests/test_wb_pages.py)
+struct WbPages {
+    std::vector<std::unique_ptr<uint64_t[]>> chunks = std::vector<std::unique_ptr<uint64_t[]>>(kPages / kChunkPages);
+    bool any = false;
+    void set(uint64_t page, uint64_t value) {
+        if (page >= kPages) return;
+        auto& c = chunks[page / kChunkPages];
+        if (!c) {
+            c.reset(new uint64_t[kChunkPages]);
+            std::fill(c.get(), c.get() + kChunkPages, 0ull);
+        }
+        c[page % kChunkPages] = value;
+        any = true;
+    }
+    uint64_t get(uint64_t page) const {
+        if (page >= kPages) return 0;
+        const auto& c = chunks[page / kChunkPages];
+        return c ? c[page % kChunkPages] : 0;
+    }
+    /// the largest value of pages first..last (0: none), and whether any had one; a chunk never made is skipped whole
+    uint64_t max_in(uint64_t first, uint64_t last, bool* ever) const {
+        uint64_t v = 0;
+        for (uint64_t p = first; p <= last && p < kPages;) {
+            const uint64_t end = (p / kChunkPages + 1) * kChunkPages;   // (the first page past p's chunk)
+            const auto& c = chunks[p / kChunkPages];
+            if (!c) {
+                p = end;
+                continue;
+            }
+            for (; p <= last && p < end; p++)
+                if (const uint64_t pv = c[p % kChunkPages]) {
+                    if (ever) *ever = true;
+                    v = std::max(v, pv);
+                }
+        }
+        return v;
+    }
+    bool empty() const { return !any; }
+} wb_pages;
+// (hookshot) and the part of that submission the write-back was recorded in (vk_replay.cpp's Recording::part), for a page
+// written back from its mirror: a submission is recorded in parts of ~120 draws (maybe_split), each part's end copies back
+// what the GPU wrote in it, and the CPU's read needs that part done, not the submission's last one. Hyrule Field: the
+// readbacks waited 5.5 ms a frame for last parts, the GPU's whole frame. 0 for a page written in place (note_direct_write:
+// no mirror; the later parts of its submission may still read or write it in guest memory, so the read waits for all of it).
+// A page's part is replaced with its value, by every note: the two are of the same write
+WbPages wb_parts;
+void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, uint64_t part) {
+    static const bool off = env_on("RX_VK_NO_READBACK_WAIT");
+    if (off || !value || guest_hi <= guest_lo) return;
+    std::lock_guard lk(wb_pages_mu);
+    for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) {
+        wb_pages.set(p, value);
+        if (part || !wb_parts.empty()) wb_parts.set(p, part);
+    }
+}
+} // namespace
+/// The newest write-back value of the range's pages (0: none; *ever: whether any page was ever written back). With part
+/// and whole: *part is the newest part that wrote any of them back from a mirror (0: none), *whole the newest value among
+/// the pages with no part (written in place: their whole submission is what a read waits for; 0: none)
+uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part, uint64_t* whole) {
+    uint64_t v = 0;
+    if (ever) *ever = false;
+    if (part) *part = 0;
+    if (whole) *whole = 0;
+    if (!size) return 0;
+    std::lock_guard lk(wb_pages_mu);
+    if (wb_pages.empty()) return 0;
+    const uint64_t first = guest >> kPageShift, last = (guest + size - 1) >> kPageShift;
+    v = wb_pages.max_in(first, last, ever);
+    if (v && (part || whole)) {
+        uint64_t newest = 0, in_place = 0;
+        for (uint64_t p = first; p <= last && p < kPages;) {
+            if (!wb_pages.chunks[p / kChunkPages]) {   // (a chunk never made: none of its pages, as max_in)
+                p = (p / kChunkPages + 1) * kChunkPages;
+                continue;
+            }
+            const uint64_t pv = wb_pages.get(p), pp = pv ? wb_parts.get(p) : 0;
+            if (pp) newest = std::max(newest, pp);
+            else if (pv) in_place = std::max(in_place, pv);
+            p++;
+        }
+        if (part) *part = newest;
+        if (whole) *whole = in_place;
+    }
+    return v;
+}
+
 /// A copy that fails instead of faulting on a page unmapped meanwhile (structured exception handling: the common case
 /// costs a memcpy; ReadProcessMemory per page was ~2.3 us each). Not inlined, and the copy a call: without
 /// -fasync-exceptions clang catches a fault in a __try block only across a call, and a 4 KB memcpy inlined into the
 /// block (the per-page retry) faulted past the handler: the crash that kept the texture storage out of the capture.
 void* (*volatile guarded_memcpy)(void*, const void*, size_t) = std::memcpy;
+#ifdef _WIN32
 __declspec(noinline) bool guarded_copy(void* dst, const void* src, size_t n) {
     __try {
         guarded_memcpy(dst, src, n);
@@ -736,13 +1517,34 @@ __declspec(noinline) bool guarded_copy(void* dst, const void* src, size_t n) {
     }
     return true;
 }
+#else
+// (linux: the guest window is one mapping that stays readable, decommitted pages read as zero: nothing to fault on)
+bool guarded_copy(void* dst, const void* src, size_t n) {
+    guarded_memcpy(dst, src, n);
+    return true;
+}
+#endif
 // ---- a capture's copies: on the submitting thread and two helpers (RX_VK_CAPTURE_THREADS=<n>, 0-4): ~9 MB of the
 // game's dynamic data a submit, four submits a frame, ~1.4 ms on the game's thread each with one ----
 // (a page written and then unmapped before the submit faulted a plain copy: ReadProcessMemory fails on it instead.
 // VirtualQuery per page took ~1 ms each in this address space: 22 ms a submit for 18 pages) (runs of adjacent pages
 // in one copy each, page by page only where a run fails; page i into slot i)
-struct CopyPart { const uint32_t* pages; int64_t i0, i1; uint8_t* out; uint8_t* ok; };
+struct CopyPair { uint8_t* dst; const uint8_t* src; };   // (a 4 KB copy between two of our own buffers: copy_pairs)
+struct CopyPart {
+    const uint32_t* pages;
+    int64_t i0, i1;
+    uint8_t* out;
+    uint8_t* ok;
+    const CopyPair* pairs = nullptr;
+    int* left = nullptr;   // (the caller's parts not done yet (copy_helpers.mu): a caller waits for its own, not another's too)
+    uint8_t* stage = nullptr;       // (guest copies only: the pages with sidx[i] >= 0 are copied into stage + sidx[i] * 4096 first, and out from there)
+    const int32_t* sidx = nullptr;
+};
 void copy_part(const CopyPart& w) {
+    if (w.pairs) {
+        for (int64_t i = w.i0; i < w.i1; i++) std::memcpy(w.pairs[i].dst, w.pairs[i].src, 4096);
+        return;
+    }
     uint8_t* const base = (uint8_t*)host->guest_base();   // (guest addresses: no GPU translation per page)
     const uint64_t gsize = host->guest_size();
     for (int64_t i = w.i0; i < w.i1;) {
@@ -750,11 +1552,44 @@ void copy_part(const CopyPart& w) {
         if (ga + 4096 > gsize) { i++; continue; }
         int64_t j = i + 1;
         while (j < w.i1 && w.pages[j] == w.pages[j - 1] + 1 && ((uint64_t)w.pages[j] << kPageShift) + 4096 <= gsize) j++;
-        if (guarded_copy(w.out + (uint64_t)i * 4096, base + ga, (SIZE_T)(j - i) * 4096)) {
-            std::memset(w.ok + i, 1, (size_t)(j - i));
+        // (a run in out alone; a run of staged pages: guest memory into the staging first, then out from the staging, so the two
+        // hold the same bytes even if the game writes the page meanwhile; a page that fails is ok = 0 in both and not used)
+        auto plain = [&](int64_t a, int64_t b) {
+            if (guarded_copy(w.out + (uint64_t)a * 4096, base + ((uint64_t)w.pages[a] << kPageShift), (SIZE_T)(b - a) * 4096)) {
+                std::memset(w.ok + a, 1, (size_t)(b - a));
+            } else {
+                for (int64_t q = a; q < b; q++)
+                    w.ok[q] = guarded_copy(w.out + (uint64_t)q * 4096, base + ((uint64_t)w.pages[q] << kPageShift), 4096);
+            }
+        };
+        auto staged = [&](int64_t a, int64_t b) {
+            uint8_t* const st = w.stage + (uint64_t)w.sidx[a] * 4096;
+            if (guarded_copy(st, base + ((uint64_t)w.pages[a] << kPageShift), (SIZE_T)(b - a) * 4096)) {
+                std::memcpy(w.out + (uint64_t)a * 4096, st, (size_t)(b - a) * 4096);
+                std::memset(w.ok + a, 1, (size_t)(b - a));
+            } else {
+                for (int64_t q = a; q < b; q++) {
+                    uint8_t* const sq = w.stage + (uint64_t)w.sidx[q] * 4096;
+                    const bool good = guarded_copy(sq, base + ((uint64_t)w.pages[q] << kPageShift), 4096);
+                    if (good) std::memcpy(w.out + (uint64_t)q * 4096, sq, 4096);
+                    w.ok[q] = good;
+                }
+            }
+        };
+        if (!w.sidx) {
+            plain(i, j);
         } else {
-            for (int64_t q = i; q < j; q++)
-                w.ok[q] = guarded_copy(w.out + (uint64_t)q * 4096, base + ((uint64_t)w.pages[q] << kPageShift), 4096);
+            for (int64_t q = i; q < j;) {   // (split at the staged / not staged edges; staged slots are consecutive for adjacent pages)
+                int64_t r = q + 1;
+                if (w.sidx[q] >= 0) {
+                    while (r < j && w.sidx[r] == w.sidx[r - 1] + 1) r++;
+                    staged(q, r);
+                } else {
+                    while (r < j && w.sidx[r] < 0) r++;
+                    plain(q, r);
+                }
+                q = r;
+            }
         }
         i = j;
     }
@@ -763,7 +1598,6 @@ struct CopyHelpers {
     std::mutex mu;
     std::condition_variable cv, done;
     std::deque<CopyPart> parts;
-    int pending = 0;
     bool started = false;
 } copy_helpers;
 void copy_helper_main() {
@@ -778,30 +1612,77 @@ void copy_helper_main() {
         }
         copy_part(w);
         std::lock_guard lk(copy_helpers.mu);
-        if (--copy_helpers.pending == 0) copy_helpers.done.notify_all();
+        if (--*w.left == 0) copy_helpers.done.notify_all();
     }
 }
-void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok) {   // (one capture at a time: submit_order_mu)
-    static const int helpers = getenv("RX_VK_CAPTURE_THREADS") ? std::clamp(atoi(getenv("RX_VK_CAPTURE_THREADS")), 0, 4) : 2;
-    if (!helpers || n < 128) return copy_part({pages, 0, n, out, ok});
+int capture_copy_helpers() {   // (copy_pages and copy_pairs share one pool of helpers, started by the first call that splits)
+    static const int helpers = getenv("RX_VK_CAPTURE_THREADS")
+        ? std::clamp(atoi(getenv("RX_VK_CAPTURE_THREADS")), 0, 4)
+        : (getenv("RX_VK_LOW_SPEC") ? 0 : std::thread::hardware_concurrency() >= 12 ? 4 : 2);   // (four where the threads are spare)
+    return helpers;
+}
+/// (hookshot) whole's n copies in helpers + 1 parts: the first on the calling thread, the others queued for the helpers.
+/// Under 128 copies (512 KB) all on the calling thread: waking the helpers costs more than they save. Its own parts no
+/// helper has taken yet the caller runs itself once its first is done, rather than waiting behind what another caller
+/// queued before them (copy_pairs runs with pools_mu and shadow_mu held, copy_pages' guest copies can take milliseconds)
+void copy_split(CopyPart whole, int64_t n) {
+    const int helpers = capture_copy_helpers();
+    if (!helpers || n < 128) { whole.i0 = 0, whole.i1 = n; return copy_part(whole); }
     const int k = helpers + 1;
+    int left = k - 1;
+    auto part = [&](int i) {
+        CopyPart w = whole;
+        w.i0 = n * i / k, w.i1 = n * (i + 1) / k, w.left = &left;
+        return w;
+    };
     {
         std::lock_guard lk(copy_helpers.mu);
         if (!copy_helpers.started) {
             copy_helpers.started = true;
             for (int i = 0; i < helpers; i++) std::thread(copy_helper_main).detach();
         }
-        for (int i = 1; i < k; i++) copy_helpers.parts.push_back({pages, n * i / k, n * (i + 1) / k, out, ok});
-        copy_helpers.pending += k - 1;
+        for (int i = 1; i < k; i++) copy_helpers.parts.push_back(part(i));
     }
     copy_helpers.cv.notify_all();
-    copy_part({pages, 0, n / k, out, ok});
+    copy_part(part(0));
     std::unique_lock lk(copy_helpers.mu);
-    copy_helpers.done.wait(lk, [] { return copy_helpers.pending == 0; });
+    for (;;) {
+        auto it = std::find_if(copy_helpers.parts.begin(), copy_helpers.parts.end(), [&](const CopyPart& w) { return w.left == &left; });
+        if (it == copy_helpers.parts.end()) break;
+        const CopyPart w = *it;
+        copy_helpers.parts.erase(it);
+        lk.unlock();
+        copy_part(w);
+        lk.lock();
+        --left;
+    }
+    copy_helpers.done.wait(lk, [&] { return left == 0; });
+}
+void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok, uint8_t* stage = nullptr, const int32_t* sidx = nullptr) {   // (one capture at a time: submit_order_mu)
+    CopyPart w{pages, 0, n, out, ok};
+    w.stage = stage, w.sidx = sidx;
+    copy_split(w, n);
+}
+/// (hookshot) n 4 KB copies on the capture's copy helpers too: the texture shadow's (take_capture), thousands of pages a submit
+/// for OoT's game thread, which copied them one after another
+void copy_pairs(const CopyPair* pairs, int64_t n) {
+    CopyPart w{nullptr, 0, n, nullptr, nullptr};
+    w.pairs = pairs;
+    copy_split(w, n);
 }
 
+std::unique_ptr<Capture> capture_make();
+void shadow_free(Pool& p);
+void shadow_forget(Pool& p, uint64_t at, uint64_t len);   // (the write-back's diff, below: a range its shadow no longer knows)
 void memory_capture_submit() {
-    if (!capture_on()) return;
+    std::unique_ptr<Capture> c = capture_make();
+    if (!c) return;
+    std::lock_guard lk(cap_mu);
+    captures.push_back(std::move(c));
+}
+/// (the pages the CPU wrote since the last capture, copied now: a submit's capture, or memory_capture_now's)
+std::unique_ptr<Capture> capture_make() {
+    if (!capture_on()) return nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_ptr<Capture> c;
     {
@@ -811,12 +1692,14 @@ void memory_capture_submit() {
     if (!c) c = std::make_unique<Capture>();
     c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0;
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
+    stage_put(*c);
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
     // every written page was taken at first (hundreds of MB a submit where the game streams its world), and the whole
     // collection, over every GPU range, is ~20 ms: 4 of them a frame on the game's thread made it crawl. The replay's
     // collection takes the rest, as before)
     // (the list the replay publishes when it makes mirrors: pools_mu here waited ~40 ms a submit for the replay)
     static thread_local std::vector<std::pair<uint64_t, uint64_t>> mirrored;
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> texr;   // (tex_cap_ranges, sorted and merged: the staged pages)
     {   // (and the texture storage the replay uploads from: see "texture storage in the capture"; and the small pools)
         std::lock_guard lk(cap_ranges_mu);
         captures_made++;
@@ -835,6 +1718,14 @@ void memory_capture_submit() {
                 else
                     mirrored.push_back(r);
             }
+            texr = tex_cap_ranges;
+            std::sort(texr.begin(), texr.end());
+            size_t m = 0;
+            for (const auto& r : texr) {
+                if (m && r.first <= texr[m - 1].second) texr[m - 1].second = std::max(texr[m - 1].second, r.second);
+                else texr[m++] = r;
+            }
+            texr.resize(m);
         }
     }
     captures_seen.store(true, std::memory_order_relaxed);
@@ -843,13 +1734,46 @@ void memory_capture_submit() {
     const int64_t n = mirrored.empty() || !host->collect_written_in ? 0
                     : host->collect_written_in(reinterpret_cast<const uint64_t(*)[2]>(mirrored.data()), (int)mirrored.size(), &pages);
     const auto t_scan = std::chrono::steady_clock::now();
+    // (hookshot) A page the CPU wrote that a submission still on the GPU writes back: the copy waits for that write-back.
+    // OoT's exposure meter page is written by both: the GPU adds the frame's light into it and the CPU sets the sums back to
+    // 0 and fills in the rest. The CPU runs a frame ahead, and a copy taken before the write-back had landed had the GPU's
+    // words from the frame before; the mirror sync of the page put them back over the GPU's newer ones, and the exposure
+    // stepped for a frame (one-frame flashes, 40-120 a minute in Kokiri Forest). Only the copies of such pages wait, for the
+    // last submission writing them back: not every frame's present. RX_VK_CAPTURE_WAIT=0: off
+    if (n > 0) {
+        static const bool cap_wait = !getenv("RX_VK_CAPTURE_WAIT") || atoi(getenv("RX_VK_CAPTURE_WAIT")) != 0;
+        uint64_t v = 0;
+        if (cap_wait) {
+            const uint64_t done = vk_timeline_completed();
+            std::lock_guard lk(wb_pages_mu);
+            if (!wb_pages.empty())
+                for (int64_t i = 0; i < n; i++) {
+                    const uint64_t pv = wb_pages.get(pages[i]);
+                    if (pv > done) v = std::max(v, pv);
+                }
+        }
+        if (v) vk_timeline_wait(v);
+    }
+    if (n > 0) shadow_written(pages, n);
     if (n > 0) {
         c->pages.assign(pages, pages + n);
         if ((uint64_t)n * 4096 <= (256ull << 20) &&   // (a load writes more: those are read later, as before)
             cap_buf_get((uint64_t)n * 4096, c->buffer, c->alloc, c->map, c->bsize)) {
             static thread_local std::vector<uint8_t> ok;
             ok.assign((size_t)n, 0);
-            copy_pages(pages, n, (uint8_t*)c->map, ok.data());
+            c->buf_cached = host_cached(c->alloc);
+            if (stage_on() && !texr.empty() && !c->buf_cached) {
+                c->sidx.assign((size_t)n, -1);
+                int32_t tn = 0;
+                for (int64_t i = 0; i < n; i++) {
+                    const uint64_t g = (uint64_t)pages[i] << kPageShift;
+                    auto it = std::upper_bound(texr.begin(), texr.end(), std::make_pair(g, ~uint64_t(0)));
+                    if (it != texr.begin() && g < std::prev(it)->second) c->sidx[(size_t)i] = tn++;
+                }
+                if (!tn || !stage_get(*c, (size_t)tn * 4096)) c->sidx.clear();
+            }
+            copy_pages(pages, n, (uint8_t*)c->map, ok.data(), c->sidx.empty() ? nullptr : c->stage.get(),
+                       c->sidx.empty() ? nullptr : c->sidx.data());
             for (int64_t i = 0; i < n; i++)
                 if (ok[i]) c->copied.push_back(pages[i]), c->slots.push_back((uint32_t)i);
             c->nbytes = (size_t)n * 4096;
@@ -875,8 +1799,7 @@ void memory_capture_submit() {
             ms = ms_lock = ms_scan = 0, written = copied = 0;
         }
     }
-    std::lock_guard lk(cap_mu);
-    captures.push_back(std::move(c));
+    return c;
 }
 
 bool capture_owns(uint64_t guest) {
@@ -886,25 +1809,26 @@ bool capture_owns(uint64_t guest) {
     std::lock_guard lk(cap_ranges_mu);
     refresh_pool_ranges_locked();   // (a pool made since the last capture: the next one takes its pages, not this)
     auto in = [guest](const std::vector<std::pair<uint64_t, uint64_t>>& v) {
-        auto it = std::upper_bound(v.begin(), v.end(), std::make_pair(guest, ~0ull));
+        auto it = std::upper_bound(v.begin(), v.end(), std::make_pair(guest, ~uint64_t(0)));
         return it != v.begin() && guest < std::prev(it)->second;
     };
     return in(cap_ranges) || in(tex_cap_ranges) || in(pool_cap_ranges);
 }
+namespace {
+std::atomic<uint64_t> mem_rec_part{0}, mem_in_place_part{0};
+void note_in_place_read(bool outside = false) {
+    const uint64_t part = mem_rec_part.load() + (outside ? 1 : 0);
+    uint64_t seen = mem_in_place_part.load();
+    while (seen < part && !mem_in_place_part.compare_exchange_weak(seen, part)) {}
+}
+} // namespace
+void memory_recording_part(uint64_t part) { mem_rec_part.store(part); }
+uint64_t memory_in_place_part() { return mem_in_place_part.load(); }
 void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
     if (completed > mem_completed) mem_completed = completed;
 }
-bool memory_take_capture(uint64_t value, uint64_t completed) {
-    if (completed > mem_completed) mem_completed = completed;
-    if (!capture_on()) return false;
-    std::unique_ptr<Capture> c;
-    {
-        std::lock_guard lk(cap_mu);
-        if (captures.empty()) return false;
-        c = std::move(captures.front());
-        captures.pop_front();
-    }
+bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
     cur_cap_value = value;
@@ -925,15 +1849,43 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
     if (!c->pages.empty() && tex_capture_on()) {   // (the texture storage it took: the shadow, as of this submit)
         std::lock_guard sk(shadow_mu);
         shadow_seq++;
+        // (the copies of pages no capture took in the last 256 submits go, over 32 MB of them, every 256 captures: such a page is what guest
+        // memory holds (a write drops its copy), and the cap's sweep below came only at 256 MB. RX_VK_SHADOW_SWEEP_OFF=1: the cap's alone)
+        static const bool sweep_off = getenv("RX_VK_SHADOW_SWEEP_OFF") != nullptr;
+        if (!sweep_off && shadow_seq % 256 == 0 && shadow_n.load(std::memory_order_relaxed) > 8192)
+            for (auto it = shadow.begin(); it != shadow.end();) {
+                if (it->second.seq + 256 >= shadow_seq) { ++it; continue; }
+                auto r = shadow_regions.find(it->first >> 9);
+                if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
+                it = shadow.erase(it);
+                shadow_n--;
+            }
         if (!tex_merged.empty()) {
             // (every page written since the last capture: its old copy is stale; the ones copied now replace it)
-            for (uint32_t p : c->pages)
-                if (in_tex_merged((uint64_t)p << 12)) shadow_erase(p);
+            // (hookshot: those copied now are overwritten in place below, their buffers kept: erasing every written page and
+            // inserting the copied ones again was a free, an allocation and two hash operations a page, for the pages the
+            // game rewrites every frame. c->slots[i] is the index in c->pages of c->copied[i], in order)
+            {
+                size_t j = 0;
+                for (size_t i = 0; i < c->pages.size(); i++) {
+                    if (j < c->slots.size() && c->slots[j] == i) {
+                        j++;
+                        continue;
+                    }
+                    const uint32_t p = c->pages[i];
+                    if (in_tex_merged((uint64_t)p << 12)) shadow_erase(p);
+                }
+            }
             bool swept = false;
-            for (size_t i = 0; i < c->copied.size(); i++) {
+            static int64_t st_takes, st_from_stage, st_from_map, st_cached;   // (the shadow copies by source and the takes whose buffer was cached, logged every 600 takes; shadow_mu)
+            int64_t from_stage = 0, from_map = 0;
+            static thread_local std::vector<CopyPair> pairs;   // (the copies, made together once the slots are known)
+            pairs.clear();
+            size_t i = 0;
+            for (; i < c->copied.size(); i++) {
                 const uint32_t p = c->copied[i];
                 if (!in_tex_merged((uint64_t)p << 12)) continue;
-                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) {
+                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax && !shadow.count(p)) {
                     if (swept) break;
                     swept = true;
                     for (auto it = shadow.begin(); it != shadow.end();) {
@@ -952,8 +1904,21 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
                     shadow_n++;
                 }
                 slot.seq = shadow_seq;
-                std::memcpy(slot.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096, 4096);
+                const int32_t sx = c->sidx.empty() ? -1 : c->sidx[c->slots[i]];
+                if (sx >= 0) pairs.push_back({slot.b.get(), (const uint8_t*)c->stage.get() + (uint64_t)sx * 4096}), from_stage++;
+                else pairs.push_back({slot.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096}), from_map++;
             }
+            // (shadow_mu still held: no slot taken here goes before its copy; the sweep above drops only older ones)
+            if (!pairs.empty()) copy_pairs(pairs.data(), (int64_t)pairs.size());
+            st_from_stage += from_stage, st_from_map += from_map, st_cached += c->buf_cached ? 1 : 0;
+            if (++st_takes % 600 == 0) {
+                logf("vk: shadow staging (600 takes): %lld shadow copies from staging, %lld from the capture buffer; capture buffers: %lld "
+                     "host-cached, %lld not (write-combined: staged)%s", (long long)st_from_stage, (long long)st_from_map,
+                     (long long)st_cached, (long long)(600 - st_cached), stage_on() ? "" : " (RX_VK_SHADOW_STAGE=0)");
+                st_from_stage = st_from_map = 0, st_cached = 0;
+            }
+            for (; i < c->copied.size(); i++)   // (the shadow full: the copied pages not replaced lose their old copies)
+                if (in_tex_merged((uint64_t)c->copied[i] << 12)) shadow_erase(c->copied[i]);
         }
     }
     const auto tk1 = std::chrono::steady_clock::now();
@@ -965,6 +1930,8 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
         cur_cap_gen = g;
         for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i]});
     }
+    cap_view_bump();
+    stage_put(*c);   // (the shadow's copies from it are done: copy_pairs returned)
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     {
         std::lock_guard lk(cap_mu);
@@ -977,12 +1944,32 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
         st_tk_all += std::chrono::duration<double, std::milli>(tk2 - tk0).count();
         if (++n % 600 == 0) {
             logf("vk: a capture taken (ms): all %.3f; retires and stamps %.3f, bytes copied %.3f; %zu kept (%llu MB), %zu "
-                 "spare buffers", st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
-                 (unsigned long long)(cap_bytes >> 20), cap_free.size());
+                 "spare buffers, %zu texture pages copied (%llu MB)", st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
+                 (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
+                 (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
             st_tk_all = st_tk_stamp = st_tk_copy = 0;
         }
     }
     return true;
+}
+bool memory_take_capture(uint64_t value, uint64_t completed) {
+    if (completed > mem_completed) mem_completed = completed;
+    if (!capture_on()) return false;
+    std::unique_ptr<Capture> c;
+    {
+        std::lock_guard lk(cap_mu);
+        if (captures.empty()) return false;
+        c = std::move(captures.front());
+        captures.pop_front();
+    }
+    return take_capture(std::move(c), value, completed);
+}
+/// (hookshot) A capture made and taken at once, for a submission going on from a wait the CPU's signal met
+/// (vk_replay.cpp resume_queue): the CPU's writes up to that signal, which the console's GPU reads after its wait
+bool memory_capture_now(uint64_t value, uint64_t completed) {
+    if (completed > mem_completed) mem_completed = completed;
+    std::unique_ptr<Capture> c = capture_make();
+    return c && take_capture(std::move(c), value, completed);
 }
 
 namespace {
@@ -998,6 +1985,7 @@ struct TlPool {
 thread_local TlPool tl_pools[1024];   // (a parallel replay thread's: by 64 KB page, read without the lock)
 
 Pool* pool_of(uint64_t guest, uint64_t size) {
+    if (!size || size > UINT64_MAX - guest) return nullptr;
     if (last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) return last_pool;
     Pool*& slot = pool_cache[(guest >> 16) & 4095];
     if (slot && guest >= slot->lo && guest + size <= slot->hi) return last_pool = slot;
@@ -1015,7 +2003,15 @@ std::condition_variable bg_cv, bg_done_cv;
 std::deque<std::pair<uint64_t, uint64_t>> bg_queue;
 std::vector<uint64_t> bg_inflight;           // (lo of the ranges queued or being imported)
 std::vector<std::pair<uint64_t, Pool>> bg_ready;
-int64_t st_bg_imports, st_bg_waits;
+int64_t st_bg_imports, st_bg_waits, st_prefetch_sent, st_prefetch_used, st_prefetch_dropped;
+void bg_main();
+void bg_start() {   // (bg_mu held)
+    static bool started;
+    if (!started) {
+        started = true;
+        std::thread(bg_main).detach();
+    }
+}
 
 void bg_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk imports");
@@ -1030,6 +2026,7 @@ void bg_main() {
         Pool p;
         const bool ok = import_pool(r.first, r.second, p);
         std::lock_guard lk(bg_mu);
+        p.prefetched = true;
         if (ok) bg_ready.push_back({r.first, p}), st_bg_imports++;
         std::erase(bg_inflight, r.first);
         bg_done_cv.notify_all();
@@ -1047,13 +2044,123 @@ void bg_drain() {
     for (auto& [lo, p] : ready) {
         auto imp = imported.find(lo);
         if (imp != imported.end() && imp->second.hi >= p.hi) {
-            vkDestroyBuffer(dev.device, p.buffer, nullptr);
+            destroy_import_buffer(p.buffer);
             vkFreeMemory(dev.device, p.memory, nullptr);
+            for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
+            continue;
+        }
+        bool overlap = false;   // (amd-fix: a chunk imported ahead that an import made since covers in part: the pools stay disjoint)
+        for (auto o = imported.lower_bound(p.hi); o != imported.begin();) {
+            --o;
+            if (o == imp) continue;
+            if (o->second.hi <= p.lo) {
+                if (o->second.hi + (1ull << 30) < p.lo) break;
+                continue;
+            }
+            overlap = true;
+            break;
+        }
+        if (overlap) {
+            st_prefetch_dropped++;
+            destroy_import_buffer(p.buffer);
+            vkFreeMemory(dev.device, p.memory, nullptr);
+            for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
             continue;
         }
         if (imp != imported.end()) retire_pool(imp);
         imported.emplace(lo, p);
         guest_pages_set(p.lo, p.hi, p.address);
+    }
+}
+
+/// (amd-fix) An import on the replay thread stalled it 20-75 ms on an RX 9060 XT (the driver locks the chunk's pages, the
+/// commit of fresh ones), a tiny uniform buffer's binding as long, ~40 times entering Kokiri: hitches. The chunks next to
+/// one imported on demand, inside the game's pools, are imported ahead by the background thread; a lookup that needs one
+/// still under way waits for it (less than importing it), and a chunk imported ahead and first bound sends for its own
+/// neighbours. RX_VK_PREFETCH_CHUNKS: how many on each side (default 0: off, the background imports slowed the replay thread's own to 80-127 ms on AMD). (pools_mu held)
+// (0.1.9c) 2 on NVIDIA was tried and taken back: the slow imports stayed at ~47 a session, and the imports taking in
+// prefetched chunks went from 1-4 to 11-16 a session, the merge path older notes tie to stale GPU data. Off everywhere
+void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
+    static const int n = [] {
+        const int v = getenv("RX_VK_PREFETCH_CHUNKS") ? std::max(0, atoi(getenv("RX_VK_PREFETCH_CHUNKS"))) : 0;
+        logf("vk: chunks imported ahead on each side of one imported on demand: %d (RX_VK_PREFETCH_CHUNKS)", v);
+        return v;
+    }();
+    if (n <= 0 || !chunk || !dev.external_memory_host || hi <= lo) return;
+    auto in_game_pool = [](uint64_t a, uint64_t b) {
+        auto g = std::lower_bound(guest_pools.begin(), guest_pools.end(), b, [](const GuestPool& p, uint64_t v) { return p.lo < v; });
+        return g != guest_pools.begin() && std::prev(g)->hi > a;
+    };
+    auto imported_over = [](uint64_t a, uint64_t b) {
+        for (auto o = imported.lower_bound(b); o != imported.begin();) {
+            --o;
+            if (o->second.hi > a) return true;
+            if (o->second.hi + (1ull << 30) < a) break;
+        }
+        return false;
+    };
+    std::vector<std::pair<uint64_t, uint64_t>> want;
+    for (int k = 0; k < n; k++) {
+        const uint64_t up = hi + (uint64_t)k * chunk;
+        if (up < UINT64_MAX - chunk) want.push_back({up, up + chunk});
+        const uint64_t down = (uint64_t)(k + 1) * chunk;
+        if (lo >= down) want.push_back({lo - down, lo - down + chunk});
+    }
+    std::lock_guard lk(bg_mu);
+    for (const auto& [a, b] : want) {
+        if (b > (1ull << 40) || !in_game_pool(a, b) || imported_over(a, b)) continue;
+        if (std::find(bg_inflight.begin(), bg_inflight.end(), a) != bg_inflight.end()) continue;
+        if (bg_inflight.size() >= 16) break;
+        bg_start();
+        bg_inflight.push_back(a);
+        bg_queue.push_back({a, b});
+        st_prefetch_sent++;
+    }
+    bg_cv.notify_one();
+}
+
+/// (imports by chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as their number grew,
+/// and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
+/// (hookshot) 4 MB, not 16, where the pools have VRAM mirrors: a mirror covers its import's whole range, and with 16 MB chunks
+/// 28-39% of the mirrors' bytes sat outside every game pool. Without mirrors a chunk's padding costs no VRAM, so those stay at
+/// 16 MB. RX_VK_IMPORT_CHUNK_MB=16: as before
+/// (0.1.9c) 16 MB on 16 GB cards was tried and taken back: it did not make the slow imports fewer (38 against 33, those are
+/// the large pools, not the chunks' count), and the mirrors' padding grew them to 2368 MB, past their budget, in Hyrule
+/// Field's area changes on an RTX 5070 Ti at 4K: 8 pools left in system memory, the driver at its limit, 2-5 fps for 15 s
+bool mirror_on();
+uint64_t import_chunk() {
+    static const uint64_t chunk = [] {
+        uint64_t mb;
+        if (const char* e = getenv("RX_VK_IMPORT_CHUNK_MB")) mb = (uint64_t)std::max(0, atoi(e));
+        else mb = mirror_on() ? 4 : 16;
+        logf("vk: game memory imported in %llu MB chunks%s", (unsigned long long)mb,
+             getenv("RX_VK_IMPORT_CHUNK_MB") ? " (RX_VK_IMPORT_CHUNK_MB)" : "");
+        return mb << 20;
+    }();
+    return chunk;
+}
+uint64_t import_span() {
+    static const uint64_t span = (uint64_t)(getenv("RX_VK_IMPORT_SPAN_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_SPAN_MB"))) : 64) << 20;
+    return span;
+}
+/// [lo, hi), chunk-aligned, grown over the game pools that run across its ends, while it stays within import_span (pools_mu held)
+void span_game_pools(uint64_t& lo, uint64_t& hi, uint64_t chunk) {
+    const uint64_t span = import_span();
+    if (!chunk || hi - lo >= span) return;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (const uint64_t e : {lo, hi}) {
+            // (a pool across e that fits starts above e - span: the pools from there to e, as the host's may overlap)
+            auto g = std::upper_bound(guest_pools.begin(), guest_pools.end(), e, [](uint64_t v, const GuestPool& p) { return v < p.lo; });
+            while (g != guest_pools.begin()) {
+                --g;
+                if (g->lo + span <= e) break;
+                if (g->lo >= e || g->hi <= e) continue;
+                const uint64_t nlo = std::min(lo, g->lo / chunk * chunk), nhi = std::max(hi, (g->hi + chunk - 1) / chunk * chunk);
+                if (nhi - nlo > span || (nlo == lo && nhi == hi)) continue;
+                lo = nlo, hi = nhi, grew = true;
+            }
+        }
     }
 }
 
@@ -1064,11 +2171,9 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
                                [](uint64_t a, const GuestPool& p) { return a < p.lo; });
     if (it == guest_pools.begin()) return nullptr;
     --it;
-    if (guest < it->lo || guest + size > it->hi) return nullptr;
-    const GuestPool range = *it;
-    // (imports by 16 MB chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as
-    // their number grew, and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
-    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : 16) << 20;
+    if (guest < it->lo || guest >= it->hi || !size || size > it->hi - guest) return nullptr;
+    const uint64_t chunk = import_chunk();
+    const GuestPool range = chunk ? GuestPool{guest, guest + size} : *it;
     auto covering = [&]() {
         auto c = imported.upper_bound(range.lo);
         if (c == imported.begin()) return imported.end();
@@ -1076,24 +2181,44 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         return c->second.lo <= range.lo && c->second.hi >= range.hi ? c : imported.end();
     };
     auto imp = chunk ? covering() : imported.find(range.lo);
-    const uint64_t want_lo = chunk ? range.lo & ~(chunk - 1) : range.lo;
-    const uint64_t want_hi = chunk ? (range.hi + chunk - 1) & ~(chunk - 1) : range.hi;
+    if (chunk && range.hi > UINT64_MAX - (chunk - 1)) return nullptr;
+    const uint64_t want_lo = chunk ? range.lo / chunk * chunk : range.lo;
+    const uint64_t want_hi = chunk ? (range.hi + chunk - 1) / chunk * chunk : range.hi;
     if (chunk && imp == imported.end()) imp = imported.find(want_lo);   // (a smaller one there: made again, larger)
     if (imp == imported.end() || imp->second.hi < range.hi) {   // (under way in the background: waited for)
         bool waited = false;
         {
             std::unique_lock lk(bg_mu);
-            if (std::find(bg_inflight.begin(), bg_inflight.end(), range.lo) != bg_inflight.end()) {
-                bg_done_cv.wait(lk, [&] {
-                    return std::find(bg_inflight.begin(), bg_inflight.end(), range.lo) == bg_inflight.end();
-                });
+            auto wanted = [&](uint64_t x) { return x == range.lo || (chunk && x >= want_lo && x < want_hi); };
+            // (0.1.9c) What the background thread has not begun is taken back and imported here: the queue runs in order,
+            // and waiting for a queued chunk was waiting for every import ahead of it, a dispatch's lookup 299 ms behind five
+            // of 50 ms. Only the one under way is waited for
+            size_t taken_back = 0;
+            for (auto q = bg_queue.begin(); q != bg_queue.end();) {
+                if (!wanted(q->first)) {
+                    ++q;
+                    continue;
+                }
+                std::erase(bg_inflight, q->first);
+                q = bg_queue.erase(q);
+                taken_back++;
+            }
+            if (taken_back) st_prefetch_dropped += (int64_t)taken_back;
+            auto under_way = [&] {   // (the pool's own import, or a chunk of the range imported ahead)
+                for (const uint64_t x : bg_inflight)
+                    if (wanted(x)) return true;
+                return false;
+            };
+            if (under_way()) {
+                bg_done_cv.wait(lk, [&] { return !under_way(); });
                 waited = true;
                 st_bg_waits++;
             }
         }
         if (waited) {
             bg_drain();
-            imp = imported.find(range.lo);
+            imp = chunk ? covering() : imported.find(range.lo);
+            if (chunk && imp == imported.end()) imp = imported.find(want_lo);
         }
     }
     if (imp == imported.end() || imp->second.hi < range.hi || imp->second.lo > range.lo) {
@@ -1104,54 +2229,75 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         // write-back: the instances of a frame before or older, objects popping in and out, one-frame flashes.)
         uint64_t lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
         std::vector<uint64_t> overlapped;
-        for (bool grew = true; grew;) {
-            grew = false;
-            overlapped.clear();
-            auto it = imported.lower_bound(hi);   // (the pools starting below hi, the last ones first)
-            while (it != imported.begin()) {
-                --it;
-                if (it->second.hi <= lo) {
-                    if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
-                    continue;
+        auto plan = [&](bool spanned) {   // (the range, the imported pools it takes in; spanned: span_game_pools's chunks too)
+            lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
+            if (spanned && chunk) span_game_pools(lo, hi, chunk);
+            for (bool grew = true; grew;) {
+                grew = false;
+                overlapped.clear();
+                auto it = imported.lower_bound(hi);   // (the pools starting below hi, the last ones first)
+                while (it != imported.begin()) {
+                    --it;
+                    if (it->second.hi <= lo) {
+                        if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
+                        continue;
+                    }
+                    overlapped.push_back(it->first);
+                    if (it->second.lo < lo) lo = it->second.lo, grew = true;
+                    if (it->second.hi > hi) hi = it->second.hi, grew = true;
                 }
-                overlapped.push_back(it->first);
-                if (it->second.lo < lo) lo = it->second.lo, grew = true;
-                if (it->second.hi > hi) hi = it->second.hi, grew = true;
+            }
+            if (hi - lo > (1ull << 30)) {   // (no larger than 1 GB: then as before, the chunk's pool alone, overlaps logged)
+                static int logged_big;
+                if (logged_big++ < 8)
+                    logf("vk: pool %#llx..%#llx would take in %zu pools, %llu MB: left overlapping", (unsigned long long)lo,
+                         (unsigned long long)hi, overlapped.size(), (unsigned long long)((hi - lo) >> 20));
+                lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
+                overlapped.clear();
+                if (imp != imported.end()) overlapped.push_back(imp->first);
+            }
+        };
+        plan(true);
+        const uint64_t spanned_lo = lo, spanned_hi = hi;
+        Pool p;
+        bool ok = false;
+        for (int pass = 0; pass < 2 && !ok; pass++) {
+            if (pass) {   // (a spanned import that failed: the range without the span, as imported before)
+                plan(false);
+                if (lo == spanned_lo && hi == spanned_hi) break;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            ok = import_pool(lo, hi, p);
+            {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                static double total_ms;
+                static int n, logged;
+                total_ms += ms, n++;
+                if ((ms >= 2.0 && logged++ < 200) || n % 256 == 0)
+                    logf("vk: pool %#llx+%#llx imported in %.1f ms (%d imports, %.0f ms in all)", (unsigned long long)range.lo,
+                         (unsigned long long)(range.hi - range.lo), ms, n, total_ms);
             }
         }
-        if (hi - lo > (1ull << 30)) {   // (no larger than 1 GB: then as before, the chunk's pool alone, overlaps logged)
-            static int logged_big;
-            if (logged_big++ < 8)
-                logf("vk: pool %#llx..%#llx would take in %zu pools, %llu MB: left overlapping", (unsigned long long)lo,
-                     (unsigned long long)hi, overlapped.size(), (unsigned long long)((hi - lo) >> 20));
-            lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
-            overlapped.clear();
-            if (imp != imported.end()) overlapped.push_back(imp->first);
-        }
-        Pool p;
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = import_pool(lo, hi, p);
-        {
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            static double total_ms;
-            static int n, logged;
-            total_ms += ms, n++;
-            if ((ms >= 2.0 && logged++ < 30) || n % 256 == 0)
-                logf("vk: pool %#llx+%#llx imported in %.1f ms (%d imports, %.0f ms in all)", (unsigned long long)range.lo,
-                     (unsigned long long)(range.hi - range.lo), ms, n, total_ms);
-        }
         if (!ok) {
-            if (failures++ < 16)
-                logf("vk: pool %#llx+%#llx not imported", (unsigned long long)range.lo,
-                     (unsigned long long)(range.hi - range.lo));
+            if (!import_cooling && failures++ < 16) {
+                if (import_result != VK_SUCCESS)
+                    logf("vk: pool %#llx+%#llx not imported (VkResult %d)", (unsigned long long)range.lo,
+                         (unsigned long long)(range.hi - range.lo), (int)import_result);
+                else
+                    logf("vk: pool %#llx+%#llx not imported", (unsigned long long)range.lo,
+                         (unsigned long long)(range.hi - range.lo));
+            }
             return nullptr;
         }
         for (uint64_t k : overlapped) {   // (the pools it took in)
             auto o = imported.find(k);
-            if (o != imported.end()) retire_pool(o);
+            if (o != imported.end())   // (their mirrors' contents come with them; and how often the range was trimmed)
+                p.gpu_only |= o->second.gpu_only, p.gpu_written |= o->second.gpu_written, p.trims = std::max(p.trims, o->second.trims),
+                    p.trim_epoch = std::max(p.trim_epoch, o->second.trim_epoch), retire_pool(o);
         }
         imp = imported.emplace(p.lo, p).first;
         guest_pages_set(p.lo, p.hi, p.address);
+        if (chunk) prefetch_chunks(p.lo, p.hi, chunk);
         if (overlapped.size() > 1) {
             static int logged_merge;
             if (logged_merge++ < 16)
@@ -1160,6 +2306,17 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         }
         static int logged;
         if (logged++ < 8 || imported.size() % 256 == 0) logf("vk: %zu pools imported", imported.size());
+    }
+    if (imp->second.prefetched) {   // (first bound: its neighbours ahead in turn)
+        imp->second.prefetched = false;
+        st_prefetch_used++;
+        prefetch_chunks(imp->second.lo, imp->second.hi, chunk);
+        static int64_t logged_at;
+        if (st_prefetch_used / 16 != logged_at) {
+            logged_at = st_prefetch_used / 16;
+            logf("vk: chunks imported ahead: %lld sent, %lld bound, %lld dropped; %lld waits", (long long)st_prefetch_sent,
+                 (long long)st_prefetch_used, (long long)st_prefetch_dropped, (long long)st_bg_waits);
+        }
     }
     imp->second.range_lo = range.lo, imp->second.range_hi = range.hi;
     return last_pool = &imp->second;
@@ -1185,6 +2342,20 @@ bool mirror_on() {
     }();
     return on != 0;
 }
+} // namespace
+uint64_t device_vram_bytes() {
+    uint64_t vram = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram = std::max(vram, (uint64_t)dev.memory.memoryHeaps[h].size);
+    return vram;
+}
+bool preset_caps_memory() {
+    static const uint64_t nominal_gb[] = {0, 4, 6, 8, 12, 16};
+    if (opts.preset <= 0 || opts.preset > 5) return true;   // (Custom: what the file says)
+    const uint64_t vram = device_vram_bytes();
+    return !vram || vram <= ((nominal_gb[opts.preset] << 30) + (768ull << 20));
+}
+namespace {
 uint64_t mirror_budget() {
     // (a quarter of the card, at most the 3 GB it was for all: on a 6 GB laptop those and the textures were past what the card has)
     static const uint64_t b = [] {
@@ -1192,12 +2363,39 @@ uint64_t mirror_budget() {
         uint64_t vram = 0;
         for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
             if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram = std::max(vram, (uint64_t)dev.memory.memoryHeaps[h].size);
-        // (hookshot: an eighth on cards of 8 GB or less. A 6 GB laptop's 1.5 GB of mirrors and its textures went past what the
-        // driver allows, it paged, and the GPU timed out: device lost, issues 96 and 132)
-        if (vram && vram <= (8ull << 30)) return vram / 8;
-        return vram ? std::min<uint64_t>(vram / 4, 3072ull << 20) : 3072ull << 20;
+        // (cards of 6 GB or less only: on 8 GB ones, a 3070 or a 4060, the game's memory read over PCIe instead left the GPU at a few
+        // percent and the frame stuttering)
+        if (vram && vram <= (6ull << 30) + (512ull << 20)) return vram / 8;
+        return vram ? std::min<uint64_t>(vram / 4, 3072ull << 20) : (uint64_t)(3072ull << 20);
     }();
-    return b;
+    // (the Insert menu's quality preset sets one, 256 MB at Minimum (4GB): it was never read, and an 8 GB card kept ~2 GB of
+    // mirrors with the 4GB preset on, 2026-11-08)
+    // (only on a card the preset is for: preset_caps_memory)
+    uint64_t cap = (opts.mirror_mb > 0 && !getenv("RX_VK_MIRROR_MB") && preset_caps_memory()) ? ((uint64_t)opts.mirror_mb << 20) : b;
+    // (0.1.8) Live VK_EXT_memory_budget guardrail: on 6 GB / 8 GB (or heavily shared) GPUs, holding up to 2 GB of idle mirrors
+    // while live VRAM usage crosses 85% of the driver's budget forces WDDM PCIe paging or starves the texture cache. Smoothly
+    // trim the mirror ceiling by the excess above 85% down to a 256 MB floor so idle mirrors give way first while active hot
+    // pools remain mirrored in VRAM. RX_VK_NO_LIVE_BUDGET=1: fixed ceiling as before.
+    static const bool no_live = getenv("RX_VK_NO_LIVE_BUDGET") && atoi(getenv("RX_VK_NO_LIVE_BUDGET")) != 0;
+    if (!no_live && !getenv("RX_VK_MIRROR_MB")) {
+        static std::atomic<uint64_t> cached_used{0}, cached_allowed{0}, probe_tick{0};
+        if ((probe_tick.fetch_add(1, std::memory_order_relaxed) & 31u) == 0) {
+            uint64_t u = 0, a = 0;
+            if (vram_usage(&u, &a) && a) {
+                cached_used.store(u, std::memory_order_relaxed);
+                cached_allowed.store(a, std::memory_order_relaxed);
+            }
+        }
+        const uint64_t u = cached_used.load(std::memory_order_relaxed);
+        const uint64_t a = cached_allowed.load(std::memory_order_relaxed);
+        const uint64_t soft_line = (a / 100) * 85;
+        if (a && u > soft_line) {
+            const uint64_t over = u - soft_line;
+            const uint64_t floor_mb = std::min<uint64_t>(cap, 256ull << 20);
+            cap = cap > over + floor_mb ? cap - over : floor_mb;
+        }
+    }
+    return cap;
 }
 uint64_t mirror_bytes = 0, mirror_epoch = 0;
 bool mirror_upload = false;   // (a submission is being recorded: its upload command buffer takes the syncs)
@@ -1207,6 +2405,76 @@ struct WriteBack {
     uint64_t lo, hi;   // offsets in the pool
 };
 std::vector<WriteBack> writebacks;
+// (hookshot, 11-07) The counter reports the replay writes into guest memory on the CPU (vk_replay.cpp NOP_REPORT_COUNTER), by
+// guest address: a mirrored pool's write-back copied the GPU's mirror over them at the end of the submission, the mirror's
+// stale words over the replay's newer ones, and the next render condition read those: a lighting pass left out, the whole lit
+// scene black for a frame (the one-frame dark flashes, every 15-30 frames; 17 in 40 s of Kokiri, 0 with mirrors off). They are
+// left out of the write-back now. RX_VK_WB_REPORTS=1: written back with the rest, as before
+std::mutex cpu_words_mu;
+// (two sorted sets with no word in both, and the words noted since the last merge: those go into the recent set, which
+// goes into the big one only once it is an eighth of its size. A std::set took a node a word and freed 65536 of them at
+// once when it filled, ~4% of the replay thread in a Kokiri profile; one sorted vector with every write-back's new words
+// merged in moved the whole of it each time, ~2.4% on a 3900X there (11-08): report words come at new addresses all the time)
+std::vector<uint64_t> cpu_words, cpu_words_recent, cpu_words_new;
+void sorted_merge(std::vector<uint64_t>& into, const uint64_t* b, const uint64_t* e) {
+    const size_t mid = into.size();
+    into.insert(into.end(), b, e);
+    std::inplace_merge(into.begin(), into.begin() + (ptrdiff_t)mid, into.end());
+}
+void cpu_words_merge() {   // (holding cpu_words_mu)
+    if (cpu_words_new.empty()) return;
+    std::sort(cpu_words_new.begin(), cpu_words_new.end());
+    cpu_words_new.erase(std::unique(cpu_words_new.begin(), cpu_words_new.end()), cpu_words_new.end());
+    // (only the words not kept already: the same report words come every frame)
+    size_t fresh = 0;
+    for (const uint64_t w : cpu_words_new)
+        if (!std::binary_search(cpu_words.begin(), cpu_words.end(), w) &&
+            !std::binary_search(cpu_words_recent.begin(), cpu_words_recent.end(), w))
+            cpu_words_new[fresh++] = w;
+    if (fresh) sorted_merge(cpu_words_recent, cpu_words_new.data(), cpu_words_new.data() + fresh);
+    if (cpu_words_recent.size() > std::max<size_t>(4096, cpu_words.size() / 8)) {
+        sorted_merge(cpu_words, cpu_words_recent.data(), cpu_words_recent.data() + cpu_words_recent.size());
+        cpu_words_recent.clear();
+    }
+    cpu_words_new.clear();
+}
+} // namespace
+void memory_cpu_owned(uint64_t guest, uint64_t size) {
+    static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
+    if (off || !guest) return;
+    std::lock_guard lk(cpu_words_mu);
+    if (cpu_words.size() + cpu_words_recent.size() + cpu_words_new.size() > 65536) {   // (as before: forgotten when it gets this big)
+        cpu_words_merge();   // (which leaves cpu_words_new empty)
+        if (cpu_words.size() + cpu_words_recent.size() > 65536) cpu_words.clear(), cpu_words_recent.clear();
+    }
+    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words_new.push_back(a);
+    // (the write itself, guest_cpu_write, has told the write-back diff's shadows)
+}
+namespace {
+// (a write-back's runs with the replay's own words cut out of them: runs of p, offsets in the pool)
+void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
+    std::lock_guard lk(cpu_words_mu);
+    cpu_words_merge();
+    if (cpu_words.empty() && cpu_words_recent.empty()) return;
+    std::vector<VkBufferCopy> out;
+    for (const VkBufferCopy& r : runs) {
+        uint64_t at = r.srcOffset;
+        const uint64_t end = r.srcOffset + r.size;
+        // A run can start inside an owned word: include that word when cutting the overlap.
+        const uint64_t first = (p.lo + at) & ~7ull, last = p.lo + end;
+        auto a = std::lower_bound(cpu_words.begin(), cpu_words.end(), first);
+        auto b = std::lower_bound(cpu_words_recent.begin(), cpu_words_recent.end(), first);
+        for (;;) {   // (both sets' words in the run, in order)
+            const bool in_a = a != cpu_words.end() && *a < last, in_b = b != cpu_words_recent.end() && *b < last;
+            if (!in_a && !in_b) break;
+            const uint64_t w = (in_a && (!in_b || *a < *b) ? *a++ : *b++) - p.lo;
+            if (w > at) out.push_back({at, at, w - at});
+            at = std::max(at, w + 8);
+        }
+        if (end > at) out.push_back({at, at, end - at});
+    }
+    runs.swap(out);
+}
 
 // ---- a pool remade larger (a 16 MB chunk the game's next pool runs past): the old one leaves the table but stays
 // alive, as this submission's bindings, its mirror syncs and its write-backs still use it. Erasing it left those
@@ -1218,10 +2486,18 @@ std::deque<std::map<uint64_t, Pool>::node_type> retired_pools;
 
 void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     Pool* old = &it->second;
+    shadow_free(*old);   // (its write-backs in this submission, if any, copied whole)
     guest_pages_set(old->lo, old->hi, 0);
     old->retired_value = std::max(old->last_value, mem_rec_value);
+    old->retired_ms = import_now_ms();   // (the wait before its import is given back counts from here)
     std::erase(mirror_wanted, old);   // (the new pool gets the mirror)
     if (old->mstate == Pool::MIRROR_WANTED) old->mstate = Pool::MIRROR_NONE;
+    // (EvilOOT, 11-07) what the GPU wrote into its mirror and nowhere else (the culling's bare table entries past their first
+    // 64 bytes, stores through the page table) was lost here: the new pool's mirror is filled from guest memory. Kokiri's
+    // foliage records, written by the GPU while the scene loaded and its pools were remade larger, came out zero: every
+    // count 0, the trees' leaf clusters never drawn. RX_VK_NO_INHERIT=1: as before
+    static const bool no_inherit = getenv("RX_VK_NO_INHERIT") != nullptr;
+    if (old->mstate == Pool::MIRROR_ON && !no_inherit) old->inherit_pending = true, old->retired_epoch = mirror_epoch;
     pools_gen++;
     retired_pools.push_back(imported.extract(it));
     last_pool = nullptr;
@@ -1234,17 +2510,11 @@ int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
+std::unordered_map<uint64_t, uint64_t> direct_bytes_by_pool;           // (and the bytes of those bindings: what the GPU may read over PCIe, a binding's whole range)
 int64_t live_seen = 0;   // (pool -> pages its syncs read live, since the last report)
 
 void transfer_barrier(VkCommandBuffer cmd) {
-    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    d.memoryBarrierCount = 1;
-    d.pMemoryBarriers = &b;
-    vkCmdPipelineBarrier2(cmd, &d);
+    full_barrier(cmd, "barrier (write-back or sync)");   // (the same barrier; one right after another is left out)
 }
 
 /// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer)
@@ -1252,9 +2522,21 @@ void mirror_sync(Pool& p) {
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
     mirror_synced.push_back(&p);
-    std::vector<VkBufferCopy> runs;   // (from guest memory)
-    std::map<VkBuffer, std::vector<VkBufferCopy>> cap_runs;   // (from the captures' copies)
+    struct CapRunGroup {
+        VkBuffer buf = VK_NULL_HANDLE;
+        std::vector<VkBufferCopy> rs;
+    };
+    static thread_local std::vector<VkBufferCopy> runs;          // (from guest memory, capacity reused across pools/frames)
+    static thread_local std::vector<CapRunGroup> cap_runs;       // (from the captures' copies, coalesced)
+    static const bool no_coalesce = env_on("RX_VK_NO_MSYNC_COALESCE");
+    runs.clear();
+    for (auto& g : cap_runs) g.rs.clear();
+    size_t cap_groups_used = 0;
+    uint32_t last_cap_gen = 0;
+    auto last_cap_it = cap_bufs.end();
+    size_t last_group = SIZE_MAX;
     uint64_t run_lo = 0, run_hi = 0;
+    const bool note_writes = memory_wb_followed(p.lo, p.hi);   // (wb_learn.h: once a pool, not a page)
     for (uint64_t page = p.lo >> kPageShift; page < (p.hi + 4095) >> kPageShift;) {
         if (page % kRegionPages == 0 && region_gen[page / kRegionPages] <= p.synced_gen) {
             page += kRegionPages;   // (a clean 2 MB region)
@@ -1273,15 +2555,50 @@ void mirror_sync(Pool& p) {
                      "pool synced at %u, gen now %u)", (unsigned long long)(page << kPageShift), (unsigned long long)p.lo,
                      live ? "live" : "from a capture", pg, (unsigned)p.synced_gen, gen_now);
         }
+        // (hookshot) the CPU wrote this page: in a large binding whose write-back may be left out, the copy below would bring
+        // guest memory's stale rest of the page over the GPU's: that binding is written back from now on (wb_learn.h)
+        if (dirty && note_writes) memory_note_cpu_access(page << kPageShift, 1ull << kPageShift, true);
+        if (dirty && protect_bare_on() && prot_page_since(page, p.synced_gen)) {   // (the GPU's records kept: see prot_pages)
+            st_prot_kept++;
+            page++;
+            continue;
+        }
         if (dirty && !sync_live()) {   // (as a capture took it, if the page was not written since)
             const CapEntry e = cap_entry(page);
             if (e.gen && e.gen == pg) {
-                auto b = cap_bufs.find(e.gen);
-                if (b != cap_bufs.end()) {
+                if (e.gen != last_cap_gen) {
+                    last_cap_gen = e.gen;
+                    last_cap_it = cap_bufs.find(e.gen);
+                    last_group = SIZE_MAX;
+                    if (last_cap_it != cap_bufs.end()) {
+                        last_cap_it->second.last_use = std::max(last_cap_it->second.last_use, cur_cap_value);
+                        const VkBuffer cbuf = last_cap_it->second.buffer;
+                        for (size_t gi = 0; gi < cap_groups_used; gi++) {
+                            if (cap_runs[gi].buf == cbuf) {
+                                last_group = gi;
+                                break;
+                            }
+                        }
+                        if (last_group == SIZE_MAX) {
+                            if (cap_groups_used == cap_runs.size()) cap_runs.emplace_back();
+                            cap_runs[cap_groups_used].buf = cbuf;
+                            cap_runs[cap_groups_used].rs.clear();
+                            last_group = cap_groups_used++;
+                        }
+                    }
+                }
+                if (last_group != SIZE_MAX) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
-                    cap_runs[b->second.buffer].push_back(
-                        {(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
-                    b->second.last_use = std::max(b->second.last_use, cur_cap_value);
+                    const uint64_t src_off = (uint64_t)e.slot * 4096 + (ga - (page << kPageShift));
+                    const uint64_t dst_off = ga - p.lo;
+                    const uint64_t copy_sz = gb - ga;
+                    auto& rs = cap_runs[last_group].rs;
+                    if (!no_coalesce && !rs.empty() && rs.back().srcOffset + rs.back().size == src_off &&
+                        rs.back().dstOffset + rs.back().size == dst_off) {
+                        rs.back().size += copy_sz;
+                    } else {
+                        rs.push_back({src_off, dst_off, copy_sz});
+                    }
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
                     page++;
                     continue;
@@ -1312,27 +2629,260 @@ void mirror_sync(Pool& p) {
         page++;
     }
     if (run_hi) runs.push_back({run_lo, run_lo, run_hi - run_lo});
-    for (const auto& [buf, rs] : cap_runs) {
+    for (size_t gi = 0; gi < cap_groups_used; gi++) {
+        const VkBuffer buf = cap_runs[gi].buf;
+        const auto& rs = cap_runs[gi].rs;
+        if (rs.empty()) continue;
+        GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages from a capture -> mirror)");
+        gp.items = (int)rs.size();
         vkCmdCopyBuffer(upload_command_buffer(), buf, p.mirror, (uint32_t)rs.size(), rs.data());
-        for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size;
+        for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
         st_sync_copies += (int64_t)rs.size();
     }
     if (runs.empty()) return;
     checkpoint_mark(upload_command_buffer(), p.lo, 'm');
+    GprofSpan gp(upload_command_buffer(), "msync copies (CPU pages live from guest memory -> mirror)");
+    gp.items = (int)runs.size();
+    note_in_place_read();   // (these pages as guest memory has them when the GPU gets here)
     vkCmdCopyBuffer(upload_command_buffer(), p.buffer, p.mirror, (uint32_t)runs.size(), runs.data());
-    for (const VkBufferCopy& r : runs) st_sync_bytes += (int64_t)r.size;
+    for (const VkBufferCopy& r : runs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
     st_sync_copies += (int64_t)runs.size();
 }
 
 } // namespace
+
+// ---- (hookshot) Large written bindings the CPU does not read: no write-back (RX_VK_WB_MAX_KB, wb_learn.h) ----
+// The table is fed from the bindings (wb_leave_out, the replay's threads, pools_mu held), the CPU's reads (memory_note_cpu_read,
+// invalidate on the game's threads) and the CPU's writes that a mirror sync copies (mirror_sync); its own mutex, taken last.
+// RX_VK_WB_MAX_KB=<KB>: the size from which a binding may be left out (1024; 0: every written binding written back, as before);
+// RX_VK_WB_PROBATION=<writes>: how many writes with no CPU read before it is (8)
+std::mutex wb_learn_mu;
+wb_learn::Table wb_table;
+int64_t st_wb_left, st_wb_left_bytes, st_wb_stale;
+uint64_t wb_cap() {
+    static const uint64_t v = [] {
+        const uint64_t b = wb_learn::max_bytes(getenv("RX_VK_WB_MAX_KB"));
+        if (const char* e = getenv("RX_VK_WB_PROBATION")) wb_table.probation = (uint32_t)std::max(1, atoi(e));
+        if (b) logf("vk: write-backs of written bindings over %llu KB that the CPU has not read in %u writes are left out (RX_VK_WB_MAX_KB=0: "
+                    "none)", (unsigned long long)(b >> 10), wb_table.probation);
+        else logf("vk: every written binding is written back (RX_VK_WB_MAX_KB=0)");
+        return b;
+    }();
+    return v;
+}
+// (a written binding [lo, hi): false, write it all back; true, only the guest ranges in keep, the parts the CPU has touched)
+bool wb_leave_out(uint64_t lo, uint64_t hi, std::vector<std::pair<uint64_t, uint64_t>>& keep) {
+    if (!wb_cap()) return false;
+    std::lock_guard lk(wb_learn_mu);
+    if (!wb_table.plan(lo, hi, wb_cap(), mirror_epoch, keep)) return false;   // (mirror_epoch: the submission)
+    uint64_t kept = 0;
+    for (const auto& k : keep) kept += k.second - k.first;
+    st_wb_left++, st_wb_left_bytes += (int64_t)(hi - lo - kept);
+    return true;
+}
+void memory_note_cpu_access(uint64_t guest, uint64_t size, bool write) {
+    if (!size || !wb_cap()) return;
+    bool stale;
+    {
+        std::lock_guard lk(wb_learn_mu);
+        // (only in a large binding followed: the CPU's other reads and writes, all over memory, would only fill the table)
+        if (!wb_table.followed(guest, guest + size)) return;
+        stale = wb_table.read(guest, guest + size);
+        if (stale) st_wb_stale++;
+    }
+    static std::atomic<int> told{0};
+    if (stale && told++ < 20)
+        logf("vk: the CPU %s %#llx +%#llx, in a binding whose write-back was left out: written back from now on (RX_VK_WB_MAX_KB=0: "
+             "every one)", write ? "wrote" : "read", (unsigned long long)guest, (unsigned long long)size);
+}
+void memory_note_cpu_read(uint64_t guest, uint64_t size) { memory_note_cpu_access(guest, size, false); }
+bool memory_wb_followed(uint64_t lo, uint64_t hi) {
+    if (!wb_cap()) return false;
+    std::lock_guard lk(wb_learn_mu);
+    return wb_table.followed(lo, hi);
+}
+static void wb_learn_report() {   // (memory_end_submission, every 600 submits)
+    if (!wb_cap()) return;
+    std::lock_guard lk(wb_learn_mu);
+    logf("vk: write-backs left out (600 submits): %lld, %.1f MB; %zu bindings followed, %zu ranges the CPU read, %llu resets; CPU reads "
+         "or writes of one left out: %lld so far", (long long)st_wb_left, st_wb_left_bytes / 1048576.0, wb_table.seen(), wb_table.reads(),
+         (unsigned long long)wb_table.resets(), (long long)st_wb_stale);
+    st_wb_left = st_wb_left_bytes = 0;
+}
+// (hookshot, diagnostics) RX_VK_LOG_WB_SKIPS=1: the written bindings left out, by guest range, every 600 submits
+struct WbSkip { uint64_t hi, n, bytes; };
+std::mutex wb_skips_mu;
+std::map<uint64_t, WbSkip> wb_skips;   // (by guest start)
+static bool wb_skips_log() {
+    static const bool v = env_on("RX_VK_LOG_WB_SKIPS");
+    return v;
+}
+static void wb_skip_note(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(wb_skips_mu);
+    WbSkip& s = wb_skips[lo];
+    s.hi = std::max(s.hi, hi), s.n++, s.bytes += hi - lo;
+}
+static void wb_skips_report() {
+    std::vector<std::pair<uint64_t, uint64_t>> top;   // (bytes, lo)
+    uint64_t all = 0;
+    std::lock_guard lk(wb_skips_mu);
+    for (const auto& [lo, s] : wb_skips) top.push_back({s.bytes, lo}), all += s.bytes;
+    std::sort(top.rbegin(), top.rend());
+    std::string t;
+    for (size_t i = 0; i < top.size() && i < 12; i++) {
+        const WbSkip& s = wb_skips[top[i].second];
+        char b[112];
+        snprintf(b, sizeof b, " %#llx+%#llx: %llu, %.1f MB;", (unsigned long long)top[i].second,
+                 (unsigned long long)(s.hi - top[i].second), (unsigned long long)s.n, s.bytes / 1048576.0);
+        t += b;
+    }
+    logf("vk: write-backs skipped (RX_VK_WB_MAX_KB, 600 submits): %zu ranges, %.1f MB; the largest:%s", wb_skips.size(),
+         all / 1048576.0, t.c_str());
+    for (auto& kv : wb_skips) kv.second.bytes = 0, kv.second.n = 0;
+}
+
+// ---- (from PR 430, YunaraDebugs) Readback pages: GPU results the CPU reads (invalidate) and then writes, as OoT's exposure meter (a
+// sum the GPU adds into each frame; the CPU reads it and stores 0 back). On the console the GPU adds into that memory as it is when
+// its work runs, the CPU's 0 included. Here it adds into the pool's mirror, which takes the CPU's 0 only at a mirror sync of a submit
+// made after it: one made just before (the game's threads overlap) added onto the old sum, the CPU read 2x the next frame and 0 the
+// one after, and the exposure stepped (the light dimming or flaring for a frame in Kokiri). So each submission first copies those
+// pages from guest memory into the mirror, on the GPU as its work starts, last of the uploads: what the CPU wrote by then is what the
+// GPU adds to. RX_VK_NO_RB_REFRESH=1: off ----
+// (hookshot, 11-09) A parallel replay's recordings share one submission (mirror_epoch) and its one write-back at its end: the part
+// before the segments, each segment and the recording after them (vk_replay.cpp replay_handle). A refresh in a later one copied the
+// guest's page, which has none of the submission's GPU writes, over what the recordings ahead of it had written in the mirror: OoT's
+// exposure sum came back ~0 and every frame was too bright (RX_VK_PARALLEL=4). So a recording that joined an open submission
+// refreshes a page only when every recording ahead of it in the queue is made and none of them may have written the page: the copy
+// then brings the CPU's writes and wipes nothing (and a page first read in the middle of a submission is refreshed ahead of its first
+// use, unless the recordings up to that use were all made before it was read). What they may have written are the GPU write
+// hazards: every range bound for writing in the mirror, and the ranges a program may write that are not copied back (a bare table
+// entry's guessed range past its first 64 bytes, the pointer table's, a wide binding: vk_draw.cpp, memory_note_gpu_write). A
+// recording that opens its submission, or comes after its write-back (frame generation's), refreshes every page as before: serial
+// replay records the same copies. With RX_VK_FOLLOW_STORES (stores through the page table, bound nowhere) a joining one refreshes
+// none. RX_VK_RB_REFRESH_EACH=1: in every recording, as before
+namespace {
+std::unordered_map<uint32_t, uint64_t> rb_pages;   // (guest page -> mirror_epoch it was last read at)
+std::atomic<int64_t> st_rb_refresh{0}, st_rb_held{0};
+// (the open submission the recording this thread is making joined; 0: none: it opens one, or comes after one's end)
+thread_local uint64_t rb_joined = 0;
+// (the GPU write hazards of submission rb_hazards_epoch, by guest address, with their recording's place in the queue
+// (texture_segment); kept past its write-back, for the recording that ends it)
+struct RbHazard {
+    uint64_t lo, hi, seg;
+};
+std::vector<RbHazard> rb_hazards;
+uint64_t rb_hazards_epoch = 0;
+// (a parallel replay's segments: the submission, the first one's order (texture_segment) and how many; the ones made, by order)
+struct RbSegments {
+    uint64_t epoch = 0, base = 0, n = 0, made = 0;
+} rb_segs;
+void rb_hazard_locked(uint64_t lo, uint64_t hi) {   // (pools_mu held)
+    if (rb_hazards_epoch != mirror_epoch) rb_hazards.clear(), rb_hazards_epoch = mirror_epoch;
+    rb_hazards.push_back({lo, hi, texture_segment()});
+}
+}
+void memory_note_readback(uint64_t guest, uint64_t size) {
+    static const bool off = getenv("RX_VK_NO_RB_REFRESH") != nullptr;
+    if (off || !size || size > 0x4000) return;   // (small results only: meters and counters)
+    std::lock_guard lk(pools_mu);
+    for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
+}
+void memory_note_gpu_write(uint64_t gpu, uint64_t size) {
+    if (!size) return;
+    uint64_t guest = gpu;
+    if (gpu >= (1ull << 40)) {   // (as gpu_buffer_bind)
+        uint64_t avail = 0;
+        if (!host->gpu_ptr(gpu, &avail) || avail < size) return;
+        guest = host->gpu_guest(gpu);
+    }
+    std::lock_guard lk(pools_mu);
+    rb_hazard_locked(guest, guest + size);
+    // (and the pools it reaches keep their mirrors: imports are at most 1 GB, so none further down reaches guest)
+    for (auto it = imported.upper_bound(guest + size - 1); it != imported.begin();) {
+        --it;
+        if (it->second.hi > guest) it->second.gpu_only = true;
+        else if (it->second.hi + (1ull << 30) < guest) break;
+    }
+}
+void memory_rb_recording_begun() {
+    std::lock_guard lk(pools_mu);
+    rb_joined = mirror_upload ? mirror_epoch : 0;
+}
+void memory_rb_segments_begin(uint64_t base, uint64_t n) {
+    std::lock_guard lk(pools_mu);
+    rb_segs = {mirror_epoch, base, n, 0};
+}
+/// Records the refresh copies into the submission's upload command buffer; true when it recorded any
+bool memory_rb_refresh(VkCommandBuffer up) {
+    std::lock_guard lk(pools_mu);
+    static const bool each = getenv("RX_VK_RB_REFRESH_EACH") != nullptr;
+    static const bool follow_stores = getenv("RX_VK_FOLLOW_STORES") != nullptr;
+    const bool joined = !each && rb_joined && rb_joined == mirror_epoch;
+    const uint64_t seg = texture_segment();
+    bool ahead_made = !follow_stores;   // (every recording ahead of this one in the queue made, and what they may write known)
+    if (joined && rb_segs.epoch == mirror_epoch && seg >= rb_segs.base && seg - rb_segs.base < rb_segs.n) {
+        const uint64_t k = seg - rb_segs.base;   // (a segment's: the ones before it made, and this one now)
+        const uint64_t below = k < 64 ? (1ull << k) - 1 : ~0ull;
+        ahead_made = ahead_made && k < 64 && (rb_segs.made & below) == below;
+        if (k < 64) rb_segs.made |= 1ull << k;
+    }
+    if (rb_pages.empty() || !up) return false;
+    auto written_ahead = [&](uint64_t lo, uint64_t hi) {   // (may be, by a recording ahead of this one in its submission)
+        if (rb_hazards_epoch != mirror_epoch) return false;
+        for (const RbHazard& h : rb_hazards)
+            if (h.seg < seg && h.lo < hi && lo < h.hi) return true;
+        return false;
+    };
+    std::map<Pool*, std::vector<VkBufferCopy>> by_pool;
+    for (auto it = rb_pages.begin(); it != rb_pages.end();) {
+        if (it->second + 600 < mirror_epoch) { it = rb_pages.erase(it); continue; }   // (not read for a while)
+        const uint64_t g = (uint64_t)it->first << kPageShift;
+        ++it;
+        auto pit = imported.upper_bound(g);
+        if (pit == imported.begin()) continue;
+        --pit;
+        Pool& p = pit->second;
+        if (g < p.lo || g >= p.hi || p.mstate != Pool::MIRROR_ON || !p.mirror) continue;
+        const uint64_t a = g - p.lo, b = std::min(g + 4096, p.hi) - p.lo;
+        if (joined && (!ahead_made || written_ahead(p.lo + a, p.lo + b))) {   // (not here: see above)
+            st_rb_held++;
+            continue;
+        }
+        by_pool[&p].push_back({a, a, b - a});
+    }
+    if (by_pool.empty()) return false;
+    full_barrier(up);   // (after the older submissions' write-backs into guest memory and this one's other uploads)
+    GprofSpan gp(up, "rbrefresh copies (readback pages guest -> mirror)");
+    gp.items = 0;
+    for (auto& [pp, rs] : by_pool) {
+        st_rb_refresh += (int64_t)rs.size();
+        // (hookshot) pages next to each other as one copy (~530 a frame in Hyrule Field, a copy a page)
+        std::sort(rs.begin(), rs.end(), [](const VkBufferCopy& x, const VkBufferCopy& y) { return x.srcOffset < y.srcOffset; });
+        size_t k = 0;
+        for (size_t i = 1; i < rs.size(); i++)
+            if (rs[k].srcOffset + rs[k].size == rs[i].srcOffset) rs[k].size += rs[i].size;
+            else rs[++k] = rs[i];
+        rs.resize(k + 1);
+        vkCmdCopyBuffer(up, pp->buffer, pp->mirror, (uint32_t)rs.size(), rs.data());
+        gp.items += (int)rs.size();
+        for (const VkBufferCopy& r : rs) gp.bytes += r.size;
+    }
+    static std::atomic<int64_t> n{0};
+    if (++n % 3000 == 1)
+        logf("vk: readback pages refreshed from guest memory: %lld pages so far (%lld held: may be written ahead in their submission)",
+             (long long)st_rb_refresh.load(), (long long)st_rb_held.load());
+    return true;
+}
 
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     uint64_t avail = 0;
     if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
     const uint64_t guest = host->gpu_guest(gpu);
     std::lock_guard lk(pools_mu);
-    const Pool* p = pool_of(guest, size);
+    Pool* p = pool_of(guest, size);
     if (!p) return {};
+    if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
+    note_in_place_read();   // (the pool itself, read by the GPU where the caller's work runs)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
 
@@ -1343,17 +2893,22 @@ void memory_pool_created(uint64_t gpu, uint64_t size) {
     if (!on || !size || gpu >= (1ull << 40) || !dev.external_memory_host) return;   // (virtual pools are not imported)
     const uint64_t lo = gpu & ~(align - 1), hi = (gpu + size + align - 1) & ~(align - 1);
     std::lock_guard lk(bg_mu);
-    static bool started;
-    if (!started) {
-        started = true;
-        std::thread(bg_main).detach();
-    }
+    bg_start();
     if (std::find(bg_inflight.begin(), bg_inflight.end(), lo) != bg_inflight.end()) return;
     bg_inflight.push_back(lo);
     bg_queue.push_back({lo, hi});
     bg_cv.notify_one();
 }
 
+// (hookshot) Whether one imported pool holds all of [lo, hi): a lookup there imports nothing (vk_texture.cpp
+// upload_unswizzle_gpu asks before it reaches for one)
+int memory_guest_contained(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(pools_mu);
+    auto it = imported.upper_bound(lo);   // (pools by lo: the last one starting at or below lo)
+    if (it == imported.begin()) return 0;
+    --it;
+    return it->second.lo <= lo && it->second.hi >= hi ? 1 : 0;
+}
 int memory_guest_imported(uint64_t lo, uint64_t hi) {
     std::lock_guard lk(pools_mu);
     auto it = imported.upper_bound(hi);   // (pools by lo: those starting below hi, the last ones checked first)
@@ -1363,7 +2918,7 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
         if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
     }
     for (const auto& nh : retired_pools)
-        if (nh.mapped().lo < hi && lo < nh.mapped().hi) return 1;
+        if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) return 1;
     return 0;
 }
 
@@ -1377,11 +2932,95 @@ void publish_cap_ranges() {
     cap_ranges.swap(v);
     cap_ranges_ver++;
 }
+// (EvilOOT, 11-07) the game's own memory pool holding a GPU address (below 1 TB, where the address is the guest's), not the
+// import that happens to cover it: imports are 16 MB chunks around what was bound, and since upstream 1c7c9c7 only around
+// the bound range, so the pool's end was a chunk's end: the pointer tables of the task and mesh stages (whole pools) and the
+// bare entries stopped there, the grass's programs read their records 12-18 MB further on as 0 and culled every blade
+static bool game_pool_of(uint64_t gpu, uint64_t& lo, uint64_t& hi) {   // (pools_mu held)
+    if (gpu >= (1ull << 40) || guest_pools.empty()) return false;
+    auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), gpu, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == guest_pools.begin()) return false;
+    --it;
+    if (gpu < it->lo || gpu >= it->hi) return false;
+    lo = it->lo, hi = it->hi;
+    return true;
+}
+/// True when gpu sits in [lo, hi) and that span was cached from the guest-pool table this generation still is.
+bool guest_span_covers(uint64_t gpu, uint64_t lo, uint64_t hi, uint64_t cached_gen, uint64_t gen) {
+    return cached_gen == gen && lo < hi && gpu >= lo && gpu < hi;
+}
+struct GuestSpan { uint64_t lo = 1, hi = 0, gen = 0; };
+thread_local GuestSpan guest_span;
+bool guest_span_cached(uint64_t gpu, uint64_t* lo, uint64_t* hi) {
+    static const bool imported_only = getenv("RX_VK_POOL_END_IMPORTED") != nullptr;   // (A/B: the import's end, as before)
+    if (imported_only || gpu >= (1ull << 40)) return false;
+    const uint64_t gen = guest_pools_gen.load(std::memory_order_relaxed);
+    if (!guest_span_covers(gpu, guest_span.lo, guest_span.hi, guest_span.gen, gen)) return false;
+    *lo = guest_span.lo;
+    *hi = guest_span.hi;
+    return true;
+}
+void guest_span_store(uint64_t lo, uint64_t hi) {   // (pools_mu held: the generation matches the table just read)
+    guest_span = {lo, hi, guest_pools_gen.load(std::memory_order_relaxed)};
+}
 uint64_t gpu_pool_end(uint64_t gpu) {
+    uint64_t lo, hi;
+    // (storage-buffer tables ask this per entry, and the entries of one table sit in one pool: the locked lookup of a
+    // pool was ~8% of replay time before buffer binds cached it)
+    if (guest_span_cached(gpu, &lo, &hi)) return hi;
     ParLock plk;   // (before pools_mu, always)
     std::lock_guard lk(pools_mu);
+    static const bool imported_only = getenv("RX_VK_POOL_END_IMPORTED") != nullptr;   // (A/B: the import's end, as before)
+    if (!imported_only && game_pool_of(gpu, lo, hi)) {
+        guest_span_store(lo, hi);
+        return hi;
+    }
     const Pool* p = pool_of(gpu, 1);
     return p ? p->hi : 0;
+}
+uint64_t gpu_pool_start(uint64_t gpu) {   // (EvilOOT) where it begins
+    uint64_t lo, hi;
+    if (guest_span_cached(gpu, &lo, &hi)) return lo;
+    ParLock plk;
+    std::lock_guard lk(pools_mu);
+    static const bool imported_only = getenv("RX_VK_POOL_END_IMPORTED") != nullptr;
+    if (!imported_only && game_pool_of(gpu, lo, hi)) {
+        guest_span_store(lo, hi);
+        return lo;
+    }
+    const Pool* p = pool_of(gpu, 1);
+    return p ? p->lo : 0;
+}
+
+// (pools leaving, a mirror made, or the next submission: a remembered read binding is looked up again)
+uint64_t gpu_bind_stamp() {
+    return pools_gen.load(std::memory_order_relaxed) ^ (mirror_epoch * 0x9E3779B97F4A7C15ull);
+}
+
+uint32_t bind_slot(uint64_t guest, uint64_t size) {
+    // (a page-aligned range's low bits are zero: fold the rest in, or every one of them lands in one slot)
+    uint64_t h = guest ^ (size * 0x9E3779B97F4A7C15ull);
+    h *= 0x9E3779B97F4A7C15ull;
+    h ^= h >> 32;
+    h ^= h >> 16;
+    return (uint32_t)(h & 255u);
+}
+
+bool bind_memo_hit(uint64_t guest, uint64_t size, uint64_t stamp, uint64_t cached_guest, uint64_t cached_size,
+                   uint64_t cached_stamp, int has_buffer) {
+    return has_buffer && size && guest == cached_guest && size == cached_size && stamp == cached_stamp;
+}
+
+struct BindMemo {
+    uint64_t guest = 0, size = 0, stamp = 0;
+    BufferRef ref{};
+};
+thread_local BindMemo bind_memo[256];
+
+void note_direct_write(Pool& p, uint64_t off, uint64_t size) {   // (pools_mu held)
+    p.direct_write_epoch = mirror_epoch;
+    if (size <= (1u << 20))   // (EvilBoyce: GPU results written in place; small ones: the readbacks are)
+        wb_pages_note(p.lo + off, p.lo + std::min(off + size, p.hi - p.lo), mem_rec_value, 0);
 }
 
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
@@ -1394,20 +3033,34 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
         guest = host->gpu_guest(gpu);
     }
+    // (the same read, while that stamp still stands: the buffer and the offset are the ones found before. a miss
+    // runs the lookup below, including a mirror sync, and remembers what it returned. a write is not remembered)
+    auto remember = [&](BufferRef ref) {
+        if (!written && ref.buffer != VK_NULL_HANDLE && size)
+            bind_memo[bind_slot(guest, size)] = BindMemo{guest, size, gpu_bind_stamp(), ref};
+        return ref;
+    };
+    if (!written) {
+        const BindMemo& m = bind_memo[bind_slot(guest, size)];
+        if (bind_memo_hit(guest, size, gpu_bind_stamp(), m.guest, m.size, m.stamp, m.ref.buffer != VK_NULL_HANDLE))
+            return m.ref;
+    }
     // (a read binding of a pool this thread found before and whose mirror is in use this submission or that has none,
     // without the lock: every thread's, the replay thread's too (each draw binds several uniform buffers: the pool's
     // lookup under the lock was ~8% of the replay's time in a race); the rest under it, as below)
     const bool par = par_active.load(std::memory_order_relaxed);
     TlPool& tl = tl_pools[(guest >> 16) & 1023];
     if (!written && tl.p && tl.gen == pools_gen.load(std::memory_order_relaxed) && guest >= tl.p->lo &&
-        guest + size <= tl.p->hi) {
+        guest <= tl.p->hi && size <= tl.p->hi - guest) {   // (0.1.9c, upstream's form again: no wrap-around for a huge size)
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
-        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED)
-            return {p->buffer, off, size, 0};
+        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) {
+            note_in_place_read(!mirror_upload);
+            return remember({p->buffer, off, size, 0});
+        }
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
-            return {p->mirror, off, size, 0};
+            return remember({p->mirror, off, size, 0});
     }
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
@@ -1418,16 +3071,24 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
-        if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; }
-        return {p->buffer, off, size, 0};
+        if (written) note_direct_write(*p, off, size);
+        if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
+        // (hookshot) written by the GPU in guest memory itself, past the mirror (bound outside a recording's uploads): the
+        // write-back diff's shadow no longer knows those pages, and reads them again at its next write-back, after this write
+        if (written) shadow_forget(*p, off, std::min(size, p->hi - p->lo - off));
+        note_in_place_read(!mirror_upload);
+        return remember({p->buffer, off, size, 0});
     }
     // (a pool's mirror is made at its first binding, in this part's uploads: bound in guest memory until the next
     // submission, the GPU read it there while the game's threads wrote it for their next frames, and a pass that drew
     // over the moment a write landed came out in two (shadows dark below a line for a frame, the line moving; a new
     // pool every so many frames as the per-frame data moves on). Not when this part already wrote it in guest memory:
     // the copy at the part's start would miss that. RX_VK_MIRROR_DEFER=1: at the next submission, as before)
+    // (and not inside a parallel replay's segment (0.1.9c: upstream's !par, lost in this tree): its fill goes into the uploads of
+    // the segment whose worker bound the pool first, which need not be the first in the queue, and an earlier segment found the
+    // mirror in the page table and read it unfilled: houses, rocks and bushes missing, geometry torn (#994 with RX_VK_PARALLEL))
     static const bool defer = getenv("RX_VK_MIRROR_DEFER") != nullptr;
-    if (p->mstate == Pool::MIRROR_NONE && !defer && p->direct_write_epoch != mirror_epoch && mirror_make(*p)) {
+    if (p->mstate == Pool::MIRROR_NONE && !defer && !par && p->direct_write_epoch != mirror_epoch && mirror_make(*p)) {
         publish_cap_ranges();
         static int64_t made_now;
         if (++made_now % 200 == 1)
@@ -1441,12 +3102,29 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (p->mstate != Pool::MIRROR_ON) {
         auto& e = direct_by_pool[p->lo];
         e.first++, e.second = (int)p->mstate;
-        if (written) p->direct_write_epoch = mirror_epoch;
-        return {p->buffer, off, size, 0};
+        direct_bytes_by_pool[p->lo] += size;
+        if (written) note_direct_write(*p, off, size);
+        note_in_place_read();
+        return remember({p->buffer, off, size, 0});
     }
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
-    if (written) writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
-    return {p->mirror, off, size, 0};
+    if (written) {
+        p->gpu_written = true;   // (its mirror kept: mirrors_give_back)
+        // (hookshot) a binding over RX_VK_WB_MAX_KB (1024 by default; 0: none) that the CPU has not read through its
+        // probation queues no write-back: OoT writes tens of MB of culling lists and per-frame buffers through the GPU that
+        // the CPU never reads, and copying them back was most of a submit's memory sync (issue 384: 68 MB a frame; Hyrule
+        // Field on an RTX 3060 Ti, 68 -> 18 MB written back a frame). Learned, not a plain size cap: the CPU does read
+        // some large ones (wb_learn.h)
+        const uint64_t wlo = p->lo + off, whi = p->lo + std::min(off + size, p->hi - p->lo);
+        static thread_local std::vector<std::pair<uint64_t, uint64_t>> keep;
+        if (!wb_leave_out(wlo, whi, keep)) writebacks.push_back({p, off, whi - p->lo});
+        else {
+            for (const auto& [klo, khi] : keep) writebacks.push_back({p, klo - p->lo, khi - p->lo});
+            if (wb_skips_log()) wb_skip_note(wlo, whi);
+        }
+        rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
+    }
+    return remember({p->mirror, off, size, 0});
 }
 
 // ---- mirrors given back ----
@@ -1458,6 +3136,98 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
 constexpr uint64_t kIdleEpochs = 600, kLongIdle = 6000;
 int64_t st_mirrors_freed = 0;
 uint64_t st_mirror_bytes_freed = 0;
+// (hookshot) A freed mirror's buffer is destroyed only once the GPU is past everything recorded until then. Its pool's
+// last_value counts the draws and dispatches that bound it, not the shaders that reach it through the guest page table:
+// a culling or fog compute pass already running read a mirror destroyed under it (device lost in 53caac5f and ee7764a6,
+// issues 132 and 195, AMD after a scene change). The table goes back to guest memory at once, as before
+struct DeadMirror { VkBuffer buffer; VmaAllocation alloc; uint64_t value; };
+std::deque<DeadMirror> dead_mirrors;
+// A retired pool's import, given back the same way. Each import is a userptr buffer object to amdgpu, and RADV lists every
+// buffer object in every submission (buffer device addresses): the kernel checks every page of every userptr object at each
+// DRM_IOCTL_AMDGPU_CS. Retired pools were never given back, so the pages it checked only grew with each pool merge: in Kokiri
+// Forest ~1.3 GB of imports, 15-45 ms a submission (3-4 fps on an RX 7800 XT with 11 ms of GPU time; issues 312, 413). Its
+// table entries went at its retirement, and its mirror goes before (mstate), so once the GPU is past retired_value nothing
+// reaches it. The node stays (pointers to it are kept elsewhere); only its buffer and memory go. RX_VK_KEEP_RETIRED=1: kept
+struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; uint64_t value; uint64_t bytes; std::vector<VkDeviceMemory> pieces; };
+std::deque<DeadImport> dead_imports;
+uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
+uint64_t dead_import_bytes = 0;   // (queued in dead_imports: still in the heap's use until the GPU is past them)
+void reap_mirrors() {   // (pools_mu held)
+    while (!dead_mirrors.empty() && dead_mirrors.front().value <= mem_completed) {
+        if (env_on("RX_VK_LOG_ADDR")) {
+            VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            da.buffer = dead_mirrors.front().buffer;
+            logf("vk: addr mirror freed at gpu %#llx (value %llu, completed %llu)", (unsigned long long)vkGetBufferDeviceAddress(dev.device, &da),
+                 (unsigned long long)dead_mirrors.front().value, (unsigned long long)mem_completed);
+        }
+        destroy_buffer(dead_mirrors.front().buffer, dead_mirrors.front().alloc);
+        dead_mirrors.pop_front();
+    }
+    while (!dead_imports.empty() && dead_imports.front().value <= mem_completed) {
+        destroy_import_buffer(dead_imports.front().buffer);
+        vkFreeMemory(dev.device, dead_imports.front().memory, nullptr);
+        for (VkDeviceMemory m : dead_imports.front().pieces) vkFreeMemory(dev.device, m, nullptr);
+        st_retired_imports_freed++, st_retired_import_bytes_freed += dead_imports.front().bytes;
+        dead_import_bytes -= std::min(dead_import_bytes, dead_imports.front().bytes);
+        dead_imports.pop_front();
+    }
+}
+bool system_heap_usage(uint64_t* used, uint64_t* budget);   // (vk_vma.cpp; said here too: the pressure probe below runs before imports_give_back's own forward of it)
+/// Whether retired imports are kept, given back at once, or given back after a wait (retired_give_back.h)
+retired_give_back::Mode retired_mode() {
+#ifdef _WIN32
+    constexpr bool windows = true;
+#else
+    constexpr bool windows = false;
+#endif
+    static const retired_give_back::Mode m = [] {
+        const char* v = getenv("RX_VK_KEEP_RETIRED");
+        return retired_give_back::mode(v && *v, env_on("RX_VK_KEEP_RETIRED"), windows, dev.props.vendorID == 0x10DE);
+    }();
+    return m;
+}
+void retired_imports_give_back() {   // (pools_mu held)
+    using retired_give_back::Mode;
+    const Mode mode = retired_mode();
+    static const uint64_t idle_ms = (uint64_t)std::max(1, env_int("RX_VK_RETIRE_SECS", 30)) * 1000;
+    static const uint64_t floor_ms = (uint64_t)std::max(0, env_int("RX_VK_RETIRE_MIN_SECS", 2)) * 1000;
+    static const int high = std::clamp(env_int("RX_VK_IMPORT_HIGH", 85), 0, 100);   // (0: off, as in imports_give_back)
+    static const int low = std::clamp(env_int("RX_VK_IMPORT_LOW", 75), 10, 95);
+    uint64_t want = 0;
+    if (mode == Mode::GRACE && high > 0) {
+        static uint64_t calls = 0;
+        uint64_t used = 0, budget = 0;
+        if (++calls % 16 == 0 && system_heap_usage(&used, &budget))
+            want = retired_give_back::want(retired_give_back::settled(used, dead_import_bytes), budget, high, low);
+    }
+    const int64_t now = mode == Mode::GRACE ? import_now_ms() : 0;
+    uint64_t live_bytes = 0, retired_bytes = 0;
+    size_t retired_alive = 0;
+    for (auto& [lo, p] : imported) live_bytes += p.hi - p.lo;
+    for (auto& nh : retired_pools) {   // (in the order they were retired: the oldest first)
+        Pool& p = nh.mapped();
+        if (!p.memory) continue;
+        const uint64_t idle = (uint64_t)std::max<int64_t>(0, now - p.retired_ms);
+        if (p.mstate == Pool::MIRROR_NONE && !p.inherit_pending && p.retired_value <= mem_completed &&
+            p.last_value <= mem_completed && retired_give_back::due(mode, idle, idle_ms, floor_ms, want > 0)) {
+            dead_imports.push_back({p.buffer, p.memory, std::max(mem_rec_value, p.last_value), p.hi - p.lo, std::move(p.pieces)});
+            dead_import_bytes += p.hi - p.lo;
+            p.pieces.clear();
+            p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0;
+            pools_gen++;
+            want -= std::min(want, p.hi - p.lo);   // (the short wait ends once the low watermark's worth is queued)
+            continue;
+        }
+        retired_alive++, retired_bytes += p.hi - p.lo;
+    }
+    static uint64_t logged_epoch;
+    if (mirror_epoch - logged_epoch >= 1200) {
+        logged_epoch = mirror_epoch;
+        logf("vk: imports: %zu live (%llu MB), %zu retired still imported (%llu MB), %llu retired given back (%llu MB)",
+             imported.size(), (unsigned long long)(live_bytes >> 20), retired_alive, (unsigned long long)(retired_bytes >> 20),
+             (unsigned long long)st_retired_imports_freed, (unsigned long long)(st_retired_import_bytes_freed >> 20));
+    }
+}
 void mirror_free(Pool& p) {
     p.was_mirrored = true;
     {   // (the table back to guest memory, for a pool still in use only: a retired one's range is another pool's now, and its
@@ -1465,7 +3235,8 @@ void mirror_free(Pool& p) {
         const auto live = imported.find(p.lo);
         if (live != imported.end() && &live->second == &p) guest_pages_set(p.lo, p.hi, p.address);
     }
-    destroy_buffer(p.mirror, p.mirror_alloc);
+    dead_mirrors.push_back({p.mirror, p.mirror_alloc, std::max(mem_rec_value, p.last_value)});
+    shadow_free(p);
     p.mirror = VK_NULL_HANDLE, p.mirror_alloc = nullptr;
     mirror_bytes -= p.hi - p.lo;
     st_mirror_bytes_freed += p.hi - p.lo;
@@ -1474,42 +3245,262 @@ void mirror_free(Pool& p) {
     pools_gen++;   // (a parallel replay thread's pool cache: looked up again)
 }
 void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
-    static const bool keep = getenv("RX_VK_MIRROR_KEEP") != nullptr;   // (A/B: mirrors kept, as before)
+    static const bool keep = env_on("RX_VK_MIRROR_KEEP");   // (A/B: mirrors kept, as before)
     if (keep) return;
+    static int logged_frees = 0;
+    const auto told = [](const Pool& p, const char* why) {
+        if (logged_frees++ < 200)
+            logf("vk: mirror of pool %#llx (%llu MB) given back: %s, %llu submissions since its sync%s%s", (unsigned long long)p.lo,
+                 (unsigned long long)((p.hi - p.lo) >> 20), why, (unsigned long long)(mirror_epoch - p.synced_epoch),
+                 p.gpu_only ? ", GPU-only data" : "", p.gpu_written ? ", GPU-written" : "");
+    };
     for (auto& nh : retired_pools) {
         Pool& p = nh.mapped();
-        if (p.mstate == Pool::MIRROR_ON && p.retired_value <= mem_completed) mirror_free(p);
+        // (EvilOOT: kept while the pool that took it in has not made its mirror, for 600 submissions at most)
+        if (p.inherit_pending && mirror_epoch - p.retired_epoch > kIdleEpochs) p.inherit_pending = false, p.inherit_lost = true;
+        if (p.mstate == Pool::MIRROR_ON && p.retired_value <= mem_completed && !p.inherit_pending) {
+            told(p, p.inherit_lost ? "retired, not inherited in time" : "retired");
+            mirror_free(p);
+        }
     }
     std::vector<Pool*> idle;
+    uint64_t kept_bytes = 0;
     for (auto& [lo, p] : imported)
-        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
-            idle.push_back(&p);
+        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed) {
+            if (p.gpu_only || p.gpu_written) kept_bytes += p.hi - p.lo;
+            else idle.push_back(&p);
+        }
     std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
-    for (Pool* p : idle)
-        if (mirror_epoch - p->synced_epoch > kLongIdle || mirror_bytes + want_bytes > mirror_budget()) mirror_free(*p);
+    for (Pool* p : idle) {
+        const bool long_idle = mirror_epoch - p->synced_epoch > kLongIdle;
+        if (long_idle || mirror_bytes + want_bytes > mirror_budget()) told(*p, long_idle ? "idle" : "idle, for room"), mirror_free(*p);
+    }
     static int64_t logged_at;
     if (st_mirrors_freed / 16 != logged_at) {
         logged_at = st_mirrors_freed / 16;
-        logf("vk: %lld mirrors given back (%llu MB in all); %llu MB of mirrors now", (long long)st_mirrors_freed,
-             (unsigned long long)(st_mirror_bytes_freed >> 20), (unsigned long long)(mirror_bytes >> 20));
+        logf("vk: %lld mirrors given back (%llu MB in all); %llu MB of mirrors now, %llu MB of them idle and kept for what the GPU "
+             "wrote there alone", (long long)st_mirrors_freed, (unsigned long long)(st_mirror_bytes_freed >> 20),
+             (unsigned long long)(mirror_bytes >> 20), (unsigned long long)(kept_bytes >> 20));
+    }
+}
+
+// ---- imports given back under pressure (16 GB PCs). The driver pins every imported pool and counts it in the system heap
+// the GPU reaches, whose budget is about half the PC's RAM (7.5 GB of 16): imports were kept for the session, the heap
+// went past its budget (7758 of 7503 MB on an RTX 3060 with 16 GB) and new imports failed with VK_ERROR_OUT_OF_DEVICE_MEMORY:
+// terrain left out, load zones stuck. Past RX_VK_IMPORT_HIGH percent of the budget (85) the pools bound least lately give
+// their imports back down to RX_VK_IMPORT_LOW percent (75): only pools without a mirror, not bound for kImportIdle
+// submissions and done on the GPU. They leave the table as a retired pool does (the page table's entries 0, the caches
+// emptied) and are imported again at their next binding; their memory is freed once everything recorded until now is
+// done. On Linux, on by default only where that heap's budget is under 12 GB (where it ran out); off by default on Windows.
+// RX_VK_IMPORT_HIGH=0: off, =85: on anywhere. (Caveat: last_value counts bindings, not shaders reaching a pool through the
+// page table; a pool only reached that way would read zeros until it is bound again. Not seen in play: the pools given back
+// were long unbound.) ----
+bool system_heap_usage(uint64_t* used, uint64_t* budget);   // (vk_vma.cpp)
+std::deque<std::map<uint64_t, Pool>::node_type> evicted_pools;
+int64_t st_imports_evicted = 0;
+uint64_t st_import_bytes_evicted = 0;
+constexpr uint64_t kImportIdle = 600;
+
+void imports_give_back() {   // (pools_mu held)
+    while (!evicted_pools.empty() && evicted_pools.front().mapped().retired_value <= mem_completed) {
+        Pool& p = evicted_pools.front().mapped();
+        destroy_import_buffer(p.buffer);
+        vkFreeMemory(dev.device, p.memory, nullptr);
+        for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);   // (a pool imported as several dma-bufs)
+        evicted_pools.pop_front();
+    }
+    // (hookshot) Off by default on Windows, as giving retired imports back is (RX_VK_KEEP_RETIRED, retired_imports_give_back:
+    // device losses on Intel Arc and AMD right after imports went back): RX_VK_IMPORT_HIGH=85 turns it on there
+    static const char* env_high = getenv("RX_VK_IMPORT_HIGH");
+#ifdef _WIN32
+    static const int high = env_high ? atoi(env_high) : 0;
+#else
+    static const int high = env_high ? atoi(env_high) : 85;
+#endif
+    static const int low = getenv("RX_VK_IMPORT_LOW") ? std::clamp(atoi(getenv("RX_VK_IMPORT_LOW")), 10, 95) : 75;
+    static uint64_t calls = 0;
+    if (high <= 0 || ++calls % 16) return;   // (the driver asked every 16 submissions)
+    uint64_t used = 0, budget = 0;
+    if (!system_heap_usage(&used, &budget)) return;
+    static const bool small = [&] {   // (on by default where the budget is small: 16 GB of RAM and less)
+        const bool on = env_high || budget < (12ull << 30);
+        logf("vk: imports given back past %d%% of a %llu MB system heap budget: %s", high, (unsigned long long)(budget >> 20),
+             on ? "on" : "off (RX_VK_IMPORT_HIGH=85 turns it on)");
+        return on;
+    }();
+    if (retired_mode() == retired_give_back::Mode::GRACE) used = retired_give_back::settled(used, dead_import_bytes);
+    if (!small || used <= budget / 100 * (uint64_t)high) return;
+    const uint64_t target = budget / 100 * (uint64_t)low;
+    const uint64_t want = used > target ? used - target : 0;
+    std::vector<std::map<uint64_t, Pool>::iterator> idle;
+    for (auto it = imported.begin(); it != imported.end(); ++it) {
+        const Pool& p = it->second;
+        if ((p.mstate == Pool::MIRROR_NONE || p.mstate == Pool::MIRROR_REFUSED) && p.last_value <= mem_completed &&
+            mem_rec_value > p.last_value + kImportIdle)
+            idle.push_back(it);
+    }
+    std::sort(idle.begin(), idle.end(), [](auto a, auto b) { return a->second.last_value < b->second.last_value; });
+    uint64_t freed = 0;
+    int n = 0;
+    for (auto it : idle) {
+        if (freed >= want) break;
+        Pool& p = it->second;
+        guest_pages_set(p.lo, p.hi, 0);
+        p.retired_value = mem_rec_value;   // (this submission's recording is being made: freed once it is done)
+        freed += p.hi - p.lo;
+        n++;
+        evicted_pools.push_back(imported.extract(it));
+    }
+    if (!n) {
+        static int logged_none;
+        if (logged_none++ < 8)
+            logf("vk: system heap %llu of %llu MB: no idle import to give back (%zu imported)", (unsigned long long)(used >> 20),
+                 (unsigned long long)(budget >> 20), imported.size());
+        return;
+    }
+    pools_gen++;
+    last_pool = nullptr;
+    std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
+    if (mirror_on()) publish_cap_ranges();
+    st_imports_evicted += n, st_import_bytes_evicted += freed;
+    static int logged;
+    if (logged++ < 40 || logged % 64 == 0)
+        logf("vk: system heap %llu of %llu MB: %d idle imports given back (%llu MB); %lld (%llu MB) in all",
+             (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), n, (unsigned long long)(freed >> 20),
+             (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
+}
+
+// ---- (hookshot) an import trimmed back to the game's live pools (mirror_trim.h) ----
+// Every 64 submissions, while VRAM is short: the mirrored import that has been mostly outside every game pool the longest
+// is retired, and each of its live parts imported again on its own. Their mirrors are made in this same submission and take
+// what the GPU wrote from the old mirror. One import a call. Nothing is done unless the new mirrors fit the budget beside
+// the old one. RX_VK_MIRROR_TRIM=0: off
+int64_t st_trims = 0;
+uint64_t st_trim_bytes = 0;
+int trims_waiting = 0;
+bool mirrors_trim() {   // (pools_mu held; true when one was trimmed: its parts are in mirror_wanted)
+    static const bool on = [] {
+        const char* v = getenv("RX_VK_MIRROR_TRIM");
+        return !v || !env_value_off(v);
+    }();
+    const uint64_t chunk = import_chunk();
+    if (!on || !chunk || mirror_epoch % 64 || par_active.load(std::memory_order_relaxed)) return false;
+    uint64_t used = 0, allowed = 0;
+    const bool pressed = vram_usage(&used, &allowed) && mirror_trim::pressed(used, allowed);
+    Pool* pick = nullptr;
+    std::vector<mirror_trim::Range> parts, pick_parts;
+    for (auto& kv : imported) {
+        Pool& p = kv.second;
+        const unsigned trims = mirror_trim::counted(p.trims, mirror_epoch - p.trim_epoch);
+        if (!pressed || p.mstate != Pool::MIRROR_ON || !mirror_trim::wait(trims)) {
+            p.dead_since = 0;
+            continue;
+        }
+        parts = mirror_trim::live(p.lo, p.hi, chunk, mirror_trim::kJoin, guest_pools);
+        if (!mirror_trim::worth(p.hi - p.lo, parts)) {
+            p.dead_since = 0;
+            continue;
+        }
+        if (!p.dead_since) p.dead_since = mirror_epoch;
+        if (mirror_epoch - p.dead_since < mirror_trim::wait(trims)) continue;
+        if (!pick || p.dead_since < pick->dead_since) pick = &p, pick_parts = parts;
+    }
+    if (!pick) return false;
+    const uint64_t kept = mirror_trim::bytes(pick_parts), size = pick->hi - pick->lo;
+    uint64_t wanted = 0;
+    for (const Pool* w : mirror_wanted) wanted += w->hi - w->lo;
+    static const bool tight_rule = getenv("RX_VK_MIRROR_TIGHT") != nullptr;
+    if (mirror_bytes + wanted + kept > mirror_budget() || (tight_rule && used > allowed / 100 * 90)) return false;
+    std::vector<Pool> made;
+    for (const mirror_trim::Range& r : pick_parts) {
+        Pool np;
+        if (!import_pool(r.lo, r.hi, np)) {
+            for (Pool& m : made) {
+                destroy_import_buffer(m.buffer);
+                vkFreeMemory(dev.device, m.memory, nullptr);
+                for (VkDeviceMemory piece : m.pieces) vkFreeMemory(dev.device, piece, nullptr);
+            }
+            pick->dead_since = mirror_epoch;
+            return false;
+        }
+        made.push_back(std::move(np));
+    }
+    const uint64_t olo = pick->lo, ohi = pick->hi, waited = mirror_epoch - pick->dead_since;
+    const bool gpu_only = pick->gpu_only, gpu_written = pick->gpu_written;
+    const uint8_t trims = (uint8_t)(mirror_trim::counted(pick->trims, mirror_epoch - pick->trim_epoch) + 1);
+    retire_pool(imported.find(olo));
+    retired_pools.back().mapped().trimmed = true;
+    trims_waiting++;
+    for (Pool& m : made) {
+        m.gpu_only = gpu_only, m.gpu_written = gpu_written, m.trims = trims, m.trim_epoch = mirror_epoch;
+        auto it = imported.emplace(m.lo, std::move(m)).first;
+        guest_pages_set(it->second.lo, it->second.hi, it->second.address);
+        it->second.mstate = Pool::MIRROR_WANTED;
+        mirror_wanted.push_back(&it->second);
+    }
+    st_trims++, st_trim_bytes += size - kept;
+    static int logged;
+    if (logged++ < 40 || st_trims % 64 == 0)
+        logf("vk: pool %#llx..%#llx (%llu MB) trimmed to its %zu live part(s), %llu MB: the rest outside every game pool for %llu "
+             "submissions (%lld trims, %llu MB in all; RX_VK_MIRROR_TRIM=0: off)", (unsigned long long)olo, (unsigned long long)ohi,
+             (unsigned long long)(size >> 20), made.size(), (unsigned long long)(kept >> 20), (unsigned long long)waited,
+             (long long)st_trims, (unsigned long long)(st_trim_bytes >> 20));
+    return true;
+}
+
+// (pools_mu held, after the submission's mirrors are made) A trimmed import's old mirror waits until every pool over its
+// range has a mirror of its own. Let go at once, what the GPU wrote in a part and nowhere else was lost.
+void trims_settle() {
+    if (!trims_waiting) return;
+    for (auto& nh : retired_pools) {
+        Pool& r = nh.mapped();
+        if (!r.trimmed) continue;
+        bool all = true;
+        if (r.inherit_pending && r.mstate == Pool::MIRROR_ON) {
+            auto it = imported.lower_bound(r.lo);
+            if (it != imported.begin() && std::prev(it)->second.hi > r.lo) --it;
+            for (; it != imported.end() && it->first < r.hi; ++it) {
+                Pool& q = it->second;
+                if (q.hi <= r.lo || q.mstate == Pool::MIRROR_ON) continue;
+                all = false;
+                if (q.mstate == Pool::MIRROR_REFUSED && q.hi - q.lo <= (1ull << 30)) q.mstate = Pool::MIRROR_NONE;
+            }
+        }
+        if (!all) {
+            static int logged;
+            if (logged++ < 16)
+                logf("vk: trimmed pool %#llx..%#llx: its mirror kept, a live part has none of its own yet", (unsigned long long)r.lo,
+                     (unsigned long long)r.hi);
+            continue;
+        }
+        r.trimmed = false, r.inherit_pending = false;
+        trims_waiting--;
     }
 }
 
 void memory_begin_submission() {
     std::lock_guard lk(pools_mu);
+    reap_mirrors();
+    retired_imports_give_back();
     mirror_epoch++;
     mirror_upload = true;
     mirror_synced.clear();
     writebacks.clear();
+    imports_give_back();
     if (tex_capture_on()) publish_tex_spans(texture_frame_no());
     if (!mirror_on()) return;
+    mirrors_trim();
     {
         uint64_t want = 0;
         for (Pool* p : mirror_wanted) want += p->hi - p->lo;
         if (mirror_epoch % 64 == 0 || mirror_bytes + want > mirror_budget()) mirrors_give_back(want);
     }
-    if (mirror_wanted.empty()) return;
+    if (mirror_wanted.empty()) {
+        trims_settle();
+        return;
+    }
     for (Pool* p : mirror_wanted) mirror_make(*p);
+    trims_settle();
     mirror_wanted.clear();
     publish_cap_ranges();
     static uint64_t logged_at;
@@ -1543,8 +3534,11 @@ bool mirror_make(Pool& pool) {
     Pool* p = &pool;
     {
         const uint64_t n = p->hi - p->lo;
-        uint64_t used = 0, allowed = 0;   // (hookshot: and none while VRAM is nearly full: a mirror is a speed-up, the pool works without)
-        const bool tight = vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 90;
+        // (hookshot: RX_VK_MIRROR_TIGHT=1, none while VRAM is 90% full. Off: 8 GB cards sit there all the time, and without their mirrors
+        // the GPU read game memory over PCIe)
+        static const bool tight_rule = getenv("RX_VK_MIRROR_TIGHT") != nullptr;
+        uint64_t used = 0, allowed = 0;
+        const bool tight = tight_rule && vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 90;
         if (mirror_bytes + n > mirror_budget() || n > (1ull << 30) || tight) {
             p->mstate = n > (1ull << 30) ? Pool::MIRROR_REFUSED : Pool::MIRROR_NONE;
             static int logged;
@@ -1561,10 +3555,51 @@ bool mirror_make(Pool& pool) {
         {   // (hookshot) the page table points at the mirror: what the GPU wrote is there, and guest memory has it only after the write-back
             VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             da.buffer = p->mirror;
-            guest_pages_set(p->lo, p->hi, vkGetBufferDeviceAddress(dev.device, &da));
+            const uint64_t ma = vkGetBufferDeviceAddress(dev.device, &da);
+            guest_pages_set(p->lo, p->hi, ma);
+            if (getenv("RX_VK_LOG_ADDR"))
+                logf("vk: addr mirror %#llx..%#llx at gpu %#llx..%#llx", (unsigned long long)p->lo, (unsigned long long)p->hi,
+                     (unsigned long long)ma, (unsigned long long)(ma + n));
         }
         const VkBufferCopy all{0, 0, n};
-        vkCmdCopyBuffer(upload_command_buffer(), p->buffer, p->mirror, 1, &all);   // (all of it, at this generation)
+        {
+            GprofSpan gp(upload_command_buffer(), "mmake copy (a whole pool -> its new mirror)");
+            gp.bytes = n;
+            note_in_place_read();
+            vkCmdCopyBuffer(upload_command_buffer(), p->buffer, p->mirror, 1, &all);   // (all of it, at this generation)
+        }
+        {   // (EvilOOT) then the mirrors of the pools it took in, over their part: what the GPU wrote there and only there
+            // (retire_pool). The captures' pages go over it after, as before: the CPU's newer writes win
+            bool barrier_done = false;
+            int inherited = 0;
+            for (auto& nh : retired_pools) {
+                Pool& r = nh.mapped();
+                if (!r.inherit_pending || r.mstate != Pool::MIRROR_ON || !r.mirror || r.hi <= p->lo || r.lo >= p->hi) continue;
+                if (!barrier_done) {   // (after the full copy, and after the shaders of earlier submissions wrote the old mirror)
+                    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                    mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+                    mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                    mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+                    vkCmdPipelineBarrier2(upload_command_buffer(), &di);
+                    barrier_done = true;
+                }
+                const uint64_t a = std::max(r.lo, p->lo), b = std::min(r.hi, p->hi);
+                const VkBufferCopy part{a - r.lo, a - p->lo, b - a};
+                vkCmdCopyBuffer(upload_command_buffer(), r.mirror, p->mirror, 1, &part);
+                if (!r.trimmed) r.inherit_pending = false;   // (a trimmed one: each of its live parts takes its own, mirrors_trim)
+                r.retired_value = std::max(r.retired_value, mem_rec_value);   // (in use by this upload until it is done)
+                inherited++;
+            }
+            if (inherited) {
+                static int logged;
+                if (logged++ < 16)
+                    logf("vk: pool %#llx..%#llx: mirror made with the GPU's contents of %d retired pool(s)", (unsigned long long)p->lo,
+                         (unsigned long long)p->hi, inherited);
+            }
+        }
         {   // (then the pages a capture holds as they were at their submit: guest memory is the game's frame ahead)
             std::map<VkBuffer, std::vector<VkBufferCopy>> over;
             for (uint64_t page = p->lo >> kPageShift; page < (p->hi + 4095) >> kPageShift; page++) {
@@ -1590,6 +3625,7 @@ bool mirror_make(Pool& pool) {
             }
         }
         p->mstate = Pool::MIRROR_ON;
+        pools_gen.fetch_add(1, std::memory_order_relaxed);   // (the binding's buffer changes: guest memory, then this mirror)
         p->synced_gen = gen_now;
         p->synced_epoch = mirror_epoch;
         p->sync_seg = texture_segment();
@@ -1601,18 +3637,341 @@ bool mirror_make(Pool& pool) {
     return true;
 }
 
-void memory_end_submission(VkCommandBuffer cmd) {
+// ---- the write-back's diff (hookshot, 2026-11-09) ----
+// A mirrored pool's write-back copied every written run whole from the mirror to guest memory: ~69 MB a frame in Hyrule Field
+// (an i7-14700K and an RTX 5070 Ti), 4.4 ms of the GPU's ~13, at the end of the frame's last submission, which the pages of the
+// next capture wait for (the capture's write-back wait above). The runs are the written bindings' whole ranges: ~82% of what
+// they copied was zeros, and of the rest little changed from one frame to the next. Now a pool written back keeps a shadow in
+// VRAM, what guest memory holds there as far as it is known, page by page. A compute pass (shaders/wb_diff.comp) copies the
+// words of a run that differ from the shadow, into guest memory and the shadow both; a page the CPU wrote since (the captures'
+// pages and the replay's own words, shadow_written) is read from guest memory into the shadow first. Guest memory comes out as
+// with the whole copy, or, for words the GPU left as they were and the CPU wrote since, with the CPU's words, as on the console:
+// the pass only ever writes fewer words than the copy did. The pass takes ~0.7 ms there, the GPU's frame went from ~13.1 to
+// ~9.2 ms, and running there the game went from ~53.9 to ~57.9 fps with 4x frame interpolation (from ~55.2 to ~58.7 without).
+// (Word by word it was far slower than the copies: the GPU's writes to system memory went at ~1 GB/s; a subgroup's whole span
+// written at once goes at the copies' speed or better.)
+// RX_VK_WB_DIFF=0: the whole copies, as before. RX_VK_WB_SHADOW_MB: the shadows' VRAM at most (default 1/8 of it)
+// What it rests on: a shadow page it knows equals guest memory. So every CPU write of guest memory reaches shadow_written before
+// the next write-back reads the list: the captures' pages (capture_make), every page the collection finds (memory_collect_written:
+// all of the game's writes with RX_VK_CAPTURE=0), and the replay's own writes, through guest_cpu_write / guest_cpu_wrote: the
+// in-stream clears of the counters the game's conditions read, the copies, clears and updates done on the CPU, the textures
+// written back into their memory, WriteTexels, the report words (memory_cpu_owned). One the shadows never heard of left the
+// CPU's value in guest memory where the whole copy wrote the GPU's, whenever the GPU's result equalled the shadow's old word:
+// a counter cleared in the stream and counted to last frame's value again stayed cleared, and what it switched stayed off
+// (PR 1109's review). The 600-submit line counts the pages each kind of report made the shadows read again.
+// The GPU's own writes of guest memory past the mirror do the same: a written binding given the pool's guest buffer
+// (gpu_buffer_bind outside a recording's uploads), and a whole copy in place of the pass, forget the shadow's pages (shadow_forget).
+std::mutex shadow_written_mu;
+std::vector<uint32_t> shadow_written_pages;   // (guest pages the CPU wrote: unknown to the shadows at the next write-back)
+std::vector<uint32_t> shadow_written_collected_list;   // (the same, of the collection: memory_collect_written)
+std::vector<uint32_t> shadow_written_by_replay;   // (the same, of the replay's own CPU writes: guest_cpu_wrote)
+bool shadow_written_all = false;              // (more than those lists hold: every page unknown at the next write-back)
+int64_t st_wbd_known_game = 0, st_wbd_known_collected = 0, st_wbd_known_replay = 0;   // (pages the shadows knew when reported)
+struct DeadShadow {
+    VkBuffer buffer;
+    VmaAllocation alloc;
+    uint64_t value;
+};
+std::deque<DeadShadow> dead_shadows;
+uint64_t shadow_bytes = 0;
+int64_t st_wbd_runs = 0, st_wbd_bytes = 0, st_wbd_fill_pages = 0;
+bool wb_diff_on() {
+    // (MasterSword) ON by default — the write-back diff was worth ~20% fps in Hookshot's measurements. RX_VK_WB_DIFF=0: off.
+    // Upstream v2.0.9 left it off after issue 1161 (RTX 4090 + NVIDIA driver 0x9b438000 device-lost); if that hits, set RX_VK_WB_DIFF=0.
+    static const bool on = [] {
+        if (const char* e = getenv("RX_VK_WB_DIFF")) return atoi(e) != 0;
+        return true;
+    }();
+    return on;
+}
+void shadow_free(Pool& p) {   // (pools_mu held: destroyed once the submissions so far are done)
+    if (!p.shadow) return;
+    dead_shadows.push_back({p.shadow, p.shadow_alloc, std::max(mem_rec_value, p.last_value)});
+    shadow_bytes -= p.hi - p.lo;
+    p.shadow = VK_NULL_HANDLE, p.shadow_alloc = nullptr, p.shadow_address = 0;
+    p.shadow_known.clear();
+}
+void shadows_reap() {
+    while (!dead_shadows.empty() && dead_shadows.front().value <= mem_completed) {
+        destroy_buffer(dead_shadows.front().buffer, dead_shadows.front().alloc);
+        dead_shadows.pop_front();
+    }
+}
+// (hookshot) The shadows' two rules read what is really allocated (the driver's count less the free space inside VMA's blocks,
+// as the texture budget's 90% rule does: vram_pressure.h), not the count alone. By the count alone they went at 95% and
+// came back only under 85%. On a 12 GB card the texture cache fills VRAM to 93-98% of what the driver allows within minutes
+// of play, gigabytes of it free space inside the blocks that evicting cannot give back, so the shadows went (272-448 MB) and
+// never returned: the write-backs were whole copies again for the rest of the session. In a player's log (RTX 4070 SUPER,
+// 2560 x 1440, 10,462 of 10,732 MB used, 3.5 GB of it free inside the blocks) "the shadows given back" is where 58 fps
+// became 26. Here, on v2.0.11's code with 9.8 GB allowed, five minutes across Hyrule Field, two runs each: 56.6 and 58.8 fps
+// with 32 and 8 of 120 two-second windows under 55 fps before, 59.8 and 59.6 fps with 1 and 2 after; the GPU's frame
+// 11.7-12.0 -> 9.8-10.1 ms, the capture's wait in a frame 2.1-2.4 -> 1.1 ms. (The free space is of no use to the shadows
+// themselves, which are allocations of their own: they are made only under the textures' lines. vram_pressure.h)
+// RX_VK_SHADOW_RAW=1: by the count alone, as before
+bool shadow_rules_raw() {
+    static const bool v = getenv("RX_VK_SHADOW_RAW") != nullptr;
+    return v;
+}
+bool shadow_room(uint64_t n) {   // (the shadows' budget, and room in VRAM: the textures and the mirrors come first)
+    static const uint64_t cap = [] {
+        if (const char* e = getenv("RX_VK_WB_SHADOW_MB")) return (uint64_t)atoll(e) << 20;
+        uint64_t used = 0, allowed = 0;
+        return vram_usage(&used, &allowed) && allowed ? allowed / 8 : (uint64_t)512 << 20;   // (uint64_t: unsigned long on Linux)
+    }();
+    if (shadow_bytes + n > cap) return false;
+    uint64_t used = 0, allowed = 0, block_free = 0;
+    if (!vram_usage(&used, &allowed, &block_free) || !allowed) return true;
+    if (shadow_rules_raw()) return used + n <= allowed / 100 * 85;
+    return vram_pressure::shadow_fits(n, used, allowed, block_free);
+}
+bool shadow_make(Pool& p) {
+    const uint64_t n = p.hi - p.lo;
+    if (!p.mirror || !shadow_room(n)) return false;
+    if (!create_device_buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, p.shadow, p.shadow_alloc))
+        return false;
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = p.shadow;
+    p.shadow_address = vkGetBufferDeviceAddress(dev.device, &da);
+    p.shadow_known.assign((size_t)((n >> kPageShift) + 63) / 64, 0);
+    shadow_bytes += n;
+    static int logged;
+    if (logged++ < 16)
+        logf("vk: write-back diff: a shadow for pool %#llx (%llu MB; %llu MB of shadows)", (unsigned long long)p.lo,
+             (unsigned long long)(n >> 20), (unsigned long long)(shadow_bytes >> 20));
+    return true;
+}
+// (pools_mu held) every 120 write-back submissions: every shadow given back while VRAM is really 95% full, or the driver's count
+// at 99%, and the shadows of the pools that had one made again once there is room. A pool's own write-backs may each stay under
+// the 256 KB a shadow is first made at, for good after a scene change, so waiting for one never gave it its shadow back.
+void shadows_check_room() {
+    static int64_t n;
+    if (++n % 120) return;
+    bool wanted = false;
+    for (const auto& [lo, p] : imported) wanted = wanted || (p.shadow_wanted && !p.shadow && p.mirror);
+    if (!shadow_bytes && !wanted) return;
+    uint64_t used = 0, allowed = 0, block_free = 0;
+    if (!vram_usage(&used, &allowed, &block_free) || !allowed) return;
+    if (!(shadow_rules_raw() ? used > allowed / 100 * 95 : vram_pressure::shadows_go(used, allowed, block_free))) {
+        int made = 0, tries = 0;
+        uint64_t made_bytes = 0;
+        for (auto& [lo, p] : imported) {
+            if (!p.mirror || p.shadow || !p.shadow_wanted) continue;
+            const uint64_t n = p.hi - p.lo;
+            if (!shadow_room(n)) continue;
+            if (tries++ == 8) break;
+            if (shadow_make(p)) made++, made_bytes += n;
+        }
+        static int logged;
+        if (made && logged++ < 8)
+            logf("vk: write-back diff: %d shadows made again (%llu MB)", made, (unsigned long long)(made_bytes >> 20));
+        return;
+    }
+    if (!shadow_bytes) return;
+    const uint64_t had = shadow_bytes;
+    for (auto& [lo, p] : imported) shadow_free(p);
+    for (auto& nh : retired_pools) shadow_free(nh.mapped());
+    static int logged;
+    if (logged++ < 8)
+        logf("vk: write-back diff: VRAM %llu of %llu MB: the shadows given back (%llu MB)", (unsigned long long)(used >> 20),
+             (unsigned long long)(allowed >> 20), (unsigned long long)(had >> 20));
+}
+// (pools_mu held) a range of the pool (offsets) unknown to its shadow again
+void shadow_forget(Pool& p, uint64_t at, uint64_t len) {
+    if (!p.shadow || !len) return;
+    for (uint64_t pg = at >> kPageShift; pg <= (at + len - 1) >> kPageShift; pg++) p.shadow_known[pg >> 6] &= ~(1ull << (pg & 63));
+}
+// (pools_mu held) the pages written since: unknown to their pools' shadows
+void shadows_forget_written() {
+    static thread_local std::vector<uint32_t> game, collected, replay;
+    bool all;
+    {
+        std::lock_guard lk(shadow_written_mu);
+        game.clear(), collected.clear(), replay.clear();
+        game.swap(shadow_written_pages);
+        collected.swap(shadow_written_collected_list);
+        replay.swap(shadow_written_by_replay);
+        all = shadow_written_all, shadow_written_all = false;
+    }
+    if (all)   // (written for a long while with no write-back to read the list: nothing of guest memory is known)
+        for (auto& [lo, pool] : imported)
+            if (pool.shadow) std::fill(pool.shadow_known.begin(), pool.shadow_known.end(), 0ull);
+    if (!shadow_bytes) return;
+    // (in this order, each page counted under the first that reports it: the collection's and the replay's counts are what the
+    // captures alone would have left known)
+    for (int which = 0; which < 3; which++) {
+        std::vector<uint32_t>& pages = which == 0 ? game : which == 1 ? collected : replay;
+        int64_t& known = which == 0 ? st_wbd_known_game : which == 1 ? st_wbd_known_collected : st_wbd_known_replay;
+        if (pages.empty()) continue;
+        std::sort(pages.begin(), pages.end());
+        Pool* p = nullptr;
+        for (uint32_t pg : pages) {
+            const uint64_t a = (uint64_t)pg << kPageShift;
+            if (!p || a < p->lo || a >= p->hi) {
+                p = nullptr;
+                auto it = imported.upper_bound(a);
+                if (it == imported.begin()) continue;
+                --it;
+                if (a < it->second.hi) p = &it->second;
+                if (!p) continue;
+            }
+            if (!p->shadow) continue;
+            const uint64_t i = (a - p->lo) >> kPageShift;
+            uint64_t& bits = p->shadow_known[i >> 6];
+            if (bits & (1ull << (i & 63))) known++;
+            bits &= ~(1ull << (i & 63));
+        }
+    }
+}
+// (the pass's pipeline: 16 bytes of push constants and no descriptors, its buffers by address; made once)
+struct WbdPipe {
+    bool tried = false;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+} wbd_pipe;
+bool wbd_pipe_ready() {
+    if (wbd_pipe.tried) return wbd_pipe.pipe != VK_NULL_HANDLE;
+    wbd_pipe.tried = true;
+    // (the pass votes across a subgroup (shaders/wb_diff.comp): a GPU without votes in compute keeps the whole copies)
+    VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &sg;
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    if (!(sg.supportedOperations & VK_SUBGROUP_FEATURE_VOTE_BIT) || !(sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+        logf("vk: write-back diff off: the GPU has no subgroup votes in compute shaders");
+        return false;
+    }
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    li.pushConstantRangeCount = 1;
+    li.pPushConstantRanges = &pr;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(dev.device, &li, nullptr, &wbd_pipe.layout) == VK_SUCCESS) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof WB_DIFF_COMP_SPV;
+        mi.pCode = WB_DIFF_COMP_SPV;
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) == VK_SUCCESS) {
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = m;
+            ci.stage.pName = "main";
+            ci.layout = wbd_pipe.layout;
+            if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &wbd_pipe.pipe) != VK_SUCCESS)
+                wbd_pipe.pipe = VK_NULL_HANDLE;
+            vkDestroyShaderModule(dev.device, m, nullptr);
+        }
+    }
+    const bool ok = wbd_pipe.pipe != VK_NULL_HANDLE;
+    logf("vk: write-back diff %s", ok ? "on (RX_VK_WB_DIFF=0: off)" : "off: its pipeline was not made");
+    return ok;
+}
+void shadow_written_to(std::vector<uint32_t>& list, const uint32_t* pages, int64_t n) {
+    if (n <= 0 || !wb_diff_on()) return;
+    std::lock_guard lk(shadow_written_mu);
+    if (shadow_written_pages.size() + shadow_written_collected_list.size() + shadow_written_by_replay.size() > (8u << 20)) {
+        shadow_written_all = true;   // (no write-back has read them for a long while: all of them, then)
+        shadow_written_pages.clear(), shadow_written_collected_list.clear(), shadow_written_by_replay.clear();
+        return;
+    }
+    list.insert(list.end(), pages, pages + n);
+}
+void shadow_written(const uint32_t* pages, int64_t n) {
+    shadow_written_to(shadow_written_pages, pages, n);
+}
+void shadow_written_collected(const uint32_t* pages, int64_t n) {
+    shadow_written_to(shadow_written_collected_list, pages, n);
+}
+int guest_cpu_write(uint64_t gpu, const void* src, uint64_t n) {
+    const int ok = host->gpu_write(gpu, src, n);
+    guest_cpu_wrote(gpu, n);
+    return ok;
+}
+void guest_cpu_wrote(uint64_t gpu, uint64_t n) {
+    if (!n || !wb_diff_on()) return;
+    uint32_t pages[64];
+    int k = 0;
+    for (uint64_t a = gpu & ~4095ull; a < gpu + n; a += 4096) {   // (GPU pages are mapped to guest memory page by page)
+        const uint64_t g = host->gpu_guest(a);
+        if (!g) continue;
+        pages[k++] = (uint32_t)(g >> kPageShift);
+        if (k == 64) shadow_written_to(shadow_written_by_replay, pages, k), k = 0;
+    }
+    if (k) shadow_written_to(shadow_written_by_replay, pages, k);
+}
+// A run of a pool (offsets, in whole words) as the pass's chunks, in order: the words before its first 16-byte vector, the
+// vectors 64 KB at most at a time, the words after the last; emit(offset, bytes, vectors). (tests/test_wb_diff_split.py)
+template <class F> void wbd_split(uint64_t at, uint64_t size, F&& emit) {
+    const uint64_t end = at + size;
+    const uint64_t body = std::min<uint64_t>(end, (at + 15) & ~(uint64_t)15), body_end = std::max<uint64_t>(body, end & ~(uint64_t)15);
+    if (body > at) emit(at, body - at, false);
+    for (uint64_t a = body; a < body_end;) {
+        const uint64_t len = std::min<uint64_t>(body_end - a, 64u << 10);
+        emit(a, len, true);
+        a += len;
+    }
+    if (end > body_end) emit(body_end, end - body_end, false);
+}
+struct WbdChunk {   // (shaders/wb_diff.comp's Chunk)
+    uint64_t mirror, shadow, guest;
+    uint32_t count, vecs;   // (16-byte vectors when vecs is 1, else words)
+};
+// (the pass's tables, mapped, a ring: one is taken again once the submission that read it is done)
+struct WbdTable {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    uint8_t* map = nullptr;
+    VkDeviceAddress address = 0;
+    uint64_t bytes = 0, value = 0;
+};
+WbdTable wbd_tables[64];
+int wbd_table_next = 0;
+WbdTable* wbd_table_get(uint64_t bytes) {
+    WbdTable& t = wbd_tables[wbd_table_next];
+    if (t.value > mem_completed) return nullptr;   // (still read by a submission the GPU has not done)
+    if (t.bytes < bytes) {
+        if (t.buf) destroy_buffer(t.buf, t.alloc);
+        t = {};
+        const uint64_t n = std::max<uint64_t>(128u << 10, (bytes + 65535) & ~65535ull);
+        void* map = nullptr;
+        if (!create_buffer(n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, t.buf, t.alloc, &map) ||
+            !map) {
+            if (t.buf) destroy_buffer(t.buf, t.alloc);
+            t = {};
+            return nullptr;
+        }
+        VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        da.buffer = t.buf;
+        t.address = vkGetBufferDeviceAddress(dev.device, &da);
+        t.map = (uint8_t*)map;
+        t.bytes = n;
+    }
+    wbd_table_next = (wbd_table_next + 1) % 64;
+    t.value = mem_rec_value;
+    return &t;
+}
+
+void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
     std::lock_guard lk(pools_mu);
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
         static int64_t n, l_live, l_cap;
         if (++n % 600 == 0) {
+            wb_learn_report();
+            if (wb_skips_log()) wb_skips_report();
             static int64_t l_old;
             logf("vk: mirror syncs (600 submits): %lld dirty pages from their submits' captures, %lld from earlier ones', "
                  "%lld from guest memory as it was at the replay; %zu captures kept; %lld pages the GPU wrote copied over "
-                 "(%lld live)", (long long)(st_sync_cap_pages - l_cap), (long long)(st_sync_old_pages - l_old),
-                 (long long)(st_sync_live_pages - l_live), cap_bufs.size(), (long long)st_sync_gpu_pages,
-                 (long long)st_sync_gpu_live);
+                 "(%lld live); %lld kept for the GPU (RX_VK_PROTECT_BARE)", (long long)(st_sync_cap_pages - l_cap),
+                 (long long)(st_sync_old_pages - l_old), (long long)(st_sync_live_pages - l_live), cap_bufs.size(),
+                 (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
+            if (shadow_bytes || st_wbd_runs)
+                logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows; %llu MB of shadows; "
+                     "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself",
+                     (long long)st_wbd_runs, st_wbd_bytes / 1048576.0, (long long)st_wbd_fill_pages, (unsigned long long)(shadow_bytes >> 20),
+                     (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay);
+            st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
+            st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
             std::vector<std::pair<int64_t, uint64_t>> top;
             for (const auto& [lo, k] : live_by_pool) top.push_back({k, lo});
             std::sort(top.rbegin(), top.rend());
@@ -1642,13 +4001,19 @@ void memory_end_submission(VkCommandBuffer cmd) {
             for (size_t i = 0; i < dtop.size() && i < 8; i++) {
                 const auto it = imported.find(dtop[i].second);
                 char b[160];
-                snprintf(b, sizeof b, " %#llx (%llu MB, state %d): %lld;", (unsigned long long)dtop[i].second,
+                snprintf(b, sizeof b, " %#llx (%llu MB, state %d): %lld binds, %.0f MB;", (unsigned long long)dtop[i].second,
                          it != imported.end() ? (unsigned long long)((it->second.hi - it->second.lo) >> 20) : 0ull,
-                         direct_by_pool[dtop[i].second].second, (long long)dtop[i].first);
+                         direct_by_pool[dtop[i].second].second, (long long)dtop[i].first,
+                         direct_bytes_by_pool[dtop[i].second] / 1048576.0);
                 ds += b;
             }
-            if (!dtop.empty()) logf("vk:   bound in guest memory, by pool:%s", ds.c_str());
-            direct_by_pool.clear();
+            if (!dtop.empty()) {
+                double all = 0;
+                for (const auto& [lo, bytes] : direct_bytes_by_pool) all += (double)bytes;
+                logf("vk:   bound in guest memory, by pool (the GPU reads these over PCIe; binds and the bytes of their ranges over these 600 submits, "
+                     "%.1f MB in all, a range counted once a submit): %s", all / 1048576.0, ds.c_str());
+            }
+            direct_by_pool.clear(), direct_bytes_by_pool.clear();
         }
     }
     static const bool no_writeback = getenv("RX_VK_NO_WRITEBACK") != nullptr;   // (an experiment: none)
@@ -1658,8 +4023,19 @@ void memory_end_submission(VkCommandBuffer cmd) {
         std::sort(writebacks.begin(), writebacks.end(), [](const WriteBack& a, const WriteBack& b) {
             return a.pool != b.pool ? a.pool < b.pool : a.lo < b.lo;
         });
+        GprofSpan gp(cmd, "wb copies (mirror -> guest memory, with its two barriers)");   // (RX_VK_PASS_TIMING)
+        gp.items = 0;
         transfer_barrier(cmd);
         std::vector<VkBufferCopy> runs;
+        // (the write-back's diff: the runs of pools with a shadow, as chunks of 64 KB at most, for one pass after the loop)
+        const bool diff = wb_diff_on() && wbd_pipe_ready();
+        if (diff) shadows_forget_written(), shadows_reap(), shadows_check_room();
+        static thread_local std::vector<WbdChunk> chunks;
+        struct ChunkSrc { Pool* p; uint64_t at, len; };
+        static thread_local std::vector<ChunkSrc> chunk_src;   // (for the whole copy, when no table is free)
+        static thread_local std::vector<VkBufferCopy> fills, odd;
+        chunks.clear(), chunk_src.clear();
+        bool filled = false;
         for (size_t i = 0; i < writebacks.size();) {
             Pool* p = writebacks[i].pool;
             runs.clear();
@@ -1670,9 +4046,62 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 else
                     runs.push_back({w.lo, w.lo, w.hi - w.lo});
             }
+            cut_cpu_words(*p, runs);
+            if (runs.empty()) continue;
             checkpoint_mark(cmd, p->lo, 'b');
-            vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
-            for (const VkBufferCopy& r : runs) st_wb_bytes += (int64_t)r.size;
+            uint64_t run_bytes = 0;
+            for (const VkBufferCopy& r : runs) run_bytes += r.size;
+            if (diff && !p->shadow && run_bytes >= (256u << 10)) {
+                // (a pool whose write-back is worth one, as VRAM allows; wanted stays after VRAM takes it, for shadows_check_room)
+                p->shadow_wanted = true;
+                shadow_make(*p);
+            }
+            if (diff && p->shadow && p->address && p->mirror) {
+                VkBufferDeviceAddressInfo mda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                mda.buffer = p->mirror;
+                const VkDeviceAddress mirror_address = vkGetBufferDeviceAddress(dev.device, &mda);
+                // (a run not in whole words, as a copy of the game's may be: copied whole, its pages then unknown to the shadow)
+                odd.clear();
+                for (const VkBufferCopy& r : runs)
+                    if ((r.dstOffset | r.size) & 3) odd.push_back(r);
+                // the pages of the runs the shadow does not know: from guest memory, whole, first
+                fills.clear();
+                const uint64_t pool_n = p->hi - p->lo;
+                for (const VkBufferCopy& r : runs)
+                    for (uint64_t pg = r.dstOffset >> kPageShift; !((r.dstOffset | r.size) & 3) && pg <= (r.dstOffset + r.size - 1) >> kPageShift; pg++) {
+                        uint64_t& bits = p->shadow_known[pg >> 6];
+                        if (bits & (1ull << (pg & 63))) continue;
+                        bits |= 1ull << (pg & 63);
+                        const uint64_t at = pg << kPageShift, len = std::min<uint64_t>(4096, pool_n - at);
+                        if (!fills.empty() && fills.back().srcOffset + fills.back().size == at)
+                            fills.back().size += len;
+                        else
+                            fills.push_back({at, at, len});
+                        st_wbd_fill_pages++;
+                    }
+                if (!fills.empty()) {
+                    vkCmdCopyBuffer(cmd, p->buffer, p->shadow, (uint32_t)fills.size(), fills.data());
+                    filled = true;
+                }
+                if (!odd.empty()) {
+                    vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)odd.size(), odd.data());
+                    for (const VkBufferCopy& r : odd) shadow_forget(*p, r.dstOffset, r.size);
+                }
+                for (const VkBufferCopy& r : runs) {
+                    if ((r.dstOffset | r.size) & 3) continue;
+                    wbd_split(r.dstOffset, r.size, [&](uint64_t at, uint64_t len, bool vecs) {
+                        chunks.push_back({mirror_address + at, p->shadow_address + at, p->address + at,
+                                          (uint32_t)(len / (vecs ? 16 : 4)), vecs ? 1u : 0u});
+                        chunk_src.push_back({p, at, len});
+                    });
+                }
+                st_wbd_runs += (int64_t)runs.size(), st_wbd_bytes += (int64_t)run_bytes;
+            } else {
+                vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
+            }
+            for (const VkBufferCopy& r : runs) st_wb_bytes += (int64_t)r.size, gp.bytes += r.size;
+            gp.items += (int)runs.size();
+            for (const VkBufferCopy& r : runs) wb_pages_note(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size, mem_rec_value, part);   // (EvilBoyce)
             {   // (hookshot) RX_VK_LOG_WRITEBACK=1: the pools written back the most, every 600 write-back submissions
                 static const bool log_wb = getenv("RX_VK_LOG_WRITEBACK") != nullptr;
                 if (log_wb) {
@@ -1699,6 +4128,30 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 }
             }
         }
+        if (!chunks.empty()) {
+            WbdTable* t = wbd_table_get(chunks.size() * sizeof(WbdChunk));
+            if (!t) {   // (no table free: the whole copies, the shadows forgotten for those pages)
+                for (const ChunkSrc& c : chunk_src) {
+                    const VkBufferCopy r{c.at, c.at, c.len};
+                    vkCmdCopyBuffer(cmd, c.p->mirror, c.p->buffer, 1, &r);
+                    shadow_forget(*c.p, c.at, c.len);
+                }
+                static int logged;
+                if (logged++ < 8) logf("vk: write-back diff: no chunk table free (%zu chunks): this one copied whole", chunks.size());
+            }
+            if (filled) transfer_barrier(cmd);   // (the shadows' pages from guest memory before the pass reads them)
+            if (t) {
+                memcpy(t->map, chunks.data(), chunks.size() * sizeof(WbdChunk));
+                flush_mapped(t->alloc, chunks.size() * sizeof(WbdChunk));
+                GprofSpan gd(cmd, "wb diff (mirror -> guest memory where it differs from the shadow)");
+                gd.items = (int)chunks.size();
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wbd_pipe.pipe);
+                const struct { uint64_t table; uint32_t count, pad; } pc{t->address, (uint32_t)chunks.size(), 0};
+                vkCmdPushConstants(cmd, wbd_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+                const uint32_t n = (uint32_t)chunks.size();
+                vkCmdDispatch(cmd, std::min<uint32_t>(n, 65535u), (n + 65534u) / 65535u, 1);
+            }
+        }
         transfer_barrier(cmd);
         writebacks.clear();
     }
@@ -1714,4 +4167,3 @@ void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, in
     *wb_bytes = st_wb_bytes;
 }
 } // namespace mkwvk
-

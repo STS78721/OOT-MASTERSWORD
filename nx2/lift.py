@@ -1,5 +1,5 @@
 """The lift driver: image (we are rtld) -> function discovery -> C, on the vendored a64-kit plus the Switch 2
-additions (nso2: DT_RELR, insn: ARMv8.1-8.5 forms, lift_fixes: jump tables).
+additions (nso2: DT_RELR, insn: ARMv8.1-8.5 forms, lift_fixes: jump tables, suyu_rt_fixes: FPX1's binary32 FMA).
 
 Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-func N] [--layout eden|a64] [--aslr 0]
   --layout eden (default): Eglantine's addresses, rtld included, from 0x80000000 + --aslr (image.py; an emulator
@@ -15,6 +15,7 @@ Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-fu
 """
 import argparse
 import collections
+import glob
 import json
 import os
 import struct
@@ -28,6 +29,7 @@ import kit
 import nso2  # noqa: F401  (DT_RELR)
 import insn
 import lift_fixes
+import suyu_rt_fixes
 import chunks
 import standalone
 import adr_entries  # noqa: E402
@@ -41,6 +43,7 @@ import a64_rtgen
 
 insn.install()
 lift_fixes.install()
+suyu_rt_fixes.install()
 
 
 def module_of(img, pc):
@@ -110,6 +113,8 @@ def coverage(L, img, out_dir):
     return total
 
 
+
+
 def main():
     kit.wait_for_quiet('the lift')
     p = argparse.ArgumentParser()
@@ -155,6 +160,15 @@ def main():
         print("ADR / ADRP+ADD code addresses outside the %d unwind-covered functions: %d, %d of them new entries" % (
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
+    if a.standalone:   # (hookshot) widescreen and ultrawide: C after a few of the game's instructions
+        import oot_wide
+        oot_wide.install(L, img)
+        import oot_fov   # (the gameplay lens, before projection and culling are built)
+        oot_fov.install(L, img, next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), ""))
+        import oot_jitter   # (the temporal upscalers' camera jitter, DLSS's and FSR 3.1's: none unless one runs, host/rx_backend.c)
+        oot_jitter.install(L, img)
+        import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
+        oot_occlusion.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     total = coverage(L, img, img_dir)
@@ -171,9 +185,11 @@ def main():
         if not a.no_polls:
             poll.install()
         gen = os.path.join(out_dir, "gen")
-        files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone)
+        files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
+                             counters=[] if a.no_polls else [poll.stats])
         import oot_patches
-        oot_patches.apply(gen)
+        main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
+        chunks.edit_c(gen, L.stats, a.standalone and main_build == oot_patches.LIFE_BUILD_ID, whole=not a.max_func)
         a64_rtgen.write(gen)
         if a.standalone:
             start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)

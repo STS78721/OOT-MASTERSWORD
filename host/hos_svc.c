@@ -112,11 +112,7 @@ static void release_locked(uint64_t mutex) {
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
 #include <emmintrin.h>
 static int spin_for_release(uint64_t mutex, uint32_t held) {
-    static int64_t limit = -1;
-    if (limit < 0) {
-        const char *e = getenv("HOS_SPIN_US");
-        limit = (e ? atoll(e) : 20) * 1000;
-    }
+    const int64_t limit = hos_spin_ns();   /* (#2709) */
     static int misses[256], tries[256];
     const unsigned slot = (unsigned)(mutex >> 3 ^ mutex >> 11) & 255;
     const int m = __atomic_load_n(&misses[slot], __ATOMIC_RELAXED);
@@ -352,11 +348,17 @@ static HosThread *thread_handle(uint32_t h) { return h == CUR_THREAD ? hos_self(
 void a64_svc(Ctx *c, uint32_t imm) {
     hos_vcore_checkpoint();
     switch (imm) {
-    case 0x01:   /* SetHeapSize(-, size) -> (result, heap address) */
+    case 0x01: { /* SetHeapSize(-, size) -> (result, heap address) */
+        int hos_heap_size_fits(uint64_t size);   /* (hookshot, hos_mem.c: the heap stays in the guest window) */
+        if (!hos_heap_size_fits(c->x[1])) {
+            c->x[0] = 0xCA01;   /* svc::ResultOutOfMemory */
+            return;
+        }
         hos_heap_size = c->x[1];
         c->x[0] = R_OK;
         c->x[1] = HOS_HEAP_BASE;
         return;
+    }
     case 0x02:   /* SetMemoryPermission */
     case 0x03:   /* SetMemoryAttribute */
     case 0x16:   /* CloseHandle */
@@ -462,6 +464,10 @@ void a64_svc(Ctx *c, uint32_t imm) {
         c->x[0] = R_OK;
         return;
     case 0x2D:   /* UnmapPhysicalMemory(address, size): the pages read as zero if mapped again */
+        if (!hos_guest_range(c->x[0], c->x[1])) {   /* (hookshot: guest pages only) */
+            c->x[0] = 0xCA01;
+            return;
+        }
         {   /* (pages under a Vulkan import stay committed, zeroed: hos_mem.c FreeMemoryPages) */
             extern int rx_guest_imported(uint64_t lo, uint64_t hi);
             if (rx_guest_imported(c->x[0], c->x[0] + c->x[1])) memset(GP(c->x[0]), 0, (size_t)c->x[1]);

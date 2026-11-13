@@ -1,0 +1,48 @@
+#version 450
+// SMAA 1x luma edge detection (iryoku/smaa Medium). Writes edges.rg = (left, top) edge strengths.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D colorTex;
+layout(binding = 1, rgba8) uniform writeonly image2D edgesTex;
+layout(push_constant) uniform P {
+    vec4 metrics; // 1/w, 1/h, w, h
+    float threshold;
+    float unused0, unused1, unused2;
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(pc.metrics.zw);
+    if (any(greaterThanEqual(p, size))) return;
+
+    vec2 texcoord = (vec2(p) + 0.5) * pc.metrics.xy;
+    vec2 pixel = pc.metrics.xy;
+
+    float L = luma(textureLod(colorTex, texcoord, 0.0).rgb);
+    float Lleft = luma(textureLod(colorTex, texcoord + vec2(-pixel.x, 0.0), 0.0).rgb);
+    float Ltop = luma(textureLod(colorTex, texcoord + vec2(0.0, -pixel.y), 0.0).rgb);
+
+    vec4 delta;
+    delta.xy = abs(L - vec2(Lleft, Ltop));
+    vec2 edges = step(vec2(pc.threshold), delta.xy);
+    if (dot(edges, vec2(1.0)) == 0.0) {
+        imageStore(edgesTex, p, vec4(0.0));
+        return;
+    }
+
+    float Lright = luma(textureLod(colorTex, texcoord + vec2(pixel.x, 0.0), 0.0).rgb);
+    float Lbottom = luma(textureLod(colorTex, texcoord + vec2(0.0, pixel.y), 0.0).rgb);
+    delta.zw = abs(L - vec2(Lright, Lbottom));
+
+    vec2 maxDelta = max(delta.xy, delta.zw);
+    float Lleftleft = luma(textureLod(colorTex, texcoord + vec2(-2.0 * pixel.x, 0.0), 0.0).rgb);
+    float Ltoptop = luma(textureLod(colorTex, texcoord + vec2(0.0, -2.0 * pixel.y), 0.0).rgb);
+    delta.zw = abs(vec2(Lleft, Ltop) - vec2(Lleftleft, Ltoptop));
+    maxDelta = max(maxDelta.xy, delta.zw);
+    float finalDelta = max(maxDelta.x, maxDelta.y);
+
+    // Local contrast adaptation (SMAA_LOCAL_CONTRAST_ADAPTATION_FACTOR = 2)
+    edges.xy *= step(finalDelta, 2.0 * delta.xy);
+    imageStore(edgesTex, p, vec4(edges, 0.0, 0.0));
+}

@@ -28,7 +28,10 @@ struct NvnState {
     NVNbufferRange vbuf[16]{};
     nvn_p_set_rt rt{};
     uint64_t rt_serial = 0;      // bumped at each NOP_SET_RT (the draw path resolves the targets once per change)
-    uint64_t bind_gen = 0;       // bumped by every binding the descriptors read (program, buffers, handles, pools)
+    uint64_t bind_gen = 0;       // bumped when a binding the descriptors read changes (a rebind of the same values does not)
+    // (hookshot) what bind_gen was when a stage's textures, samplers or images (tex_gen) or its storage buffers (ssbo_gen) last changed: the
+    // driver banks c2 and c0 of a graphics stage are made from those alone, so a draw after another uniform buffer's bind keeps its banks
+    uint64_t tex_gen[kNvnStages] = {}, ssbo_gen[kNvnStages] = {};
     float viewport[16][4]{};
     float depth_near = 0.0f, depth_far = 1.0f;
     int32_t scissor[4]{0, 0, 0, 0};
@@ -56,11 +59,21 @@ const void* descriptor_ok(const void* p, size_t n);
 void texture_released(uint64_t serial);
 bool texture_of(int id, nvn_tex* t, nvn_view* v, bool* has_view);
 void cs_slot_counts(const NvnState& s, uint32_t* tex, uint32_t* img);   // (hookshot) the compute program's slot counts
+/// (hookshot) set while a seed compute program is translated: its control section, which the c0 layout is read from in place of
+/// the bound program's (vk_bank.cpp)
+extern thread_local const uint8_t* seed_cs_control;
 bool sampler_of(int id, nvn_samp_par* p);
 /// Changes whenever a texture slot may resolve to another texture (a registration, a texture finalized)
 uint64_t registrations_generation();
 /// Changes whenever the slot may resolve to another texture (its registrations, its texture finalized)
 uint32_t texture_slot_version(int id);
+/// (hookshot, RX_VK_SAMPLER_CACHE) Changes whenever the sampler id may resolve to other parameters (its registrations)
+uint32_t sampler_slot_version(int id);
+/// Changes on any sampler registration: descriptor reuse checks the samplers its last build resolved
+uint64_t sampler_registrations_generation();
+/// (hookshot) What every sampler is made from changed outside the registrations (the Anisotropic filtering row): moves that
+/// generation, so sampler_for's tables and the descriptors kept by reuse make theirs again
+void samplers_changed();
 
 /// One word of a driver constant bank (c0 / c2) as the NVN driver lays it out for the bound state
 uint32_t driver_bank_word(const NvnState& s, int bank, int stage, uint32_t offset);

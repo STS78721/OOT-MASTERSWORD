@@ -1,0 +1,38 @@
+#version 450
+// Hybrid MVec: prefer depth-reproject where confidence is high; else colour-flow. Dilate holes.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D flow;   // coarse RGBA16F (xy = pixel delta)
+layout(binding = 1) uniform sampler2D repro;  // full RGBA16F (xy + conf)
+layout(binding = 2, rg16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { int use_repro; float unused; } pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 sz = imageSize(dst);
+    if (any(greaterThanEqual(g, sz))) return;
+    const ivec2 fm = textureSize(flow, 0) - 1;
+    const vec2 flow_v = texelFetch(flow, clamp(g / 16, ivec2(0), fm), 0).xy;
+    vec2 out_v = flow_v;
+    if (pc.use_repro != 0) {
+        const ivec2 rm = textureSize(repro, 0) - 1;
+        float conf = texelFetch(repro, clamp(g, ivec2(0), rm), 0).z;
+        // Neighbour confidence: reject depth discontinuities / silhouette holes.
+        conf = min(conf, texelFetch(repro, clamp(g + ivec2(-1, 0), ivec2(0), rm), 0).z);
+        conf = min(conf, texelFetch(repro, clamp(g + ivec2(1, 0), ivec2(0), rm), 0).z);
+        conf = min(conf, texelFetch(repro, clamp(g + ivec2(0, -1), ivec2(0), rm), 0).z);
+        conf = min(conf, texelFetch(repro, clamp(g + ivec2(0, 1), ivec2(0), rm), 0).z);
+        if (conf > 0.5) {
+            out_v = texelFetch(repro, clamp(g, ivec2(0), rm), 0).xy;
+        } else {
+            // Dilate: take any high-confidence neighbour before falling back to flow.
+            vec2 fill = vec2(0.0);
+            float best = 0.0;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++) {
+                    const vec4 r = texelFetch(repro, clamp(g + ivec2(dx, dy), ivec2(0), rm), 0);
+                    if (r.z > best) best = r.z, fill = r.xy;
+                }
+            if (best > 0.5) out_v = fill;
+        }
+    }
+    imageStore(dst, g, vec4(out_v, 0.0, 0.0));
+}

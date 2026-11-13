@@ -104,6 +104,7 @@ struct Profile {
     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
+    bool has_broken_spirv_fragment_shuffle{};   // (Lichii #273: AMD's proprietary driver, fragment stages only)
     u32 max_subgroup_size{};
 
     u32 gl_max_compute_smem_size{};
@@ -113,6 +114,11 @@ struct Profile {
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
+
+    /// Mesh prologue zeroes map + attribute workgroup memory. Needed on AMD (leftover shared → shadow lines,
+    /// Hookshot #475 / ae4fb30); on NVIDIA it makes neon green/red foliage stems (9ba208d). Eglantine/Fritchii leave
+    /// those regions alone. Default set in make_profile(); RX_VK_MESH_ZERO / RX_VK_MESH_NO_ZERO override.
+    bool zero_mesh_stage_buffer{};
 
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;

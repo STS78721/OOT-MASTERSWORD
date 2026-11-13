@@ -23,6 +23,7 @@ OPCODE(EndPrimitive,                                        Void,           U32,
 // Barriers
 OPCODE(Barrier,                                             Void,                                                                                           )
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
+OPCODE(SubgroupBarrier,                                     Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
 
 // Context getters/setters
@@ -49,6 +50,7 @@ OPCODE(SetAttributeIndexed,                                 Void,           U32,
 OPCODE(GetPatch,                                            F32,            Patch,                                                                          )
 OPCODE(SetPatch,                                            Void,           Patch,          F32,                                                            )
 OPCODE(IsbeRead,                                            U32,            U32,                                                                            )
+OPCODE(IsbeReadOutput,                                      U32,            U32,                                                                            )
 OPCODE(IsbeWriteAttribute,                                  Void,           U32,            U32,                                                            )
 OPCODE(IsbeWriteMapU8,                                      Void,           U32,            U32,                                                            )
 OPCODE(IsbeWriteMapU32,                                     Void,           U32,            U32,                                                            )
@@ -365,6 +367,7 @@ OPCODE(GlobalAtomicAnd32,                                   U32,            U64,
 OPCODE(GlobalAtomicOr32,                                    U32,            U64,            U32,                                                            )
 OPCODE(GlobalAtomicXor32,                                   U32,            U64,            U32,                                                            )
 OPCODE(GlobalAtomicExchange32,                              U32,            U64,            U32,                                                            )
+OPCODE(GlobalAtomicCompareExchange32,                       U32,            U64,            U32,            U32,                                            )
 OPCODE(GlobalAtomicIAdd64,                                  U64,            U64,            U64,                                                            )
 OPCODE(GlobalAtomicSMin64,                                  U64,            U64,            U64,                                                            )
 OPCODE(GlobalAtomicUMin64,                                  U64,            U64,            U64,                                                            )
@@ -402,6 +405,7 @@ OPCODE(StorageAtomicAnd32,                                  U32,            U32,
 OPCODE(StorageAtomicOr32,                                   U32,            U32,            U32,            U32,                                            )
 OPCODE(StorageAtomicXor32,                                  U32,            U32,            U32,            U32,                                            )
 OPCODE(StorageAtomicExchange32,                             U32,            U32,            U32,            U32,                                            )
+OPCODE(StorageAtomicCompareExchange32,                      U32,            U32,            U32,            U32,            U32,                            )
 OPCODE(StorageAtomicIAdd64,                                 U64,            U32,            U32,            U64,                                            )
 OPCODE(StorageAtomicSMin64,                                 U64,            U32,            U32,            U64,                                            )
 OPCODE(StorageAtomicUMin64,                                 U64,            U32,            U32,            U64,                                            )
