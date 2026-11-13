@@ -26,22 +26,33 @@
 We aim for a **native, flagship PC experience**:
 - **Next-Gen Immersion** — DualSense support with tactile feedback, native mouse camera, live gameplay FOV (`50%–150%`), and selectable glyph layouts
 - **Modern presentation** — **NVIDIA DLSS Super Resolution & Multi Frame Generation (2x/3x/4x/6x)**, **AMD FSR 4 & FSR 3.1 FG (2x)**, **MasterSword frame generation up to 8x**, **Nodix SMFG and Apex FG up to 6x**, Mailbox by default, SMAA, colour grading, **5K2K (`5120×2160`) ultrawide**, **NVIDIA Reflex** (active even with Frame Generation)
-- **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, true >60 FPS physics/audio/clock accuracy, shipped zero-stutter pipeline precompilation, and native-resolution CPU/AVX2/VRAM optimizations
+- **Faithful Hyrule, sharper on PC** — foliage, terrain, reactive alpha masks, true >60 FPS physics/audio/clock accuracy, shipped zero-stutter pipeline precompilation, and native-resolution CPU/AVX2/VRAM optimizations, and P-core/E-core aware threading on hybrid CPUs
 - **Community workflow** — SteelTemple Sony/Nixxes-style launcher (safe 1080p out-of-the-box baseline, settings outside the game, 1-click auto-updates, save vault, mod manager)
 
 ---
 
-## 🎮 What's in 0.1.9b
+## 🎮 What's in 0.1.9c
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
 ### ✨ MasterSword identity
-* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.9b**
+* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.9c**
 * SteelTempSaint logo on the startup screen & safe 1080p vendor-neutral out-of-the-box defaults
 
-### 🚀 0.1.9b — Smoother area traversal
+### 🚀 0.1.9c — Smooth play on hybrid CPUs
+* **Intel Hybrid CPU Patch** (Insert / F1 menu → Graphics, **On (Recommended)** for 12th/13th/14th gen Core & Core Ultra) — the Switch 2 gives a game six identical cores. On Intel hybrid CPUs (12th gen+, Core Ultra) every game thread now runs on the **P-cores** and background work (shader builds) on the **E-cores**. On a Core Ultra 7 270K Plus frame pacing became far steadier and most graphical glitches went away.
+* **Parallel replay on by default** — each frame is recorded on several threads, the count picked from your CPU's fast cores (8 P-cores → 4 threads, under 6 → off).
+* **Renderer on its own P-core** — frame recording runs on a core kept free of the game's threads, then returns.
+* **~1.6 GB of VRAM back** — no more mostly-empty image reserve; fewer textures cleared and reloaded at 4K.
+* **Faster texture loads** — opaque textures made in their final format from the start; the 16–28 ms texture-load hitches are gone.
+* **Steadier area loads** — memory upkeep waits for the new area, render targets reused under pressure, big shadow-map checks on several threads, a draw builds its own pipeline at once.
+* **Fixed** — missing/torn geometry and dark lighting with parallel replay; long stalls when a draw waited for its pipeline.
+* **Tip** — Windows Game Bar (Win + G → Settings → General) → **Remember this is a game**: noticeably smoother in testing. The launcher shows how on the first PLAY.
+* Turn the patch off in the menu (applies after a restart); other parts in `hookshot_env.txt`: `RX_VK_PARALLEL=0`, `RX_VK_REPLAY_PIN=0`. Small hitches can still occur.
+
+### 🏹 From 0.1.9b (still here) — Smoother area traversal
 * **Area changes** — when the card is nearly full, cold textures are cleared before a large new texture is created, and texture reshuffling waits until the new area has finished streaming in.
 * **Old areas** — an import that is mostly unused after a scene change is cut down to the live part. The picture in the new area is kept.
 * **Smaller memory copies** — imports are 4 MB instead of 16 MB on cards that keep a video-memory mirror, so empty padding no longer counts as used memory.
@@ -56,7 +67,7 @@ We aim for a **native, flagship PC experience**:
 * **Streaming upload hitch** — a one-off GPU unswizzle no longer imports a whole pool on the replay thread (Deku Tree camera turns). Same pixels.
 * **Apex FG (Fast)** — recommended row; tighter motion search when that engine is on. The DLSS frame-gen model row appears only for DLSS MFG. Apex Super Resolution is not in this update.
 * **Left / Right stick speed** — Controls, default 100% (stock).
-* **Parallel replay stays off** unless `RX_VK_PARALLEL` is set.
+* **Parallel replay** — on by default since 0.1.9c (`RX_VK_PARALLEL=0`: off).
 
 ### 🏹 From 0.1.8 (still here)
 * **Hot/Cold Recompiled Code Split (`-O2`) & `.text` Call-Locality Packing** — isolates `728` hot lifted functions (`99.1%` of CPU execution) with inlined FP fast paths and orders `4,513` hot call-graph neighbours contiguously at the start of `.text`, slashing instruction-cache & iTLB misses
@@ -80,10 +91,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.9b)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.1.9c)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.9b-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9b/SteelTemple-MasterSword-0.1.9b-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.1.9c-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9c/SteelTemple-MasterSword-0.1.9c-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -103,11 +114,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.9b-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9b/SteelTemple-MasterSword-0.1.9b-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.9b`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.1.9c-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9c/SteelTemple-MasterSword-0.1.9c-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.9c`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9b/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9c/MasterSwordLauncher.exe)**
 
 ---
 

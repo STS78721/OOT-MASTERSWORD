@@ -1493,14 +1493,14 @@ const FastCores& fast_cores() {
     return f;
 }
 
-/// RX_VK_PARALLEL=<threads> (the replay thread one of them; 0 or 1: off, the default), or =auto: by the fast cores, keeping
-/// four of them for the game's main and frame threads, audio and the driver: 8 P-cores (a 270K Plus, a 9700X) -> 4 threads,
-/// 6-7 -> 2-3, 12+ -> 4 (more segments at once only took slots and submits: kMaxBatch), under 6 -> off
+/// RX_VK_PARALLEL=<threads> (the replay thread one of them; 0 or 1: off), or =auto, the default since 0.1.9c: by the fast cores,
+/// keeping four of them for the game's main and frame threads, audio and the driver: 8 P-cores (a 270K Plus, a 9700X) -> 4
+/// threads, 6-7 -> 2-3, 12+ -> 4 (more segments at once only took slots and submits: kMaxBatch), under 6 -> off
 int par_threads() {
     static const int n = [] {
         const char* e = getenv("RX_VK_PARALLEL");
         int v = 0;
-        if (e && (!strcmp(e, "auto") || !strcmp(e, "-1"))) {
+        if (!e || !*e || !strcmp(e, "auto") || !strcmp(e, "-1")) {
             const FastCores& f = fast_cores();
             v = f.n >= 6 ? std::clamp(f.n - 4, 2, 4) : 0;
             logf("vk: parallel replay auto: %d fast cores of %d (%s) -> %d threads", f.n, f.all,
@@ -1517,7 +1517,7 @@ int par_threads() {
 /// replay's; a draw that waits for its pipeline still builds it itself when it is queued (jobs_wait)
 void jobs_worker_placement() {
 #if defined(_WIN32)
-    static const bool any = getenv("RX_VK_JOBS_ANY_CORE") != nullptr;
+    static const bool any = getenv("RX_VK_JOBS_ANY_CORE") != nullptr || !opts.hybrid_cpu;   // (the menu's Intel Hybrid CPU Patch)
     DWORD_PTR proc = 0, sys = 0;
     GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
     const uint64_t fast = fast_cores().mask, slow = (uint64_t)proc & ~fast;
@@ -1544,7 +1544,7 @@ void par_worker_main() {
     // long, and the frame waits for the slowest segment. Windows' power throttling (EcoQoS) off for it, as the host does for the
     // frame's own threads
     {
-        static const bool any = getenv("RX_VK_PAR_ANY_CORE") != nullptr;
+        static const bool any = getenv("RX_VK_PAR_ANY_CORE") != nullptr || !opts.hybrid_cpu;   // (the menu's Intel Hybrid CPU Patch)
         const FastCores& f = fast_cores();
         // (not the replay's reserved core, which the replaying thread takes while it records: ReplayPin)
         const uint64_t reserved = host->reserved_cpus ? host->reserved_cpus() : 0;

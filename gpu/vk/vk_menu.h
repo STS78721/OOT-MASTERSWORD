@@ -18,6 +18,7 @@ struct Options {
     int fg_flow = 35;          // Nodix Flow scale 10–100 (motion strength for SMFG)
     int pace = 0;              // frames shown on an even line (vk_framegen.cpp)
     int ms_pacer = 0;          // Mastersword Pacer: off until the Insert row is turned on (host/nn_vi.c)
+    int hybrid_cpu = 1;        // (0.1.9c) Intel Hybrid CPU Patch: the game's threads on P-cores, background work on E-cores (host/hos_thread.c, read at start). Nothing on a CPU of one kind
     int vsync = 0;             // V-Sync: 0 Mailbox, 1 On (FIFO), 2 Off (immediate). The row cycles On, Mailbox, Off. RX_VK_FIFO / RX_VK_IMMEDIATE over it
     int fps_cap = 0;           // Game frame rate cap: 0 60 .. 5 240, 6 Uncapped (host/nn_vi.c frame_rate_cap=)
     int resolution = 0;        // the 3D's: 0 Auto (the game's dynamic resolution), else 100%, 75%, 67%, 50% of its full scale (nx2/oot_patches.py)

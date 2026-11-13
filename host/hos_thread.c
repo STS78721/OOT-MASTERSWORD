@@ -773,11 +773,16 @@ static uint64_t last_fastest_core(int *cores) {
 /* (0.1.9c) The cores of the fastest kind on a hybrid CPU (Intel's P-cores beside E-cores): their logical processors, or 0 on a
    CPU of one kind, with fewer than 4 of the fastest, or HOS_P_CORES=0. A Core Ultra 7 270K Plus: P-cores at logical processors
    0, 1, 10-13, 22 and 23, E-cores at 2-9 and 14-21. The calling thread's processor group, as the reserved core's choice */
+int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c: the Insert menu's mastersword_options.ini) */
 uint64_t hos_fast_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
     mask = 0;
-    if (getenv("HOS_P_CORES") && !atoi(getenv("HOS_P_CORES"))) return mask;
+    /* (the Insert / F1 menu's "Intel Hybrid CPU Patch", hybrid_cpu=, on unless 0; read once, at start. HOS_P_CORES over it) */
+    if (getenv("HOS_P_CORES") ? !atoi(getenv("HOS_P_CORES")) : !hos_ini_option("hybrid_cpu", 1)) {
+        hos_log("threads: Intel Hybrid CPU Patch off: the game's threads on any core");
+        return mask;
+    }
     GROUP_AFFINITY ga;
     const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
     DWORD len = 0;

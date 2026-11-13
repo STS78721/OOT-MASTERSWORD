@@ -82,6 +82,7 @@ const char* tx_nodix_quality(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_hybrid(int v) { return v ? "On (Recommended)" : "Off"; }   // (0.1.9c: Intel Hybrid CPU Patch)
 const char* tx_menu_theme(int v) {
     static const char* t[] = {"OOT Mastersword", "Light", "Dark"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
@@ -340,6 +341,11 @@ Row rows[] = {
      "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
     {TAB_GRAPHICS, "Mastersword Pacer (Experimental)", &opts.ms_pacer, 0, 1, 1, tx_onoff,
      "Experimental. Holds the game's own frames to an even beat. A frame more than 2 ms late starts a new beat, so the next one is not held for a full extra frame. Off uses the previous start-time cap."},
+    {TAB_GRAPHICS, "Intel Hybrid CPU Patch", &opts.hybrid_cpu, 0, 1, 1, tx_hybrid,
+     "Recommended for Intel hybrid CPUs: 12th, 13th and 14th gen Core and Core Ultra. Runs the game's threads on the "
+     "performance cores (P-cores) and background work such as shader building on the efficiency cores (E-cores), like the "
+     "Switch 2's six identical cores. Steadier frames and fewer glitches. No effect on CPUs with one kind of core (most AMD). "
+     "Applies after a restart."},
     {TAB_GRAPHICS, "V-Sync", &opts.vsync, 0, 2, 1, tx_vsync,
      "On waits for the display refresh (FIFO). Mailbox shows the latest finished frame on the next refresh, without tearing. "
      "Off presents immediately and can tear. Changes at once. RX_VK_FIFO / RX_VK_IMMEDIATE still choose for a run."},
@@ -566,6 +572,7 @@ const char* ini_key(const Row& r) {
     if (r.value == &opts.vsync) return "vsync";
     if (r.value == &opts.fps_cap) return "frame_rate_cap";  // host/nn_vi.c
     if (r.value == &opts.ms_pacer) return "ms_pacer";       // Mastersword Pacer, host/nn_vi.c
+    if (r.value == &opts.hybrid_cpu) return "hybrid_cpu";   // Intel Hybrid CPU Patch, host/hos_thread.c reads it at start
     if (r.value == &opts.mesh_mode) return "mesh_shaders";  // gpu/vk/vk_main.cpp reads at device create
     if (r.value == &opts.framegen_preset) return "fg_model"; // stable key (row renamed to DLSS FG preset)
     static char k[32];
@@ -1680,6 +1687,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
             r.value != &opts.mouse_invert && r.value != &opts.reflex &&
             r.value != &opts.fov && r.value != &opts.text_speed && r.value != &opts.pad_background &&
             r.value != &opts.ms_pacer &&
+            r.value != &opts.hybrid_cpu &&
             r.value != &opts.color_preset && r.value != &opts.color_brightness &&
             r.value != &opts.color_contrast && r.value != &opts.color_saturation &&
             r.value != &opts.color_gamma) {
@@ -2007,6 +2015,7 @@ void menu_tick() {
                     r.value != &opts.mouse_sens && r.value != &opts.stick_l_sens && r.value != &opts.stick_r_sens &&
                     r.value != &opts.mouse_invert &&
                     r.value != &opts.ms_pacer &&
+                    r.value != &opts.hybrid_cpu &&
                     r.value != &opts.color_preset && r.value != &opts.color_brightness &&
                     r.value != &opts.color_contrast && r.value != &opts.color_saturation &&
                     r.value != &opts.color_gamma) {   // (the controls / colour are not the quality preset's)
