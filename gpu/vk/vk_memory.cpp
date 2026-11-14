@@ -1707,10 +1707,14 @@ int capture_copy_helpers() {   // (copy_pages and copy_pairs share one pool of h
 /// Under 128 copies (512 KB) all on the calling thread: waking the helpers costs more than they save. Its own parts no
 /// helper has taken yet the caller runs itself once its first is done, rather than waiting behind what another caller
 /// queued before them (copy_pairs runs with pools_mu and shadow_mu held, copy_pages' guest copies can take milliseconds)
+/// (MasterSword Temper 2026-11-14) in up to 4 parts a thread, each of 64 copies at least: the game's thread (a P-core) did its
+/// fifth and then waited for the helpers (E-cores, slower): Mask of Truth in Town, the main thread's submit_q ~1.8 ms a frame,
+/// 37% of it copies and 8% this wait. With smaller parts the faster thread takes more of them. RX_VK_CAPTURE_PARTS=1: as before
 void copy_split(CopyPart whole, int64_t n) {
     const int helpers = capture_copy_helpers();
     if (!helpers || n < 128) { whole.i0 = 0, whole.i1 = n; return copy_part(whole); }
-    const int k = helpers + 1;
+    static const int per = getenv("RX_VK_CAPTURE_PARTS") ? std::clamp(atoi(getenv("RX_VK_CAPTURE_PARTS")), 1, 16) : 4;
+    const int k = (int)std::clamp<int64_t>(n / 64, helpers + 1, (int64_t)(helpers + 1) * per);
     int left = k - 1;
     auto part = [&](int i) {
         CopyPart w = whole;

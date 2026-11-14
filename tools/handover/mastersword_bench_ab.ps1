@@ -17,7 +17,7 @@ $i = $Start - 1
 foreach ($exe in $Order) {
     $i++
     $name = "{0}_{1}_{2}" -f $Tag, $i, $exe
-    $dll = if ($Dlls) { ($Dlls.Split(","))[$i - $Start] } else { "" }
+    $dll = if ($Dlls) { ($Dlls.Split(", ", [System.StringSplitOptions]::RemoveEmptyEntries))[$i - $Start] } else { "" }
     if ($dll) { $name = "{0}_{1}_{2}" -f $Tag, $i, $dll }
     & $bench -Game $Game -Exe $exe -Dll $dll -Name $name -Seconds $Seconds -Script $route -Sample $Sample
 }

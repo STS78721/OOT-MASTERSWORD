@@ -667,6 +667,14 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   (2779; 0.365 ms per 100 draws): old 22.16 ms (4 runs, stdev 0.12), first Forge 22.74 ms (+2.6%), **V1 21.71 ms (-2.0%,
   45.1 -> 46.1 fps)**; both V1 runs outside the old range. Clean (no faults). **Deployed to smoke** (mastersword.exe = V1,
   md5 9199f6c5; the old one stays as mastersword.exe.bak_pre_biggoron). bench_compare.py now also prints equal-draw means.
+- **Copy split (take_capture's copies, vk_memory.cpp copy_split): measured win, deployed.** The submit-time capture's copy is
+  split into up to 4 parts a thread (64 copies each at least; RX_VK_CAPTURE_PARTS=1: as before), so the game's thread (P-core)
+  takes more than the E-core helpers instead of waiting for them. Bench (V1 exe both sides, 2+2 runs alternated): 21.87 ->
+  21.50 ms a frame (-1.7%, 45.7 -> 46.5 fps), both copy-split runs below both base runs, no faults. Smoke mastersword_vk.dll =
+  f519b943 (backup mastersword_vk.dll.bak_pre_copysplit). Not changeable: capture_make's wait for the exposure meter's
+  write-back (11% of the main thread's submit time; the white-flash fix).
+- **Bench baseline now V1 + copy split** (exe_old.exe = V1, dll_base.dll = copy split; exe_preforge.exe = before the Forge).
+- nx2/build.py: RX_HOT_FLAGS="<flags>" adds compiler flags to the hot pieces only (in their object key), for -hot-cold-split.
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),

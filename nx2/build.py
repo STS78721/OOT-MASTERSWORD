@@ -670,6 +670,10 @@ def main():
         # new profile kept the hot code built from the old one)
         with open(PGO, "rb") as f:
             hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
+    # (MasterSword, 2026-11-14) RX_HOT_FLAGS="<flags>": more compiler flags for the hot pieces alone, in their object key (an
+    # experiment's build never takes another's objects), e.g. "-mllvm -hot-cold-split=true"
+    if os.environ.get("RX_HOT_FLAGS"):
+        hot_fl = hot_fl + os.environ["RX_HOT_FLAGS"].split()
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
              hot_fl if os.path.basename(s).startswith("code_hot") else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
