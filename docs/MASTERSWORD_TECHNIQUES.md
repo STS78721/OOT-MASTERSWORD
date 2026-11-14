@@ -232,6 +232,12 @@ from 34 to 43 ms on average, 290 ms worst). The lesson: background page pinning 
 
 ## 7. Method notes that made the difference
 
+- **The MasterSword Forge & Temper cycle (tick-tock).** Every new capability (Forge) is followed by a refinement pass on it
+  (Temper): measure what it costs and what it misses, then cut the overhead, widen the coverage or harden it, and say so
+  when there's nothing worth changing. Temper 1 found the memory census costing ~370 ms and ~90 MB every minute (now every
+  5 minutes and on demand, with half the RAM), and split Lens of Truth's misses so the next Temper can close them. A
+  feature isn't finished when it works; it's finished when it has been tempered.
+
 - **Log what you need to decide, then decide.** Each fix here started from a log line: per-frame slow-frame breakdowns
   (`RX_VK_SLOW_LOG=<ms>`), a per-NVN-op profiler, import timings, the memory census. Several "obvious" fixes (bigger
   import chunks, prefetching, async replay, a harder texture-pool trim) measured worse and were reverted. They're listed in

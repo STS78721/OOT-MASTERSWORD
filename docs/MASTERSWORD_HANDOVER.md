@@ -323,6 +323,20 @@ window closes (`slate_close` from `vk_main.cpp`):
 - To test: 2-3 sessions through the same areas; from the second on, area changes should show picture matches and fewer
   `made` modules in the census.
 
+### The MasterSword Forge & Temper cycle (the working process, from 2026-11-14)
+
+Intel's tick-tock, MasterSword's way. A **Forge** (tock) adds a capability; the next **Temper** (tick) refines what was just
+forged: less overhead, more coverage, more robustness. **Every Temper starts from the log's own measurements**, and says so
+when something costs too little to be worth touching. Each Temper is one commit titled `MasterSword Forge & Temper, Temper N`
+with the measurements in the message, and an entry here.
+
+| Temper | Measured | Changed |
+|---|---|---|
+| **1** (commit 19317f46) | Census 360-375 ms of a worker + ~90 MB every minute; Lens of Truth missed 45 of 128 imports; the Slate locked once per frame; the Mirror Shield's checks cheap | Census at 600 frames, then every 5 min (`RX_MEM_CENSUS`, default 18000 frames) and once after memory pressure (at most a minute apart), its page list sorted in place (~45 MB less). The Slate takes no lock on idle frames. Lens misses are now split into "gaps in the bitmap" vs "not committed yet", and the first 6 gaps are logged with the first missing block (`Lens of Truth gap N: ...`, `Lens of Truth misses: G gaps, R not committed yet`). Mirror Shield: no change |
+
+**Temper 2 (next):** close the Lens of Truth gaps the new lines show (a commit path that doesn't mark the bitmap), then look
+at what the Slate's pictures and Song of Time cost at start-up once there are 2-3 sessions of data.
+
 ---
 
 ## 5. Releases
