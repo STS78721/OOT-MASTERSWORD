@@ -4476,13 +4476,41 @@ void texture_frame(uint64_t completed) {
             ++it;
         }
         spare_staging_tend();
+        if (frame_no % 30 == 0) {   // (MasterSword: the PC's memory pressure, the multi-second stalls with an idle renderer)
+            static uint64_t last_faults = 0, last_frame = 0;
+            PROCESS_MEMORY_COUNTERS pc{};
+            pc.cb = sizeof pc;
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof ms;
+            if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof pc) && GlobalMemoryStatusEx(&ms)) {
+                const uint64_t faults = pc.PageFaultCount - last_faults;
+                const uint64_t avail = ms.ullAvailPhys >> 20;
+                // (soft faults run to tens of thousands a second in play; hundreds of thousands in half a second, or the PC's
+                // free RAM under 1.5 GB, is Windows trimming and paging the game's memory)
+                if (last_frame && (faults > 150000 || avail < 1536)) {
+                    static int told = 0;
+                    if (told++ < 40)
+                        logf("vk: memory pressure: %llu page faults in the last %llu frames, %llu MB of RAM free of %llu, working set %llu MB",
+                             (unsigned long long)faults, (unsigned long long)(frame_no - last_frame), (unsigned long long)avail,
+                             (unsigned long long)(ms.ullTotalPhys >> 20), (unsigned long long)(pc.WorkingSetSize >> 20));
+                }
+                last_faults = pc.PageFaultCount, last_frame = frame_no;
+            }
+        }
         if (frame_no % 600 == 0) {   // (the process's memory now and then: what the host side holds)
             PROCESS_MEMORY_COUNTERS_EX pm{};
             pm.cb = sizeof pm;
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof ms;
+            GlobalMemoryStatusEx(&ms);
             if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm))
-                logf("vk: memory: working set %llu MB (peak %llu), private %llu MB, staging %llu MB in %zu arenas",
+                logf("vk: memory: working set %llu MB (peak %llu), private %llu MB, staging %llu MB in %zu arenas; the PC: %llu MB "
+                     "RAM free of %llu, commit %llu of %llu MB, %llu page faults so far",
                      (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20),
-                     (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(kept >> 20), arenas.size());
+                     (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(kept >> 20), arenas.size(),
+                     (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
+                     (unsigned long long)((ms.ullTotalPageFile - ms.ullAvailPageFile) >> 20),
+                     (unsigned long long)(ms.ullTotalPageFile >> 20), (unsigned long long)pm.PageFaultCount);
 #if defined(__linux__) && defined(__GLIBC__)
             // (glibc's heap: what its arenas hold free. The shader translation and the loads' decoding leave their garbage spread through
             // the threads' arenas (26 of them, 1.2 GB resident in Kokiri Forest, the heap's growth in a scene change never going back),
