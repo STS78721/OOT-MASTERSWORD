@@ -334,8 +334,24 @@ with the measurements in the message, and an entry here.
 |---|---|---|
 | **1** (commit 19317f46) | Census 360-375 ms of a worker + ~90 MB every minute; Lens of Truth missed 45 of 128 imports; the Slate locked once per frame; the Mirror Shield's checks cheap | Census at 600 frames, then every 5 min (`RX_MEM_CENSUS`, default 18000 frames) and once after memory pressure (at most a minute apart), its page list sorted in place (~45 MB less). The Slate takes no lock on idle frames. Lens misses are now split into "gaps in the bitmap" vs "not committed yet", and the first 6 gaps are logged with the first missing block (`Lens of Truth gap N: ...`, `Lens of Truth misses: G gaps, R not committed yet`). Mirror Shield: no change |
 
-**Temper 2 (next):** close the Lens of Truth gaps the new lines show (a commit path that doesn't mark the bitmap), then look
-at what the Slate's pictures and Song of Time cost at start-up once there are 2-3 sessions of data.
+**Temper 2 (next):** Lens gaps: none to close (measured). The Slate: score only in-play uses, and add the driver
+fingerprint and Owl Statue awareness (research doc §5, step 1). Owl Statue: check its flush times and the slow-write lines.
+
+### Results 2026-11-14 11:08-11:20, the MasterSword Owl Statue, and the Slate research
+
+- **Lens of Truth confirmed:** imports averaged ~22 ms (41 before); on imports the bitmap answered, the Windows half is 0.0 ms.
+  Frames over 50 ms: 43 -> 5-13. Temper 1's split: **0 gaps** in the bitmap, all 32 misses were memory not yet committed,
+  so the Lens has no holes to close.
+- **Sheikah Slate finding:** it learned (`mastersword_slate.bin`, 234 KB), but **0 area pictures** in 12 area streams.
+  The start-up preparation builds nearly all pipelines (~26,600 in ~5 s), so play makes too few new builds for a picture.
+  The research document `docs/MASTERSWORD_SHEIKAH_SLATE_RESEARCH.md` lays out what it should see instead and how to add that
+  without breaking anything.
+- **MasterSword Owl Statue** (commit bc02db0a, **exe only**, `host/nn_fs.c`): the player saw a stop at every save. A save's
+  `nn::fs::FlushFile` called `FlushFileBuffers` on the game's thread. Now a duplicate handle goes to the Owl Statue thread
+  (E-cores, `THREAD_MODE_BACKGROUND_BEGIN`), which flushes and logs the time (`save: MasterSword Owl Statue: a save's
+  flush took N ms ...`). Drained at exit (5 s at most); a full queue (64) flushes in place. Slow save writes and renames
+  (>= 5 ms) are logged for the next Temper. Trade-off, told to the user: only a power cut or Windows crash within about a
+  second of a save could cost the newest save. `HOS_OWL_STATUE=0` restores the old behaviour. **Not yet play-tested.**
 
 ---
 

@@ -19,6 +19,7 @@ What came from where:
 | MasterSword Lens of Truth (a commit bitmap instead of VirtualQuery) | **MasterSword** (2026-11-14) |
 | Triforce upgrades: Wisdom adaptive, Song of Time, Mirror Shield | **MasterSword** (2026-11-14) |
 | MasterSword Sheikah Slate (the self-training memory, area pictures) | **MasterSword** (2026-11-14) |
+| MasterSword Owl Statue (a save's flush off the game's thread) | **MasterSword** (2026-11-14) |
 | Reserved core for the replay thread | Hookshot (upstream), restored in MasterSword |
 | X3D cache-CCD placement | Hookshot (upstream) |
 
@@ -229,6 +230,15 @@ creates it, before any draw asks. Lessons from the attempt that failed first:
 Status: **measured worse and switched off** (only 32 of ~380 chunks imported in time; the game's own imports slowed
 from 34 to 43 ms on average, 290 ms worst). The lesson: background page pinning competes with the foreground's. Code:
 `gpu/vk/vk_memory.cpp` (`memory_pool_created`, `bg_main`).
+
+## 6b. MasterSword Owl Statue: saving without stopping the journey
+
+A ported game's save usually ends in a flush to disk (`FlushFileBuffers` on Windows), which waits for the drive, on the game's
+own thread. The data is already in the OS file cache when the write returns, so the flush only protects against a power cut
+or an OS crash. The Owl Statue hands the flush (a duplicated handle) to its own thread, on the efficiency cores at background
+I/O priority, and lets the game continue. It drains on exit, falls back to flushing in place if its queue fills, and logs
+each flush's time. The trade-off is stated plainly to the player, with a switch to turn it off. For other ports: **durable
+I/O belongs on a background thread unless the game truly needs the data on disk before it continues.**
 
 ## 7. Method notes that made the difference
 
