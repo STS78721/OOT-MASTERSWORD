@@ -51,7 +51,8 @@ extern const char hos_main_build_id[];                 /* (gen/hos_image.c: main
    hos_thread.c) run only when the lifted main is Mario Kart World's: any other game has other code there */
 int hos_game_is_mkw(void);
 #define HOS_GAME_TITLE "MasterSword"
-void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
+uint64_t hos_used_memory(uint64_t base);   /* (hos_mem.c) base + heap + the game's mapped pages: the used memory it is told */
+int hos_commit(uint64_t addr, uint64_t size);          /* (mkw_glue.c) guest pages made usable by host APIs: 1, or 0 if refused */
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))

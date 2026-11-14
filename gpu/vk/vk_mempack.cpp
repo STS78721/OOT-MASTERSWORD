@@ -281,13 +281,23 @@ bool pack_read(uint64_t at, uint32_t words, std::vector<uint32_t>& out) {
 }
 
 // (Wisdom, adaptive: see hot_budget) every 300 frames from mempack_tick
+// Hysteresis prevents bouncing across 512/1024/2048 MB thresholds and evicting thousands of cached modules.
 void wisdom_adapt() {
     if (hot_budget_fixed() >= 0) return;
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     if (!GlobalMemoryStatusEx(&ms)) return;
     const uint64_t free_mb = ms.ullAvailPhys >> 20;
-    const uint64_t want = (free_mb > 8192 ? 2048ull : free_mb > 4096 ? 1024ull : free_mb > 2048 ? 512ull : 256ull) << 20;
+    const uint64_t cur_mb = hot_budget_auto.load(std::memory_order_relaxed) >> 20;
+    uint64_t want_mb = cur_mb ? cur_mb : 1024ull;
+    if (free_mb >= 10240) want_mb = 2048;
+    else if (free_mb >= 6144) want_mb = std::max<uint64_t>(want_mb, 1024);
+    else if (free_mb >= 5120) want_mb = 1024;
+    else if (free_mb >= 3072) want_mb = std::clamp<uint64_t>(want_mb, 512, 1024);
+    else if (free_mb >= 2560) want_mb = 512;
+    else if (free_mb >= 1536) want_mb = std::min<uint64_t>(want_mb, 512);
+    else want_mb = 256;
+    const uint64_t want = want_mb << 20;
     const uint64_t was = hot_budget_auto.exchange(want);
     if (want != was) {
         logf("vk: MasterSword Triforce, Wisdom: the hot cache's budget %llu -> %llu MB (%llu MB of RAM free)",
@@ -306,7 +316,8 @@ void triforce_release(uint64_t key) {
     hot_evict_locked();
 }
 
-bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder) {
+bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder, bool* busy) {
+    if (busy) *busy = false;
     si.module = st.module;
     if (st.module || !st.code_words) return st.module != VK_NULL_HANDLE;
     const uint64_t key = st.code_at;
@@ -330,7 +341,17 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
         ci.codeSize = holder.words.size() * 4;
         ci.pCode = holder.words.data();
         VkShaderModule m = VK_NULL_HANDLE;
-        if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) == VK_SUCCESS && m) {
+        VkResult r = VK_ERROR_UNKNOWN;
+        {
+            IntelDriverGate gate(busy != nullptr);   // (busy given: dispatch ask only tries the gate)
+            if (gate.busy) {
+                *busy = true;
+                std::vector<uint32_t>().swap(holder.words);
+                return false;
+            }
+            r = extern_guarded_shader_module(&ci, &m);
+        }
+        if (r == VK_SUCCESS && m) {
             {
                 std::lock_guard lk(hot_mu);
                 auto [it, fresh] = hot.try_emplace(key);
@@ -375,6 +396,351 @@ struct Picture {
     // shader codes of every program drawn then, in first-draw order: what a match makes ready)
     std::vector<uint64_t> head, all;
     uint64_t seen = 0;   // (the session counter when last taken or matched)
+};
+
+// ---- Slate 3 / Temper 3: ABI-safe per-area & per-program attribution side tables ----
+uint64_t picture_sig(const std::vector<uint64_t>& head) {
+    if (head.empty()) return 0;
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)head.size();
+    const size_t n = std::min<size_t>(24, head.size());
+    for (size_t i = 0; i < n; i++) {
+        h ^= head[i] + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    }
+    return h ? h : 1;
+}
+struct TemperProg {
+    uint64_t draws = 0, desc_rebuilds = 0, uniform_rebuilds = 0;
+};
+struct TemperArea {
+    uint64_t frames = 0, session_frames = 0;
+    uint64_t par_locks = 0, draws = 0, desc_rebuilds = 0, uniform_rebuilds = 0;
+    double sum_total_ms = 0, sum_submit_ms = 0, sum_host_ms = 0, sum_par_wait_ms = 0;
+    uint64_t s_draws = 0, s_desc = 0, s_ubo = 0, s_locks = 0;
+    double s_total_ms = 0, s_submit_ms = 0, s_host_ms = 0, s_wait_ms = 0;
+    std::unordered_map<uint64_t, TemperProg> progs;
+};
+enum { T3_MAX_SLOTS = 128, T3_SETS = 128, T3_WAYS = 2, T3_BUCKETS = T3_SETS * T3_WAYS };
+struct alignas(64) TemperBucket {
+    uint64_t key = 0;
+    uint32_t draws = 0, desc = 0, ubo = 0, _pad = 0;
+};
+struct alignas(64) TemperSlot {
+    TemperBucket b[T3_BUCKETS]{};
+};
+struct TemperSnap {
+    uint64_t key = 0;
+    uint32_t draws = 0, desc = 0, ubo = 0;
+};
+struct ShadeEntry {
+    int32_t threads = -1, seg = -1;
+    double base_ms = 0, best_ms = 0;
+    uint32_t flags = 0, reserved = 0;
+};
+struct ShadeCand {
+    int threads = -1, seg = -1;
+    std::vector<double> tot, sub;
+    int seen = 0;
+};
+struct ShadeProbe {
+    uint64_t area = 0;
+    int step = -1, settle = 0, idle = 0;
+    std::vector<ShadeCand> cands;
+};
+struct Temper3 {
+    std::mutex mu;
+    std::unordered_map<uint64_t, TemperArea> areas;
+    uint64_t active_area = 0;
+    std::vector<std::array<TemperSnap, T3_BUCKETS>> snaps;
+    std::unordered_map<uint64_t, ShadeEntry> shade_learned;
+    ShadeProbe shade_probe;
+};
+Temper3& t3_state() {
+    static Temper3 t;
+    return t;
+}
+TemperSlot t3_slots[T3_MAX_SLOTS + 1];
+std::atomic<int> t3_slot_count{0};
+inline thread_local TemperSlot* t3_my_slot = nullptr;   // (raw pointer: no TLS ctor/dtor)
+std::atomic<uint64_t> t3_active_sig{0};
+std::atomic<int> hs_def_threads{-1}, hs_def_seg{-1}, hs_active_threads{-1}, hs_active_seg{-1};
+
+bool heros_shade_on() {
+    static const bool on = getenv("RX_HEROS_SHADE") && atoi(getenv("RX_HEROS_SHADE")) != 0;
+    return on;
+}
+
+bool temper3_on() {
+    static const bool on = !getenv("RX_SLATE_TEMPER") || atoi(getenv("RX_SLATE_TEMPER")) != 0;
+    return on;
+}
+TemperSlot* t3_alloc_slot() {
+    const int idx = t3_slot_count.fetch_add(1, std::memory_order_acq_rel);
+    TemperSlot* const s = &t3_slots[idx < T3_MAX_SLOTS ? idx : T3_MAX_SLOTS];
+    t3_my_slot = s;
+    return s;
+}
+void t3_drain_slots_locked(uint64_t area_sig) {
+    Temper3& st = t3_state();
+    TemperArea& a = st.areas[area_sig];
+    const int n_raw = t3_slot_count.load(std::memory_order_acquire);
+    const int n = std::min(n_raw, (int)T3_MAX_SLOTS);
+    if ((int)st.snaps.size() < n) st.snaps.resize((size_t)n);
+    for (int si = 0; si < n; si++) {
+        TemperSlot& s = t3_slots[si];
+        auto& snap = st.snaps[(size_t)si];
+        for (int bi = 0; bi < T3_BUCKETS; bi++) {
+            const uint64_t k = std::atomic_ref<uint64_t>(s.b[bi].key).load(std::memory_order_relaxed);
+            if (!k || snap[(size_t)bi].key != k) continue;
+            const uint32_t d = std::atomic_ref<uint32_t>(s.b[bi].draws).load(std::memory_order_relaxed);
+            const uint32_t dd = std::atomic_ref<uint32_t>(s.b[bi].desc).load(std::memory_order_relaxed);
+            const uint32_t du = std::atomic_ref<uint32_t>(s.b[bi].ubo).load(std::memory_order_relaxed);
+            const uint32_t dd_diff = dd - snap[(size_t)bi].desc;
+            const uint32_t du_diff = du - snap[(size_t)bi].ubo;
+            const uint32_t d_diff = d - snap[(size_t)bi].draws;
+            if (d_diff || dd_diff || du_diff) {
+                TemperProg& tp = a.progs[k];
+                tp.draws += d_diff, tp.desc_rebuilds += dd_diff, tp.uniform_rebuilds += du_diff;
+                a.desc_rebuilds += dd_diff, a.uniform_rebuilds += du_diff;
+                a.s_desc += dd_diff, a.s_ubo += du_diff;
+                snap[(size_t)bi].draws = d, snap[(size_t)bi].desc = dd, snap[(size_t)bi].ubo = du;
+            }
+        }
+    }
+}
+void t3_set_area(uint64_t sig) {
+    Temper3& st = t3_state();
+    std::lock_guard lk(st.mu);
+    if (st.active_area != sig) {
+        t3_drain_slots_locked(st.active_area);
+        st.active_area = sig;
+        t3_active_sig.store(sig, std::memory_order_release);
+        if (heros_shade_on()) {
+            const auto it = st.shade_learned.find(sig);
+            if (it != st.shade_learned.end()) {
+                hs_active_threads.store(it->second.threads, std::memory_order_release);
+                hs_active_seg.store(it->second.seg, std::memory_order_release);
+            } else {
+                hs_active_threads.store(-1, std::memory_order_release);
+                hs_active_seg.store(-1, std::memory_order_release);
+            }
+            st.shade_probe = ShadeProbe{};
+        }
+    }
+}
+void t3_note_draw_impl(uint64_t prog_key, bool desc_rebuilt, bool uniform_only) {
+    if (!temper3_on() || !prog_key) return;
+    TemperSlot* s = t3_my_slot;
+    if (!s) s = t3_alloc_slot();
+    if (s != &t3_slots[T3_MAX_SLOTS]) {
+        const uint32_t set = (uint32_t)((prog_key * 0x9E3779B97F4A7C15ull) >> 57) & (T3_SETS - 1);
+        TemperBucket& b0 = s->b[set * T3_WAYS];
+        TemperBucket& b1 = s->b[set * T3_WAYS + 1];
+        const uint64_t k0 = std::atomic_ref<uint64_t>(b0.key).load(std::memory_order_relaxed);
+        if (k0 == prog_key) {
+            std::atomic_ref<uint32_t>(b0.draws).store(b0.draws + 1, std::memory_order_relaxed);
+            if (desc_rebuilt) std::atomic_ref<uint32_t>(b0.desc).store(b0.desc + 1, std::memory_order_relaxed);
+            if (uniform_only) std::atomic_ref<uint32_t>(b0.ubo).store(b0.ubo + 1, std::memory_order_relaxed);
+            return;
+        }
+        const uint64_t k1 = std::atomic_ref<uint64_t>(b1.key).load(std::memory_order_relaxed);
+        if (k1 == prog_key) {
+            std::atomic_ref<uint32_t>(b1.draws).store(b1.draws + 1, std::memory_order_relaxed);
+            if (desc_rebuilt) std::atomic_ref<uint32_t>(b1.desc).store(b1.desc + 1, std::memory_order_relaxed);
+            if (uniform_only) std::atomic_ref<uint32_t>(b1.ubo).store(b1.ubo + 1, std::memory_order_relaxed);
+            return;
+        }
+        Temper3& st = t3_state();
+        std::lock_guard lk(st.mu);
+        const int si = (int)(s - t3_slots);
+        if ((int)st.snaps.size() <= si) st.snaps.resize((size_t)si + 1);
+        const int bi = !k0 ? (int)(set * T3_WAYS)
+                           : (!k1 ? (int)(set * T3_WAYS + 1)
+                                  : (b0.draws <= b1.draws ? (int)(set * T3_WAYS) : (int)(set * T3_WAYS + 1)));
+        TemperBucket& victim = s->b[bi];
+        TemperSnap& sp = st.snaps[(size_t)si][(size_t)bi];
+        const uint64_t old_k = std::atomic_ref<uint64_t>(victim.key).load(std::memory_order_relaxed);
+        if (old_k) {
+            TemperArea& a = st.areas[st.active_area];
+            const uint32_t d_diff = victim.draws - sp.draws;
+            const uint32_t dd_diff = victim.desc - sp.desc;
+            const uint32_t du_diff = victim.ubo - sp.ubo;
+            if (d_diff || dd_diff || du_diff) {
+                TemperProg& tp = a.progs[old_k];
+                tp.draws += d_diff, tp.desc_rebuilds += dd_diff, tp.uniform_rebuilds += du_diff;
+                a.desc_rebuilds += dd_diff, a.uniform_rebuilds += du_diff;
+                a.s_desc += dd_diff, a.s_ubo += du_diff;
+            }
+        }
+        std::atomic_ref<uint64_t>(victim.key).store(prog_key, std::memory_order_relaxed);
+        std::atomic_ref<uint32_t>(victim.draws).store(1, std::memory_order_relaxed);
+        std::atomic_ref<uint32_t>(victim.desc).store(desc_rebuilt ? 1u : 0u, std::memory_order_relaxed);
+        std::atomic_ref<uint32_t>(victim.ubo).store(uniform_only ? 1u : 0u, std::memory_order_relaxed);
+        sp = {prog_key, 0, 0, 0};
+        return;
+    }
+    Temper3& st = t3_state();
+    std::lock_guard lk(st.mu);
+    TemperArea& a = st.areas[st.active_area];
+    TemperProg& tp = a.progs[prog_key];
+    tp.draws++;
+    if (desc_rebuilt) tp.desc_rebuilds++, a.desc_rebuilds++, a.s_desc++;
+    if (uniform_only) tp.uniform_rebuilds++, a.uniform_rebuilds++, a.s_ubo++;
+}
+void t3_record_frame(double total_ms, double submit_ms, int64_t par_locks_n, double par_wait_ms, int draws) {
+    if (!temper3_on() && !heros_shade_on()) return;
+    static const int log_env = [] { const char* e = getenv("RX_SLATE_TEMPER_LOG"); return e && *e ? atoi(e) : -1; }();
+    const int log_every = log_env == 0 ? 0 : (log_env == 1 ? 120 : (log_env > 1 ? log_env : 600));
+    const double t_ms = std::min(std::max(total_ms, 0.0), 500.0);
+    const double sub_ms = std::min(std::max(submit_ms, 0.0), t_ms);
+    const double host_ms = std::max(0.0, t_ms - sub_ms);
+    const double pw_ms = std::min(std::max(par_wait_ms, 0.0), 500.0);
+    std::string report, shade_report;
+    {
+        Temper3& st = t3_state();
+        std::lock_guard lk(st.mu);
+        TemperArea& a = st.areas[st.active_area];
+        a.frames++;
+        a.session_frames++;
+        a.par_locks += (uint64_t)std::max<int64_t>(0, par_locks_n);
+        a.draws += (uint64_t)std::max(0, draws);
+        a.sum_total_ms += t_ms;
+        a.sum_submit_ms += sub_ms;
+        a.sum_host_ms += host_ms;
+        a.sum_par_wait_ms += pw_ms;
+        a.s_locks += (uint64_t)std::max<int64_t>(0, par_locks_n);
+        a.s_draws += (uint64_t)std::max(0, draws);
+        a.s_total_ms += t_ms;
+        a.s_submit_ms += sub_ms;
+        a.s_host_ms += host_ms;
+        a.s_wait_ms += pw_ms;
+        if (temper3_on() && log_every > 0 && (a.session_frames % (uint64_t)log_every) == 0) {
+            t3_drain_slots_locked(st.active_area);
+            std::vector<std::pair<uint64_t, TemperProg>> top(a.progs.begin(), a.progs.end());
+            std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second.draws > y.second.draws; });
+            if (top.size() > 3) top.resize(3);
+            const double d = (double)a.session_frames;
+            char buf[640];
+            int n = snprintf(buf, sizeof buf,
+                             "vk: Slate 3 Temper 3 (area %016llx, %llu fr): total %.2f ms (submit %.2f ms, game/host %.2f ms), "
+                             "ParLock %.0f/%.2f ms, %.0f draws (%.0f desc, %.0f ubo)",
+                             (unsigned long long)st.active_area, (unsigned long long)a.session_frames,
+                             a.s_total_ms / d, a.s_submit_ms / d, a.s_host_ms / d,
+                             (double)a.s_locks / d, a.s_wait_ms / d, (double)a.s_draws / d,
+                             (double)a.s_desc / d, (double)a.s_ubo / d);
+            if (!top.empty()) {
+                n += snprintf(buf + n, sizeof buf - n, "; top:");
+                for (const auto& [k, p] : top)
+                    n += snprintf(buf + n, sizeof buf - n, " %016llx(%llu/%llud)", (unsigned long long)k,
+                                  (unsigned long long)p.draws, (unsigned long long)p.desc_rebuilds);
+            }
+            report.assign(buf);
+        }
+        if (heros_shade_on() && st.active_area != 0) {
+            const int def_t = hs_def_threads.load(std::memory_order_relaxed);
+            const int def_s = hs_def_seg.load(std::memory_order_relaxed);
+            static const int min_draws = [] {
+                const char* e = getenv("RX_HEROS_SHADE_MIN_DRAWS");
+                return e ? std::max(0, atoi(e)) : 48;
+            }();
+            if (def_t >= 2 && def_s >= 32 && !st.shade_learned.count(st.active_area) && a.session_frames >= 90) {
+                ShadeProbe& sp = st.shade_probe;
+                if (sp.area != st.active_area || sp.step < 0) {
+                    if (draws >= min_draws) {
+                        sp = ShadeProbe{};
+                        sp.area = st.active_area;
+                        sp.step = 0;
+                        const auto add_cand = [&](int t, int s) {
+                            for (const ShadeCand& c : sp.cands)
+                                if (c.threads == t && c.seg == s) return;
+                            sp.cands.push_back({t, s, {}, {}, 0});
+                        };
+                        add_cand(def_t, def_s);
+                        add_cand(def_t, 64);
+                        add_cand(def_t, 96);
+                        add_cand(def_t, 240);
+                        add_cand(std::max(2, def_t - 1), 96);
+                        add_cand(std::min(6, def_t + 1), 96);
+                        hs_active_threads.store(sp.cands[0].threads, std::memory_order_release);
+                        hs_active_seg.store(sp.cands[0].seg, std::memory_order_release);
+                    }
+                } else if (sp.step < (int)sp.cands.size()) {
+                    if (draws < min_draws) {
+                        if (++sp.idle >= 180) {
+                            hs_active_threads.store(def_t, std::memory_order_release);
+                            hs_active_seg.store(def_s, std::memory_order_release);
+                            sp.step = -1;
+                        }
+                    } else {
+                        ShadeCand& cur = sp.cands[(size_t)sp.step];
+                        if (sp.settle < 4) {
+                            sp.settle++;
+                        } else {
+                            cur.seen++;
+                            if (t_ms < 100.0) cur.tot.push_back(t_ms), cur.sub.push_back(sub_ms);
+                            if (cur.tot.size() >= 20 || cur.seen >= 32) {
+                                sp.step++;
+                                sp.settle = 0;
+                                sp.idle = 0;
+                                if (sp.step < (int)sp.cands.size()) {
+                                    hs_active_threads.store(sp.cands[(size_t)sp.step].threads, std::memory_order_release);
+                                    hs_active_seg.store(sp.cands[(size_t)sp.step].seg, std::memory_order_release);
+                                } else {
+                                    auto med_of = [](std::vector<double> v) {
+                                        if (v.empty()) return 1e9;
+                                        std::sort(v.begin(), v.end());
+                                        return v[v.size() / 2];
+                                    };
+                                    const double base_tot = sp.cands[0].tot.size() >= 8 ? med_of(sp.cands[0].tot) : 0.0;
+                                    const double base_sub = sp.cands[0].sub.size() >= 8 ? med_of(sp.cands[0].sub) : 0.0;
+                                    int best = 0;
+                                    double best_tot = base_tot, best_sub = base_sub;
+                                    if (base_tot > 0.0) {
+                                        for (int k = 1; k < (int)sp.cands.size(); k++) {
+                                            if (sp.cands[(size_t)k].tot.size() < 8) continue;
+                                            const double mt = med_of(sp.cands[(size_t)k].tot);
+                                            const double ms = med_of(sp.cands[(size_t)k].sub);
+                                            const bool gain = (mt <= base_tot * 0.98 && ms <= base_sub * 1.02) ||
+                                                              (ms <= base_sub * 0.95 && mt <= base_tot * 1.005);
+                                            if (gain && mt < best_tot) best = k, best_tot = mt, best_sub = ms;
+                                        }
+                                    }
+                                    const ShadeCand& win = sp.cands[(size_t)best];
+                                    ShadeEntry se{win.threads, win.seg, base_tot, best_tot, best ? 1u : 0u, 0u};
+                                    st.shade_learned[st.active_area] = se;
+                                    hs_active_threads.store(se.threads, std::memory_order_release);
+                                    hs_active_seg.store(se.seg, std::memory_order_release);
+                                    char sbuf[256];
+                                    snprintf(sbuf, sizeof sbuf,
+                                             "vk: MasterSword Hero's Shade (area %016llx): latched %s (threads %d, seg %d): "
+                                             "median %.2f -> %.2f ms (submit %.2f -> %.2f ms)",
+                                             (unsigned long long)st.active_area, best ? "winner" : "baseline",
+                                             se.threads, se.seg, base_tot, best_tot, base_sub, best_sub);
+                                    shade_report.assign(sbuf);
+                                    sp.step = -1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!report.empty()) logf("%s", report.c_str());
+    if (!shade_report.empty()) logf("%s", shade_report.c_str());
+}
+struct Tmp3AreaDisk {
+    uint64_t pic_sig, frames, par_locks, draws, desc_rebuilds, uniform_rebuilds;
+    double sum_total_ms, sum_submit_ms, sum_host_ms, sum_par_wait_ms;
+    uint32_t prog_count, reserved;
+};
+struct Tmp3ProgDisk {
+    uint64_t key, draws, desc_rebuilds, uniform_rebuilds;
+};
+struct TmpShdeDisk {
+    uint64_t pic_sig;
+    int32_t threads, seg;
+    double base_ms, best_ms;
+    uint32_t flags, reserved;
 };
 struct Slate {
     std::mutex mu;
@@ -439,7 +805,10 @@ void make_ready(std::vector<uint64_t> list, double fill, const char* why) {
             ci.codeSize = words.size() * 4;
             ci.pCode = words.data();
             VkShaderModule m = VK_NULL_HANDLE;
-            if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) != VK_SUCCESS || !m) continue;
+            {
+                IntelDriverGate gate;
+                if (extern_guarded_shader_module(&ci, &m) != VK_SUCCESS || !m) continue;
+            }
             std::lock_guard lk(hot_mu);
             auto [h, fresh] = hot.try_emplace(at);
             if (!fresh) {
@@ -480,6 +849,7 @@ void slate_note_draw(const Program& p, bool score, bool first_in_burst) {
         if (st.code_words && n < 8) ats[n++] = st.code_at;
     Slate& sl = slate();
     std::vector<uint64_t> replay;
+    uint64_t matched_sig = 0;
     {
         std::lock_guard lk(sl.mu);
         if (score) {
@@ -500,6 +870,7 @@ void slate_note_draw(const Program& p, bool score, bool first_in_burst) {
         if (best_i == SIZE_MAX || best < 12) return;
         Picture& pic = sl.pictures[best_i];
         pic.seen = sl.sessions;
+        matched_sig = picture_sig(pic.head);
         for (const uint64_t x : pic.all)
             if (!sl.taken_seen.count(x)) replay.push_back(x);
         sl.replays++;
@@ -508,6 +879,7 @@ void slate_note_draw(const Program& p, bool score, bool first_in_burst) {
             logf("vk: MasterSword Sheikah Slate: an area streams in; it matches a picture (%zu of its first 24 programs): %zu more "
                  "of its shaders made ready ahead", best, replay.size());
     }
+    if (matched_sig) t3_set_area(matched_sig);
     make_ready(std::move(replay), 1.0, "Sheikah Slate, an area's picture");
 }
 } // namespace
@@ -539,41 +911,46 @@ void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
     // (Temper 1: no lock on a frame with no burst and no picture being taken: nearly every frame)
     static std::atomic<bool> busy{false};
     if (!burst && !busy.load(std::memory_order_relaxed)) return;
-    std::lock_guard lk(sl.mu);
-    if (sl.taking && frame_no > sl.taking_until) {   // (the picture is taken)
-        sl.taking = false;
-        if (sl.taken_programs.size() >= 16) {
-            Picture pic;
-            pic.head.assign(sl.taken_programs.begin(), sl.taken_programs.begin() + std::min<size_t>(48, sl.taken_programs.size()));
-            pic.all = sl.taken;
-            pic.seen = sl.sessions;
-            size_t best = 0, best_i = SIZE_MAX;   // (the same area seen again: its picture is replaced)
-            for (size_t i = 0; i < sl.pictures.size(); i++) {
-                const size_t o = overlap(pic.head, sl.pictures[i].head);
-                if (o > best) best = o, best_i = i;
-            }
-            if (best_i != SIZE_MAX && best * 2 >= pic.head.size()) sl.pictures[best_i] = std::move(pic);
-            else {
-                if (sl.pictures.size() >= 64) {
-                    size_t old = 0;
-                    for (size_t i = 1; i < sl.pictures.size(); i++)
-                        if (sl.pictures[i].seen < sl.pictures[old].seen) old = i;
-                    sl.pictures.erase(sl.pictures.begin() + (ptrdiff_t)old);
+    uint64_t updated_sig = 0;
+    {
+        std::lock_guard lk(sl.mu);
+        if (sl.taking && frame_no > sl.taking_until) {   // (the picture is taken)
+            sl.taking = false;
+            if (sl.taken_programs.size() >= 16) {
+                Picture pic;
+                pic.head.assign(sl.taken_programs.begin(), sl.taken_programs.begin() + std::min<size_t>(48, sl.taken_programs.size()));
+                pic.all = sl.taken;
+                pic.seen = sl.sessions;
+                updated_sig = picture_sig(pic.head);
+                size_t best = 0, best_i = SIZE_MAX;   // (the same area seen again: its picture is replaced)
+                for (size_t i = 0; i < sl.pictures.size(); i++) {
+                    const size_t o = overlap(pic.head, sl.pictures[i].head);
+                    if (o > best) best = o, best_i = i;
                 }
-                sl.pictures.push_back(std::move(pic));
+                if (best_i != SIZE_MAX && best * 2 >= pic.head.size()) sl.pictures[best_i] = std::move(pic);
+                else {
+                    if (sl.pictures.size() >= 64) {
+                        size_t old = 0;
+                        for (size_t i = 1; i < sl.pictures.size(); i++)
+                            if (sl.pictures[i].seen < sl.pictures[old].seen) old = i;
+                        sl.pictures.erase(sl.pictures.begin() + (ptrdiff_t)old);
+                    }
+                    sl.pictures.push_back(std::move(pic));
+                }
+                sl.pictures_taken++;
             }
-            sl.pictures_taken++;
         }
+        if (burst && !sl.taking) {   // (an area streams in: a picture is begun)
+            sl.taking = true, sl.matched = false;
+            sl.taking_until = frame_no + 900;
+            sl.taken.clear(), sl.taken_programs.clear(), sl.taken_seen.clear();
+            sl.bursts++;
+            g_burst.fetch_add(1, std::memory_order_relaxed);
+        }
+        busy.store(sl.taking, std::memory_order_relaxed);
+        g_taking.store(sl.taking, std::memory_order_relaxed);
     }
-    if (burst && !sl.taking) {   // (an area streams in: a picture is begun)
-        sl.taking = true, sl.matched = false;
-        sl.taking_until = frame_no + 900;
-        sl.taken.clear(), sl.taken_programs.clear(), sl.taken_seen.clear();
-        sl.bursts++;
-        g_burst.fetch_add(1, std::memory_order_relaxed);
-    }
-    busy.store(sl.taking, std::memory_order_relaxed);
-    g_taking.store(sl.taking, std::memory_order_relaxed);
+    if (updated_sig) t3_set_area(updated_sig);
 }
 
 std::string slate_path() { return pack().dir + "mastersword_slate.bin"; }
@@ -614,6 +991,57 @@ void slate_save() {
         // (SLT2's optional sections, each a tag and a length: a reader skips the ones it doesn't know)
         const uint32_t fp_tag = 0x54525046u /* "FPRT" */, fp_len = (uint32_t)sl.fingerprint.size();
         put(&fp_tag, 4), put(&fp_len, 4), put(sl.fingerprint.data(), fp_len);
+    }
+    if (temper3_on()) {
+        Temper3& st = t3_state();
+        std::lock_guard tk(st.mu);
+        t3_drain_slots_locked(st.active_area);
+        std::vector<std::pair<uint64_t, const TemperArea*>> areas;
+        for (const auto& [sig, a] : st.areas)
+            if (a.frames) areas.push_back({sig, &a});
+        std::sort(areas.begin(), areas.end(), [](const auto& x, const auto& y) { return x.second->frames > y.second->frames; });
+        if (areas.size() > 64) areas.resize(64);
+        const uint32_t tag = 0x33504D54u /* "TMP3" */, ver = 1, n_areas = (uint32_t)areas.size();
+        uint32_t len_zero = 0;
+        put(&tag, 4);
+        const size_t len_at = out.size();
+        put(&len_zero, 4);
+        put(&ver, 4), put(&n_areas, 4);
+        for (const auto& [sig, ap] : areas) {
+            std::vector<std::pair<uint64_t, TemperProg>> top(ap->progs.begin(), ap->progs.end());
+            std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.second.draws > y.second.draws; });
+            if (top.size() > 16) top.resize(16);
+            Tmp3AreaDisk ad{sig, ap->frames, ap->par_locks, ap->draws, ap->desc_rebuilds, ap->uniform_rebuilds,
+                            ap->sum_total_ms, ap->sum_submit_ms, ap->sum_host_ms, ap->sum_par_wait_ms, (uint32_t)top.size(), 0};
+            put(&ad, sizeof ad);
+            for (const auto& [k, pr] : top) {
+                Tmp3ProgDisk pd{k, pr.draws, pr.desc_rebuilds, pr.uniform_rebuilds};
+                put(&pd, sizeof pd);
+            }
+        }
+        const uint32_t sec_len = (uint32_t)(out.size() - (len_at + 4));
+        std::memcpy(out.data() + len_at, &sec_len, 4);
+    }
+    {
+        Temper3& st = t3_state();
+        std::lock_guard tk(st.mu);
+        if (!st.shade_learned.empty()) {
+            const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 2;
+            const uint32_t count = (uint32_t)std::min<size_t>(st.shade_learned.size(), 64);
+            uint32_t len_zero = 0;
+            put(&tag, 4);
+            const size_t len_at = out.size();
+            put(&len_zero, 4);
+            put(&ver, 4), put(&count, 4);
+            uint32_t written = 0;
+            for (const auto& [sig, se] : st.shade_learned) {
+                if (written++ >= count) break;
+                TmpShdeDisk sd{sig, se.threads, se.seg, se.base_ms, se.best_ms, se.flags, se.reserved};
+                put(&sd, sizeof sd);
+            }
+            const uint32_t sec_len = (uint32_t)(out.size() - (len_at + 4));
+            std::memcpy(out.data() + len_at, &sec_len, 4);
+        }
     }
     const std::string path = slate_path(), tmp = path + ".tmp";
     const HANDLE f = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -681,9 +1109,67 @@ void slate_load() {
             std::erase_if(pic.all, [&](uint64_t a) { return !known(a); });
             if (head[1] == 2) sl.pictures.push_back(std::move(pic));
         }
-    // (SLT2's sections: the fingerprint; unknown tags skipped by their length)
+    // (SLT2's sections: the fingerprint, TMP3, SHDE; unknown tags skipped by their length)
+    size_t tmp3_off = 0, tmp3_len = 0, shde_off = 0, shde_len = 0;
     for (uint32_t tag = 0, len = 0; head[1] == 2 && take(&tag, 4) && take(&len, 4) && at + len <= in.size(); at += len) {
         if (tag == 0x54525046u /* "FPRT" */) sl.last_fingerprint.assign((const char*)in.data() + at, len);
+        else if (tag == 0x33504D54u /* "TMP3" */) tmp3_off = at, tmp3_len = len;
+        else if (tag == 0x45444853u /* "SHDE" */) shde_off = at, shde_len = len;
+    }
+    if (tmp3_len >= 8) {
+        size_t ta = tmp3_off;
+        const size_t tend = tmp3_off + tmp3_len;
+        auto take3 = [&](void* d, size_t sz) {
+            if (ta + sz > tend) return false;
+            std::memcpy(d, in.data() + ta, sz), ta += sz;
+            return true;
+        };
+        uint32_t ver = 0, n_areas = 0;
+        if (take3(&ver, 4) && ver == 1 && take3(&n_areas, 4)) {
+            if (n_areas > 64) n_areas = 64;
+            Temper3& st = t3_state();
+            std::lock_guard tk(st.mu);
+            for (uint32_t ai = 0; ai < n_areas; ai++) {
+                Tmp3AreaDisk ad{};
+                if (!take3(&ad, sizeof ad)) break;
+                TemperArea& a = st.areas[ad.pic_sig];
+                a.frames += ad.frames, a.par_locks += ad.par_locks, a.draws += ad.draws;
+                a.desc_rebuilds += ad.desc_rebuilds, a.uniform_rebuilds += ad.uniform_rebuilds;
+                a.sum_total_ms += ad.sum_total_ms, a.sum_submit_ms += ad.sum_submit_ms;
+                a.sum_host_ms += ad.sum_host_ms, a.sum_par_wait_ms += ad.sum_par_wait_ms;
+                const uint32_t np_c = std::min<uint32_t>(ad.prog_count, 64);
+                for (uint32_t pi = 0; pi < np_c; pi++) {
+                    Tmp3ProgDisk pd{};
+                    if (!take3(&pd, sizeof pd)) break;
+                    TemperProg& tp = a.progs[pd.key];
+                    tp.draws += pd.draws, tp.desc_rebuilds += pd.desc_rebuilds, tp.uniform_rebuilds += pd.uniform_rebuilds;
+                }
+            }
+        }
+    }
+    if (shde_len >= 8) {
+        size_t sa = shde_off;
+        const size_t send = shde_off + shde_len;
+        auto takes = [&](void* d, size_t sz) {
+            if (sa + sz > send) return false;
+            std::memcpy(d, in.data() + sa, sz), sa += sz;
+            return true;
+        };
+        uint32_t ver = 0, count = 0;
+        if (takes(&ver, 4)) {
+            if (ver == 2 && takes(&count, 4)) {
+                if (count > 64) count = 64;
+                Temper3& st = t3_state();
+                std::lock_guard tk(st.mu);
+                for (uint32_t i = 0; i < count; i++) {
+                    TmpShdeDisk sd{};
+                    if (!takes(&sd, sizeof sd)) break;
+                    st.shade_learned[sd.pic_sig] = {sd.threads, sd.seg, sd.base_ms, sd.best_ms, sd.flags, sd.reserved};
+                }
+            } else if (ver != 2) {
+                logf("vk: MasterSword Hero's Shade: ignoring v%u table (re-learning with Step 3 timings)", (unsigned)ver);
+            }
+        }
     }
     sl.sessions = sessions + 1;
     if (budget && hot_budget_fixed() < 0) hot_budget_auto.store(budget);
@@ -713,6 +1199,25 @@ void song_of_time_play() {
 
 void slate_frame(uint64_t frame_no, uint64_t textures_made) { slate_frame_locked_free(frame_no, textures_made); }
 void slate_close() { slate_save(); }   // (vk_main.cpp, as the window closes)
+void temper3_note_draw(uint64_t prog_key, bool desc_rebuilt, bool uniform_only) { t3_note_draw_impl(prog_key, desc_rebuilt, uniform_only); }
+void temper3_frame(double total_ms, double submit_ms, int64_t par_locks_n, double par_wait_ms, int draws) {
+    t3_record_frame(total_ms, submit_ms, par_locks_n, par_wait_ms, draws);
+}
+void heros_shade_tune(int default_threads, int default_seg, int* out_threads, int* out_seg) {
+    if (!heros_shade_on()) {
+        *out_threads = default_threads;
+        *out_seg = default_seg;
+        return;
+    }
+    if (hs_def_threads.load(std::memory_order_relaxed) != default_threads)
+        hs_def_threads.store(default_threads, std::memory_order_relaxed);
+    if (hs_def_seg.load(std::memory_order_relaxed) != default_seg)
+        hs_def_seg.store(default_seg, std::memory_order_relaxed);
+    const int t = hs_active_threads.load(std::memory_order_acquire);
+    const int s = hs_active_seg.load(std::memory_order_acquire);
+    *out_threads = t >= 0 ? std::clamp(t, 0, default_threads) : default_threads;
+    *out_seg = s >= 32 ? s : default_seg;
+}
 
 // Courage: the pack read ahead of need. At start, a thread at background priority (its disk reads and the pages they bring in
 // both lowest: Windows takes those pages first) reads the pack front to back in 8 MB reads, so the first build of a shader in

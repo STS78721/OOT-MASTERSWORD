@@ -3,6 +3,7 @@
 // At the default values nothing is recorded and the present is what it was. Design and preset values: STS78721's
 // colour profiles (TOTK / DKB vivid OLED).
 #include "vk_color.h"
+#include "vk_draw.h"   // (extern_guarded_shader_module, extern_guarded_compute)
 #include "vk_menu.h"
 #include "shaders/color_grade_comp_spv.h"
 
@@ -55,12 +56,16 @@ bool init() {
     mi.codeSize = sizeof COLOR_GRADE_COMP_SPV;
     mi.pCode = COLOR_GRADE_COMP_SPV;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
-                nullptr};
-    ci.layout = C.layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &C.pipe);
+    VkResult r;
+    {
+        IntelDriverGate gate;
+        if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
+                    nullptr};
+        ci.layout = C.layout;
+        r = extern_guarded_compute(VK_NULL_HANDLE, &ci, &C.pipe);
+    }
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (r != VK_SUCCESS) {
         logf("vk: colour adjustment off: its pipeline could not be created");

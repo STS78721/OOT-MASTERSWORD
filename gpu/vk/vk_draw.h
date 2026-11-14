@@ -77,6 +77,7 @@ bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* li
 void draw_skip_report(double frames);   // (hookshot) skips by the line that made them
 int64_t draw_desc_reused();
 int64_t draw_desc_uniform_only();   // (hookshot: draws that built uniform ranges alone, desc_rest_stands)
+int64_t draw_desc_mru_hits();       // (Slate 3 Step 3: interleaved uniform_only draws satisfied from per-recording MRU)
 /// (RX_VK_DESC_SLOTGEN) Of those, the reuses the global registrations' generation check would have rebuilt for
 int64_t draw_slotgen_saves();
 /// RX_VK_FLASH_RECORD=<key>,...: the last frames' draws of those programs, written to the log for frames around a flash
@@ -103,6 +104,14 @@ void pipeline_cache_play();   // (the start-up done: what play makes goes into p
 /// recording's stream (mapped at base), or UINT64_MAX when none overlaps
 uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc);
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
+/// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
+
+/// (longshot) vkCreate* that a driver's compiler can fault inside. A fault leaves that one out (result -77) instead of
+/// ending the process. On Windows, Intel's compiler is entered by one thread (IntelDriverGate). The calls themselves
+/// live in vk_draw.cpp's unnamed namespace; these are the ones the other files link to.
+VkResult extern_guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl);
+VkResult extern_guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl);
+VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m);
 
 } // namespace mkwvk

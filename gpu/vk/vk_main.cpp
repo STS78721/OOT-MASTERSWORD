@@ -65,7 +65,14 @@ namespace mkwvk {
 
 std::vector<std::string> gpu_device_names;
 const MkwVkHost* host;
-int64_t prof_ns[PROF_COUNT];
+ProfSlot prof_slots[PROF_MAX_SLOTS + 1];
+std::atomic<int> prof_slot_count{0};
+ProfSlot* prof_alloc_slot() {
+    const int idx = prof_slot_count.fetch_add(1, std::memory_order_acq_rel);
+    ProfSlot* const s = &prof_slots[idx < PROF_MAX_SLOTS ? idx : PROF_MAX_SLOTS];
+    prof_my_slot = s;
+    return s;
+}
 Device dev;
 PFN_vkGetInstanceProcAddr instance_proc() { return vkx::instance_proc_addr(); }
 
@@ -268,6 +275,7 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);
     dlss_device_extensions(want, exts);
     dlss_fg_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS Frame Generation's through NGX, asked of NGX)
     reflex_device_extensions(want, exts);    // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
@@ -445,9 +453,32 @@ bool create_device() {
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
     if (dev.mesh_fallback) logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
     bool task_mesh_fallback = false;
+    const auto task_mesh_fallback_default = [](uint32_t vendor, uint32_t device) -> bool {
+        if (vendor != 0x1002) return false;
+        switch (device) {
+        case 0x73a1:   // Navi 21: Radeon Pro V620
+        case 0x73a2:   // Navi 21: Radeon Pro W6900X
+        case 0x73a3:   // Navi 21: Radeon Pro W6800
+        case 0x73ab:   // Navi 21: Radeon Pro W6800X, W6800X Duo
+        case 0x73ae:   // Navi 21: Radeon Pro V620 MxGPU
+        case 0x73bf:   // Navi 21: RX 6800, 6800 XT, 6900 XT
+        case 0x73af:   // Navi 21: RX 6900 XT (XTXH boards)
+        case 0x73a5:   // Navi 21: RX 6950 XT
+        case 0x73df:   // Navi 22: RX 6700, 6700 XT, 6750 XT, 6750 GRE 12GB, 6700M, 6800M, 6850M XT
+        case 0x73e0:   // Navi 23: RX 6600M
+        case 0x73e1:   // Navi 23: Radeon Pro W6600M
+        case 0x73e3:   // Navi 23: Radeon Pro W6600
+        case 0x73ef:   // Navi 23: RX 6650 XT, 6650M, 6650M XT, 6700S, 6800S
+        case 0x73ff:   // Navi 23: RX 6600, 6600 XT, 6600 LE, 6600M, 6600S
+            return true;
+        default:
+            return false;
+        }
+    };
 #ifdef _WIN32
-    // Navi 22 can time out on task + mesh draws in the AMD Windows driver (issue 996).
-    task_mesh_fallback = dev.props.vendorID == 0x1002 && dev.props.deviceID == 0x73df;
+    // (https://github.com/NotRexed/Hookshot/issues/996) AMD's RDNA 2 cards, Navi 21 to 23, can time out on task + mesh draws
+    // in the Windows driver
+    task_mesh_fallback = task_mesh_fallback_default(dev.props.vendorID, dev.props.deviceID);
 #endif
     if (mesh_mode == 1) task_mesh_fallback = false;   // Native: the card's own mesh shaders for every draw
     if (const char* e = getenv("RX_VK_TASK_MESH_FALLBACK")) task_mesh_fallback = atoi(e) != 0;
@@ -494,6 +525,36 @@ bool create_device() {
 }
 
 } // namespace
+
+/// The UNORM format of an sRGB one (the same bytes, read and written as they are), else the format itself
+VkFormat unorm_of(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return f;
+    }
+}
+void swap_views_drop() {
+    for (auto view : dev.swap_views)
+        if (view) vkDestroyImageView(dev.device, view, nullptr);
+    dev.swap_views.clear();
+}
+void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
+    swap_views_drop();
+    dev.swap_views.assign(dev.swap_images.size(), VK_NULL_HANDLE);
+    dev.swap_view_format = format;
+    if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return;
+    for (size_t i = 0; i < dev.swap_images.size(); i++) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = dev.swap_images[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(dev.device, &vi, nullptr, &dev.swap_views[i]) != VK_SUCCESS)
+            dev.swap_views[i] = VK_NULL_HANDLE;
+    }
+}
 
 int swapchain_framegen() { return opts_fg_on() ? std::min(opts.framegen, 8) : 0; }
 bool swapchain_dlssg() { return swapchain_framegen() >= 2 && dlss_fg_runs(); }
@@ -561,6 +622,9 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    // Dear ImGui renders overlays directly into the swapchain image via dynamic rendering when the surface permits it.
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+        ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
@@ -579,6 +643,18 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = dev.swapchain;
     reflex_swapchain_info(ci);
+    // An sRGB swapchain (some drivers list no UNORM format) made mutable when the driver can: Dear ImGui draws through
+    // UNORM views, their colours as they are, as on a UNORM swapchain. Without it, vk_imgui.cpp makes them linear.
+    const VkFormat view_formats[2] = {fmt.format, unorm_of(fmt.format)};
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    const bool mutable_view = dev.swap_mutable && view_formats[1] != fmt.format && (ci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (mutable_view) {
+        ci.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+        format_list.viewFormatCount = 2;
+        format_list.pViewFormats = view_formats;
+        format_list.pNext = ci.pNext;
+        ci.pNext = &format_list;
+    }
     VkSwapchainKHR sc;
     result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
     if (result != VK_SUCCESS) {
@@ -603,6 +679,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     if (dev.swapchain) {
         device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
         reflex_swapchain_destroyed();
+        swap_views_drop();
         for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
         vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
         dev.swap_spare = 0;
@@ -615,6 +692,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr);
     dev.swap_images.resize(n);
     vkGetSwapchainImagesKHR(dev.device, sc, &n, dev.swap_images.data());
+    swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     dev.swap_spare = n > caps.minImageCount ? n - caps.minImageCount : 0;
     logf("vk: swapchain %ux%u, %u images (%u spare), %s (V-Sync %s)", width, height, n,
          dev.swap_spare.load(std::memory_order_relaxed),
@@ -676,6 +754,7 @@ void prepare_with_screen() {
             predict_run(prep_progress);
         }
         if (!prepare_stopped()) {
+            if (update) state_list_run();   // (the shipped list's pipelines, as a start with no screen makes them)
             prep_done.store(0), prep_total.store(0);
             prep_stage.store(2);
             precompile_run(prep_progress);
@@ -721,7 +800,22 @@ void prepare_with_screen() {
                 last_w = w, last_h = h;
             }
             if (w && h) present_image(nullptr, dev.swap_extent.width, dev.swap_extent.height, nullptr);
-            if (finished || paint_stop.load()) break;
+            if (finished || paint_stop.load()) {
+                if (finished && !prepare_stopped()) {
+                    const auto f0 = clock::now();
+                    for (;;) {
+                        const double f = std::chrono::duration<double>(clock::now() - f0).count() / 0.4;
+                        startup_fade_to((float)std::min(f, 1.0));
+                        uint32_t fw, fh;
+                        window_size(&fw, &fh);
+                        if (fw && fh) present_image(nullptr, dev.swap_extent.width, dev.swap_extent.height, nullptr);
+                        if (f >= 1.0 || paint_stop.load()) break;
+                        Sleep(8);
+                    }
+                    startup_fade_to(0);
+                }
+                break;
+            }
             Sleep(33);
         }
         SetEvent(painted);

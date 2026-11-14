@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "vk_paths.h"
@@ -22,9 +23,14 @@
 #include "upscaler_rows.h"
 #include "vk_menu.h"
 #include "vk_menu_hit.h"
+#include "vk_menu_keys.h"
+#include "menu_restart.h"
 #include "menu_theme.h"
+#include "vk_imgui.h"
+#include "vk_ui.h"
 #include "vk_reflex.h"
-#include "vk_startup_paint.h"
+#include "vk_progress.h"
+#include "vk_draw.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -51,7 +57,9 @@ struct Row {
     int* value;
     int lo, hi, step;
     const char* (*text)(int v);
-    const char* help;   // (shown under the list while the row is selected)
+    const char* help;   // (shown in the help panel while the row is selected)
+    bool preset_exempt = false;
+    bool restart = false;
 };
 const char* tx_fg_backend(int v) {
     static const char* t[] = {"Off", "MasterSword", "SMFG 1.3 (Nodix)", "DLSS MFG", "FSR 3.1 FG", "XeSS MFG",
@@ -84,9 +92,14 @@ const char* tx_nodix_quality(int v) {
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_hybrid(int v) { return v ? "On (Recommended)" : "Off"; }   // (0.1.9c: Intel Hybrid CPU Patch)
 const char* tx_menu_theme(int v) {
-    static const char* t[] = {"OOT Mastersword", "Light", "Dark"};
+    static const char* t[] = {"OOT Mastersword", "Light", "Dark", "Longshot"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
+}
+const char* tx_ui_size(int v) {
+    static const char* t[] = {"Small", "Medium", "Large"};
+    if (v < 1 || v > 3) return t[1];
+    return t[v - 1];
 }
 const char* tx_reflex(int v) {
     static const char* t[] = {"Off", "On", "Boost"};
@@ -212,7 +225,7 @@ const char* tx_resolution(int v) {
     return b;
 }
 const char* tx_output_res(int v) {
-    static const char* t[] = {"1920x1080 (restart)", "2560x1440 (restart)", "3840x2160 (restart)"};
+    static const char* t[] = {"1920x1080", "2560x1440", "3840x2160"};
     return t[std::min(std::max(v, 0), 2)];
 }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
@@ -222,27 +235,23 @@ const char* tx_text_speed(int v) {
     return t[v];
 }
 const char* tx_fov(int v) { return v == 100 ? "100% (original)" : tx_percent(v); }
-const char* tx_handheld(int v) { return v ? "On (restart)" : "Off (restart)"; }
-const char* tx_ultrawide(int v) { return v ? "Monitor's shape (restart)" : "16:9 (restart)"; }
-int gpu_device_at_start = 0;   // (the row's value the game started with: menu_set_gpu_count)
+const char* tx_handheld(int v) { return v ? "On" : "Off"; }
+const char* tx_ultrawide(int v) { return v ? "Monitor's shape" : "16:9"; }
 const char* tx_gpu(int v) {
     static char buf[300];
     const int idx = v - 1;
     if (v <= 0) snprintf(buf, sizeof buf, "Auto");
     else if (idx < (int)gpu_device_names.size()) snprintf(buf, sizeof buf, "%d: %s", idx, gpu_device_names[idx].c_str());
     else snprintf(buf, sizeof buf, "%d: Device %d", idx, idx);
-    // (a GPU other than the one in use: it takes a restart, said where the choice is, as Handheld and Ultrawide say it.
-    // The whole name shows: the selected row slides through it, see marquee_pos)
-    if (v != gpu_device_at_start) strncat(buf, " (restart)", sizeof buf - strlen(buf) - 1);
     return buf;
 }
 const char* tx_pad_layout(int v);
 const char* tx_robust(int v) {
-    static const char* t[] = {"Auto (restart)", "Off (restart)", "On (restart)"};
+    static const char* t[] = {"Auto", "Off", "On"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
 const char* tx_mesh_mode(int v) {
-    static const char* t[] = {"Automatic (restart)", "Native (restart)", "Compute (restart)"};
+    static const char* t[] = {"Automatic", "Native", "Compute"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
 const char* tx_vsync(int v) {
@@ -317,15 +326,20 @@ void apply_preset(int p) {
 
 Row rows[] = {
     // Graphics
-    {TAB_GRAPHICS, "Menu theme", &opts.menu_theme, 0, 2, 1, tx_menu_theme,
+    {TAB_GRAPHICS, "Menu theme", &opts.menu_theme, 0, 3, 1, tx_menu_theme,
      "OOT Mastersword: Lost Woods greens with Master Sword blue and gold. Light: Switch settings grey and cyan. "
-     "Dark: black panels with red accents."},
+     "Dark: near-black panels with crimson accents. Longshot: warm bronze, parchment, and gold.",
+     true, false},
+    {TAB_GRAPHICS, "Menu size", &opts.menu_size, 1, 3, 1, tx_ui_size,
+     "Size of the Insert menu and start-up screen (Small, Medium, or Large). Separate from the FPS overlay size.",
+     true, false},
     {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
      "Automatically configures resolution, upscaling, frame generation, and dynamic VRAM limits tailored to your GPU tier."},
     {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "Borderless fullscreen at the monitor size; cursor auto-hides. Same as F11. Starts from this setting."},
     {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
-     "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart."},
+     "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart.",
+     true, true},
     {TAB_GRAPHICS, "FG engine", &opts.fg_backend, 0, 6, 1, tx_fg_backend,
      "MasterSword = Hookshot native FG only when chosen. DLSS MFG / Nodix SMFG / FSR / XeSS / Apex FG (Fast) are "
      "separate engine rows (interpolator stand-in until vendor FG evaluates). The multiplier you pick is the one that is made. Off disables FG. "
@@ -345,7 +359,8 @@ Row rows[] = {
      "Recommended for Intel hybrid CPUs: 12th, 13th and 14th gen Core and Core Ultra. Runs the game's threads on the "
      "performance cores (P-cores) and background work such as shader building on the efficiency cores (E-cores), like the "
      "Switch 2's six identical cores. Steadier frames and fewer glitches. No effect on CPUs with one kind of core (most AMD). "
-     "Applies after a restart."},
+     "Applies after a restart.",
+     true, true},
     {TAB_GRAPHICS, "V-Sync", &opts.vsync, 0, 2, 1, tx_vsync,
      "On waits for the display refresh (FIFO). Mailbox shows the latest finished frame on the next refresh, without tearing. "
      "Off presents immediately and can tear. Changes at once. RX_VK_FIFO / RX_VK_IMMEDIATE still choose for a run."},
@@ -355,7 +370,8 @@ Row rows[] = {
      "Internal 3D size as a percent of Output resolution (like a PC title). Auto lets the game lower it when the GPU is busy. "
      "With XeSS/FSR/Nodix selected, their quality row sets this live (e.g. FSR Quality = 67% of 1440p/4K)."},
     {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, 2, 1, tx_output_res,
-     "The size the game draws at. 1080p, 1440p, or 4K. Applies after a restart. Match monitor overrides this."},
+     "The size the game draws at. 1080p, 1440p, or 4K. Applies after a restart. Match monitor overrides this.",
+     false, true},
     {TAB_GRAPHICS, "Match monitor", &opts.match_monitor, 0, 1, 1, tx_onoff,
      "Draws at this screen's size. Each side is rounded down to a multiple of 8, so a 1366x768 screen becomes 1360x768. "
      "Applies after a restart. Off uses Output resolution."},
@@ -381,27 +397,35 @@ Row rows[] = {
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "Sharpens the picture as it goes to the window, with or without an upscaling filter. Too much shows halos around edges."},
     {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
-     "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
+     "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart.",
+     false, true},
     {TAB_GRAPHICS, "Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
-     "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart."},
+     "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart.",
+     false, true},
     {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
      "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; "
-     "Off can be faster on some NVIDIA cards. Applies after restart."},
+     "Off can be faster on some NVIDIA cards. Applies after restart.",
+     false, true},
     {TAB_GRAPHICS, "Mesh shaders", &opts.mesh_mode, 0, 2, 1, tx_mesh_mode,
      "How the game's mesh programs (much of the scenery) run: on the GPU's own mesh shaders, or as compute shaders, which "
-     "every GPU has. Automatic is the old behaviour. Applies after a restart."},
+     "every GPU has. Automatic is the old behaviour. Applies after a restart.",
+     false, true},
     {TAB_GRAPHICS, "Quit to Desktop", nullptr, 0, 0, 0, nullptr,
      "Saves options and closes MasterSword. Enter or the bottom face button quits."},
 
     // Gameplay
     {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
      "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate."},
+    {TAB_GAMEPLAY, "Overlay size", &opts.overlay_size, 1, 3, 1, tx_ui_size,
+     "Size of the in-game FPS overlay (Small, Medium, or Large). Separate from the Insert menu size.",
+     true, false},
     {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed,
      "Per frame: the game slows down whenever it runs below 60 fps. Real time: it keeps normal speed down to 15 fps by taking "
      "longer steps."},
     {TAB_GAMEPLAY, "Game frame rate cap", &opts.fps_cap, 0, 6, 1, tx_fps_cap,
      "Caps the game's own frames (not made ones). Uncapped: as fast as the PC can, still at real time; with V-Sync on, the display's "
-     "refresh rate is the limit. Applies after a restart."},
+     "refresh rate is the limit. Applies after a restart.",
+     false, true},
     {TAB_GAMEPLAY, "Field of view", &opts.fov, 50, 150, 5, tx_fov,
      "How much of the world you see: 100% is the original view. Higher is wider, lower is closer. Changes apply at once "
      "during gameplay. Cutscenes keep their own view."},
@@ -450,7 +474,6 @@ Row rows[] = {
      "Which gamepad button and which keys press each of the Switch's buttons."},
 };
 constexpr int kRows = sizeof rows / sizeof rows[0];
-constexpr int kMenuWidth = menu_hit::kWidth;   // (at a scale of 1: 720 lines; wider for FG engine / Nodix labels)
 
 int cur_tab = TAB_GRAPHICS;
 int tab_selected[TAB_COUNT] = {0, 0, 0, 0};
@@ -514,15 +537,6 @@ int tab_row_count(int t) {
         if (rows[i].tab == (MenuTab)t && row_visible(rows[i])) c++;
     return c;
 }
-/// The most rows a tab has: the menu keeps that height whichever tab is shown
-int max_tab_rows() {
-    int most = 0;
-    for (int t = 0; t < TAB_COUNT; t++) most = std::max(most, tab_row_count(t));
-    // Graphics can grow when FG/upscale sub-rows appear; keep room for the dense case.
-    most = std::max(most, 16);
-    return most;
-}
-
 int tab_row_to_global(int t, int local_idx) {
     int count = 0;
     for (int i = 0; i < kRows; i++) {
@@ -540,18 +554,79 @@ void clamp_tab_selection(int t) {
     else if (tab_selected[t] >= n) tab_selected[t] = n - 1;
 }
 
+// Menu and overlay sizes use opts.menu_size / opts.overlay_size (1 Small, 2 Medium, 3 Large) via ui::unit.
+constexpr int kControlsSlot = TAB_COUNT;
 std::atomic<bool> open_now{false};
 bool menu_refresh = false;
-// (hookshot/#946) mouse hit state while the Insert menu is open
+int page = 0;            // 0 options, 1 Controls bindings page, 5 Restart Needed dialog
+int csel = 0, ccol = 0;  // Controls row (kControls = Reset) and column (menu_hit::CtlColumn)
+int listening = 0;       // waiting for new input: 1 gamepad, 2 keyboard
+bool listen_armed = false;
+int64_t listen_end = 0;
+
+// ---- (longshot/tock) mouse hit-test, smooth scroll, gamepad prompt dot, restart tracking ----
+menu_hit::Map hits;
 int hover_tab = -1;
-int row_value_l[kRows];
-bool row_slider[kRows];
 int drag_row = -1;
 bool mouse_read = false;
+float scroll_at[TAB_COUNT + 1] = {};
+float scroll_want[TAB_COUNT + 1] = {};
+int scrolled_to[TAB_COUNT + 1] = {-1, -1, -1, -1, -1};
+int wheel_rows[TAB_COUNT + 1] = {};
+float ease_step = 1.0f;
+bool pad_last = false;
+int pad_confirm = 3, pad_back = 1;
+int ask_sel = 0;
+float menu_ox = 0;
+std::atomic<float> startup_fade{0.0f};
+
+namespace mr = menu_restart;
+mr::State restart_state;
+int restart_slot[kRows];
+const char* restart_names[mr::kMax];
+
+void restart_init() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    for (int i = 0; i < kRows; i++) {
+        restart_slot[i] = rows[i].restart && rows[i].value ? restart_state.add(*rows[i].value) : -1;
+        if (restart_slot[i] >= 0) restart_names[restart_slot[i]] = rows[i].name;
+    }
+}
+int restart_slot_of(const Row& r) { return restart_slot[&r - rows]; }
+bool restart_changed(const Row& r) {
+    const int slot = restart_slot_of(r);
+    return r.value && r.restart && slot >= 0 && *r.value != restart_state.start[slot];
+}
+void restart_values(int* now) {
+    for (int i = 0; i < kRows; i++)
+        if (restart_slot[i] >= 0) now[restart_slot[i]] = *rows[i].value;
+}
+unsigned restart_pending() {
+    int now[mr::kMax];
+    restart_values(now);
+    return restart_state.pending(now);
+}
+bool restart_ask() {
+    int now[mr::kMax];
+    restart_values(now);
+    return app_window() && restart_state.ask(now);
+}
+std::string restart_list(const char* last) {
+    return mr::names(restart_names, restart_state.n, restart_pending(), ", ", last);
+}
+
 bool is_slider(const Row& r) {
     return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.stick_l_sens ||
            r.value == &opts.stick_r_sens || r.value == &opts.fg_flow || r.value == &opts.fov ||
+           r.value == &opts.color_brightness || r.value == &opts.color_contrast ||
+           r.value == &opts.color_saturation || r.value == &opts.color_gamma ||
            (r.value && r.text == tx_percent && r.hi - r.lo >= 50 && r.step >= 5);
+}
+bool stops_at_ends(const Row& r) {
+    return is_slider(r) || r.value == &opts.mouse_sens || r.value == &opts.stick_l_sens ||
+           r.value == &opts.stick_r_sens || r.value == &opts.fov;
 }
 
 // (a value too long for its row, a GPU's name: the selected row's slides through it, a character a step, resting at
@@ -763,539 +838,650 @@ const std::vector<int>& bindable_keys() {
     }
     return k;
 }
-int page = 0;          // 0 the options, 1 the controls
-int csel = 0, ccol = 0;   // the controls' row (kControls: reset) and column (0 the gamepad, 1 the keyboard)
-int listening = 0;     // waiting for the new input: 1 a gamepad's, 2 a key
-bool listen_armed = false;   // (once what started it was let go)
-int64_t listen_end = 0;
-std::string keys_text(int button) {
-    const int a = host->binding(HOS_BIND_KEY, button, 0), b = host->binding(HOS_BIND_KEY, button, 1);
-    std::string t = a ? key_name(a) : "";
-    if (b) t += std::string(a ? ", " : "") + key_name(b);
-    return t.empty() ? "None" : t;
+std::string key_slot_text(int button, int slot) {
+    const int k = host->binding(HOS_BIND_KEY, button, slot);
+    return k ? key_name(k) : "None";
 }
 
-// ---- what is drawn: bitmaps of the menu and the counter, in the window's byte order ----
-struct Bitmap {
-    uint32_t w = 0, h = 0;
-    std::vector<uint8_t> px;
-    uint64_t version = 0;
-    bool keyed = false;                   // (black is see-through: copied as the runs of pixels in between)
-    std::vector<VkBufferImageCopy> runs;
-};
-Bitmap menu_bmp, fps_bmp;
-std::mutex bmp_mu;
-/// Menu panel height at scale s for `rows` option lines and `help_px` of wrapped help (matches redraw_menu).
-int menu_panel_h(int s, int rows, int help_px) {
-    using namespace menu_hit;
-    // header + pad + rows + help gap + help text + footer
-    return (kHeadH + kContentPad + rows * kRowH + 12) * s + help_px + (12 + kFootH) * s;
+// ---- what is drawn: Dear ImGui draw lists over the window's image (vk_ui.h, vk_imgui.cpp) ----
+std::atomic<int64_t> game_frames{0}, shown_frames{0};
+const char* const tab_titles[TAB_COUNT] = {"Graphics", "Gameplay", "Colour", "Controls"};
+constexpr int kVersionMinPt = 10;
+
+ui::Ctx ui_ctx(uint32_t w, uint32_t h) {
+    ui::Ctx c{ImGui::GetForegroundDrawList(), ui::fonts(), 1, (float)w, (float)h, 0, pad_last,
+              menu_keys::dot(pad_confirm), menu_keys::dot(pad_back), menu_theme::of(opts.menu_theme)};
+    c.s = ui::unit((float)h, opts.menu_size, &c.safe);
+    return c;
 }
-int measure_help(int s);   // (defined below: used when choosing a scale that still fits the swapchain)
-/// Prefer h/720, then shrink until the densest tab + real help text fit. Windowed often fit by luck; fullscreen
-/// 4K (scale 3) with Wave A/B's extra Graphics rows made the bitmap taller than the swapchain, and copy_over
-/// skipped the draw (Insert open, blank).
-int scale_of(uint32_t h) {
-    int s = (int)std::max(1u, h / 720);
-    const int rows = max_tab_rows();
-    while (s > 1) {
-        if (menu_panel_h(s, rows, measure_help(s)) <= (int)h) break;
-        --s;
+float banner_h(const ui::Ctx& c) { return std::max(58 * c.s, c.safe + 40 * c.s); }
+
+const char* fg_short_name(int backend) {
+    switch (backend) {
+    case 1: return "MasterSword FG";
+    case 2: return "SMFG";
+    case 3: return "DLSS MFG";
+    case 4: return "FSR 3.1 FG";
+    case 5: return "XeSS MFG";
+    case 6: return "Apex FG";
+    default: return nullptr;
     }
-    return s;
 }
 
-thread_local uint32_t* paint_bits = nullptr;   // (start-up screen blends its logo in: vk_startup_paint.h)
-void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, uint32_t, int), int scale) {
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-    bi.bmiHeader.biWidth = (LONG)w;
-    bi.bmiHeader.biHeight = -(LONG)h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    HDC dc = CreateCompatibleDC(nullptr);
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp) { DeleteDC(dc); return; }
-    HGDIOBJ old = SelectObject(dc, bmp);
-    paint_bits = (uint32_t*)bits;
-    paint(dc, w, h, scale);
-    paint_bits = nullptr;
-    GdiFlush();
-    const bool rgba = dev.swap_format == VK_FORMAT_R8G8B8A8_UNORM || dev.swap_format == VK_FORMAT_R8G8B8A8_SRGB;
-    std::lock_guard lk(bmp_mu);
-    out.w = w, out.h = h;
-    out.px.assign((const uint8_t*)bits, (const uint8_t*)bits + (size_t)w * h * 4);
-    if (out.keyed) {
-        out.runs.clear();
-        for (uint32_t y = 0; y < h; y++) {
-            for (uint32_t x = 0; x < w;) {
-                const uint8_t* p = out.px.data() + ((size_t)y * w + x) * 4;
-                if (!(p[0] | p[1] | p[2])) { x++; continue; }
-                uint32_t e = x + 1;
-                for (; e < w; e++) {
-                    const uint8_t* q = out.px.data() + ((size_t)y * w + e) * 4;
-                    if (!(q[0] | q[1] | q[2])) break;
-                }
-                VkBufferImageCopy c{};
-                c.bufferOffset = ((uint64_t)y * w + x) * 4;
-                c.bufferRowLength = w;
-                c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                c.imageOffset = {(int32_t)x, (int32_t)y, 0};
-                c.imageExtent = {e - x, 1, 1};
-                out.runs.push_back(c);
-                x = e;
-            }
-        }
-        // One strip per row was a copy of its own. At 4K that is a couple of thousand copies every present, and the
-        // frame rate fell while the menu was open. A strip that continues the one above becomes a taller copy.
-        if (out.runs.size() > 1) {
-            std::vector<VkBufferImageCopy> stacked;
-            stacked.reserve(out.runs.size());
-            std::vector<uint32_t> above, row;
-            int32_t row_y = out.runs[0].imageOffset.y - 1;
-            for (const VkBufferImageCopy& c : out.runs) {
-                if (c.imageOffset.y != row_y) {
-                    above.swap(row);
-                    row.clear();
-                    row_y = c.imageOffset.y;
-                }
-                uint32_t onto = UINT32_MAX;
-                for (uint32_t i : above) {
-                    VkBufferImageCopy& p = stacked[i];
-                    if (p.imageOffset.x != c.imageOffset.x || p.imageExtent.width != c.imageExtent.width) continue;
-                    if (p.bufferRowLength != c.bufferRowLength) continue;
-                    if (p.imageOffset.y + (int32_t)p.imageExtent.height != c.imageOffset.y) continue;
-                    const uint64_t step = (uint64_t)p.bufferRowLength * 4ull * p.imageExtent.height;
-                    if (p.bufferOffset + step != c.bufferOffset) continue;
-                    onto = i;
-                    break;
-                }
-                if (onto != UINT32_MAX) {
-                    stacked[onto].imageExtent.height++;
-                    row.push_back(onto);
-                } else {
-                    row.push_back((uint32_t)stacked.size());
-                    stacked.push_back(c);
-                }
-            }
-            out.runs.swap(stacked);
-        }
-    }
-    for (size_t i = 0; i < out.px.size(); i += 4) {
-        if (rgba) std::swap(out.px[i], out.px[i + 2]);
-        out.px[i + 3] = 255;
-    }
-    out.version++;
-    SelectObject(dc, old);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-}
-HFONT font(int px, int weight) {
-    return CreateFontA(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                       DEFAULT_PITCH, "Segoe UI");
-}
-int help_px = 0;   // (the help text's height: measure_help)
-/// The help text word-wrapped to width, a TextOutA a line (the POSIX GDI stand-in has no DrawTextA), drawn at (x, y)
-/// when draw: its height in pixels either way
-int wrap_help(HDC dc, const char* text, int width, int x, int y, bool draw) {
-    SIZE sz{};
-    GetTextExtentPoint32A(dc, "Ag", 2, &sz);
-    const int line_h = (int)sz.cy;
-    int lines = 0;
-    for (const char* p = text; *p;) {
-        int n = 0;   // (the most whole words that fit; one word at least, however long)
-        for (int end = 0;; end++) {
-            while (p[end] && p[end] != ' ') end++;
-            GetTextExtentPoint32A(dc, p, end, &sz);
-            if (n && sz.cx > width) break;
-            n = end;
-            if (!p[end]) break;
-        }
-        if (draw) TextOutA(dc, x, y + lines * line_h, p, n);
-        lines++;
-        p += n;
-        while (*p == ' ') p++;
-    }
-    return lines * line_h;
-}
-void fill(HDC dc, int x, int y, int w, int h, COLORREF c) {
-    RECT r{x, y, x + w, y + h};
-    HBRUSH b = CreateSolidBrush(c);
-    FillRect(dc, &r, b);
-    DeleteObject(b);
-}
-void fill_round(HDC dc, int x, int y, int w, int h, int rad, COLORREF c) {
-    HBRUSH b = CreateSolidBrush(c);
-    HPEN p = CreatePen(PS_SOLID, 1, c);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
-    RoundRect(dc, x, y, x + w, y + h, rad * 2, rad * 2);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(b);
-    DeleteObject(p);
-}
-void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
-    // Layout constants from vk_menu_hit.h (qualified so picture and hit-test stay locked).
-    const int kHeadH = menu_hit::kHeadH, kSideW = menu_hit::kSideW, kFootH = menu_hit::kFootH;
-    const int kTabH = menu_hit::kTabH, kRowH = menu_hit::kRowH, kTabY = menu_hit::kTabY;
-    (void)kTabY;   // same edge as the sidebar body; kept for the hit-test lock
-    (void)menu_hit::tab_slot_w(s, (int)w, TAB_COUNT);
-    const menu_theme::Palette th = menu_theme::of(opts.menu_theme);
-    // keyed black outside: rounded card (gdi_draw treats black as see-through when keyed)
-    fill(dc, 0, 0, (int)w, (int)h, RGB(0, 0, 0));
-    const int rad = 14 * s;
-    fill_round(dc, 0, 0, (int)w, (int)h, rad, th.panel);
-    SetBkMode(dc, TRANSPARENT);
-    HFONT title = font(18 * s, FW_SEMIBOLD), body = font(15 * s, FW_NORMAL), small = font(12 * s, FW_NORMAL);
-    HGDIOBJ old = SelectObject(dc, title);
-
-    // ---- title bar ----
-    fill(dc, 0, 0, (int)w, kHeadH * s, th.header);
-    // re-round the top by covering the square header corners with panel colour… skipped: header fills full width
-    fill(dc, 0, kHeadH * s - s, (int)w, s, th.divider);
-    fill(dc, 16 * s, (int)(kHeadH * 0.28f) * s, 5 * s, (int)(kHeadH * 0.44f) * s, th.accent);   // accent bar
-    SetTextColor(dc, th.text);
-    TextOutA(dc, 28 * s, (kHeadH * s - 18 * s) / 2, "MasterSword", 11);
-    {
-        SIZE tsz{};
-        GetTextExtentPoint32A(dc, "MasterSword", 11, &tsz);
-        SelectObject(dc, small);
-        SetTextColor(dc, th.text_soft);
-        TextOutA(dc, 28 * s + tsz.cx + 12 * s, (kHeadH * s - 12 * s) / 2 + s, "Settings", 8);
-        std::string ver = HOOKSHOT_VERSION;
-        SIZE sz{};
-        GetTextExtentPoint32A(dc, ver.c_str(), (int)ver.size(), &sz);
-        const int room = (int)w - 40 * s - tsz.cx - 80 * s;
-        if (sz.cx > room && ver.find(" (") != std::string::npos) {
-            ver.resize(ver.find(" ("));
-            GetTextExtentPoint32A(dc, ver.c_str(), (int)ver.size(), &sz);
-        }
-        SetTextColor(dc, th.text_dim);
-        if (sz.cx <= (int)w - 32 * s) TextOutA(dc, (int)w - 16 * s - sz.cx, (kHeadH * s - 12 * s) / 2 + s, ver.c_str(), (int)ver.size());
-        SelectObject(dc, title);
-    }
-
-    if (page == 1) {   // (hookshot) the Controls bindings page
-        SelectObject(dc, body);
-        SetTextColor(dc, th.text_soft);
-        TextOutA(dc, 16 * s, 12 * s + 4 * s, "Controls", 8);
-        const int rh = menu_hit::kCtlRowH * s, top = menu_hit::kCtlTop * s, xpad = menu_hit::kCtlPad * s,
-                  xkey = menu_hit::kCtlKey * s;
-        SetTextColor(dc, th.text_dim);
-        TextOutA(dc, 16 * s, 44 * s, "Button", 6);
-        TextOutA(dc, xpad, 44 * s, "Gamepad", 7);
-        TextOutA(dc, xkey, 44 * s, "Keyboard", 8);
-        for (int i = 0; i <= kControls; i++) {
-            const int y = top + i * rh;
-            const bool sel = i == csel;
-            if (sel) fill_round(dc, 8 * s, y, (int)w - 16 * s, rh, 6 * s, th.row_sel);
-            SetTextColor(dc, sel ? th.accent_text : th.text);
-            if (i == kControls) {
-                const char* t = "Reset to defaults";
-                TextOutA(dc, 16 * s, y + 3 * s, t, (int)strlen(t));
-                continue;
-            }
-            const Control& c = controls[i];
-            TextOutA(dc, 16 * s, y + 3 * s, c.name, (int)strlen(c.name));
-            for (int col = 0; col < 2; col++) {
-                std::string v = col == 0 ? (keys_only(i) ? "-" : pad_name(host->binding(HOS_BIND_PAD, c.button, 0)))
-                                         : keys_text(c.button);
-                if (sel && col == ccol && listening) v = col == 0 ? "Press a button..." : "Press a key...";
-                if (sel && col == ccol) {
-                    SIZE sz{};
-                    GetTextExtentPoint32A(dc, v.c_str(), (int)v.size(), &sz);
-                    fill_round(dc, (col ? xkey : xpad) - 6 * s, y + 2 * s, (int)sz.cx + 12 * s, rh - 4 * s, 5 * s,
-                               listening ? th.warn : th.accent);
-                    SetTextColor(dc, th.header);
-                } else {
-                    SetTextColor(dc, sel ? th.accent_text : th.text);
-                }
-                TextOutA(dc, col ? xkey : xpad, y + 3 * s, v.c_str(), (int)v.size());
-            }
-        }
-        SetTextColor(dc, th.text_dim);
-        const char* hint = listening ? "Press the new one   Esc cancels"
-                                     : "Enter binds   Delete clears   Esc goes back";
-        const char* hint2 = "Gamepad: D-pad moves, bottom button binds, right one goes back";
-        TextOutA(dc, 16 * s, top + (kControls + 1) * rh + 6 * s, hint, (int)strlen(hint));
-        TextOutA(dc, 16 * s, top + (kControls + 1) * rh + 26 * s, hint2, (int)strlen(hint2));
-        SelectObject(dc, old);
-        DeleteObject(title);
-        DeleteObject(body);
-        DeleteObject(small);
-        return;
-    }
-
-    // ---- sidebar categories (Switch settings) ----
-    const int side = kSideW * s;
-    const int body_y = kHeadH * s;
-    const int foot_y = (int)h - kFootH * s;
-    fill(dc, 0, body_y, side, foot_y - body_y, th.sidebar);
-    fill(dc, side - s, body_y, s, foot_y - body_y, th.divider);
-    const char* const tab_titles[TAB_COUNT] = {"Graphics", "Gameplay", "Colour", "Controls"};
-    const int ih = kTabH * s, ix = 12 * s, iw = side - 24 * s, iy0 = body_y + 12 * s;
-    HFONT tab_font = font(14 * s, FW_SEMIBOLD);
-    SelectObject(dc, tab_font);
-    for (int t = 0; t < TAB_COUNT; t++) {
-        const int y = iy0 + t * (ih + 6 * s);
-        const bool active = (t == cur_tab);
-        const bool hov = (hover_tab == t);
-        if (active) {
-            fill_round(dc, ix, y, iw, ih, 8 * s, th.row_sel);
-            fill(dc, ix + 6 * s, y + ih / 4, 4 * s, ih / 2, th.accent);
-            SetTextColor(dc, th.accent_text);
-        } else if (hov) {
-            fill_round(dc, ix, y, iw, ih, 8 * s, th.row_hover);
-            SetTextColor(dc, th.text);
-        } else {
-            SetTextColor(dc, th.text);
-        }
-        TextOutA(dc, ix + 20 * s, y + (ih - 14 * s) / 2, tab_titles[t], (int)strlen(tab_titles[t]));
-    }
-    // L / R pills (match hit-test at sidebar bottom)
-    {
-        SelectObject(dc, small);
-        const int ph = (int)(kTabH * 0.7f) * s, py = foot_y - ph - 12 * s;
-        auto pill = [&](int px, const char* letter) {
-            SIZE ts{};
-            GetTextExtentPoint32A(dc, letter, 1, &ts);
-            const int pw = ts.cx + ph;
-            fill_round(dc, px, py, pw, ph, ph / 2, th.text);
-            SetTextColor(dc, th.header);
-            TextOutA(dc, px + (pw - ts.cx) / 2, py + (ph - ts.cy) / 2, letter, 1);
-            return pw;
-        };
-        int px = ix + 8 * s;
-        px += pill(px, "L") + 8 * s;
-        pill(px, "R");
-    }
-    DeleteObject(tab_font);
-
-    // ---- option rows in the content pane ----
-    SelectObject(dc, body);
-    const int rh = kRowH * s, top = menu_hit::rows_top(s), cx = menu_hit::content_x(s);
-    const int tab_count = tab_row_count(cur_tab);
-    marquee_max = 0;
-    for (int i = 0; i < tab_count; i++) {
-        const Row& r = rows[tab_row_to_global(cur_tab, i)];
-        const int y = top + i * rh;
-        const bool sel = i == tab_selected[cur_tab];
-        if (sel) {
-            fill_round(dc, cx + 4 * s, y, (int)w - cx - 12 * s, rh, 8 * s, th.row_sel);
-            // accent outline: thin bars on the selection card
-            fill(dc, cx + 4 * s, y, (int)w - cx - 12 * s, s, th.accent);
-            fill(dc, cx + 4 * s, y + rh - s, (int)w - cx - 12 * s, s, th.accent);
-            fill(dc, cx + 4 * s, y, s, rh, th.accent);
-            fill(dc, (int)w - 9 * s, y, s, rh, th.accent);
-        }
-        SetTextColor(dc, sel ? th.accent_text : th.text);
-        TextOutA(dc, cx + 16 * s, y + (rh - 15 * s) / 2, r.name, (int)strlen(r.name));
-        SIZE nsz{};
-        GetTextExtentPoint32A(dc, r.name, (int)strlen(r.name), &nsz);
-        const int name_right = cx + 16 * s + (int)nsz.cx + 12 * s;
-        const int room = (int)w - menu_hit::kValueRight * s - name_right;
-        std::string label;
-        if (r.value) label = r.text(*r.value);
-        else if (!strcmp(r.name, "Quit to Desktop")) label = sel ? "Enter" : "";
-        else label = ">";
-        const bool arrows = r.value && sel;
-        auto width = [&](const std::string& t) {
-            SIZE z{};
-            GetTextExtentPoint32A(dc, t.c_str(), (int)t.size(), &z);
-            return (int)z.cx;
-        };
-        auto framed = [&](const std::string& t) { return arrows ? "<  " + t + "  >" : t; };
-        std::string v = framed(label);
-        if (width(v) > room && arrows) {
-            size_t start = label.size();
-            while (start > 0 && width(framed(label.substr(start - 1))) <= room) start--;
-            marquee_max = (int)start;
-            const size_t from = (size_t)std::min(marquee_pos, marquee_max);
-            size_t n = label.size() - from;
-            while (n > 1 && width(framed(label.substr(from, n))) > room) n--;
-            v = framed(label.substr(from, n));
-        } else if (width(v) > room) {
-            std::string t = label;
-            while (t.size() > 1 && width(v) > room) {
-                t.pop_back();
-                while (!t.empty() && t.back() == ' ') t.pop_back();
-                v = t + "...";
-            }
-        } else if (arrows) {
-            marquee_max = 0;
-        }
-        SetTextColor(dc, sel ? th.accent_text : th.text_soft);
-        TextOutA(dc, (int)w - menu_hit::kValueRight * s - width(v), y + (rh - 15 * s) / 2, v.c_str(), (int)v.size());
-        row_value_l[i] =
-            (int)w - menu_hit::kValueRight * s - std::min(r.value ? width(std::string("<  ") + label + "  >") : width(v), room);
-        {
-            const int tl = menu_hit::kSliderL * s, tr = menu_hit::kSliderR * s;
-            row_slider[i] = is_slider(r) && name_right <= tl && row_value_l[i] >= tr + 8 * s;
-            if (row_slider[i]) {
-                const int ty = y + rh / 2 - s;
-                const int knob = tl + (tr - tl) * menu_hit::slider_permille(*r.value, r.lo, r.hi) / 1000;
-                fill(dc, tl, ty, tr - tl, 2 * s, th.track);
-                fill(dc, tl, ty, std::max(0, knob - tl), 2 * s, th.track_fill);
-                fill_round(dc, knob - 4 * s, y + rh / 2 - 6 * s, 8 * s, 12 * s, 4 * s, sel ? th.accent : th.text_soft);
-            }
-        }
-    }
-
-    // ---- help box + footer ----
-    const int help_top = top + max_tab_rows() * rh + 8 * s;
-    const int help_x = cx + 12 * s, help_w = (int)w - cx - 24 * s;
-    fill_round(dc, help_x, help_top, help_w, help_px + 8 * s, 8 * s, th.help_bg);
-    HFONT help = font(13 * s, FW_NORMAL);
-    SelectObject(dc, help);
-    SetTextColor(dc, th.text_soft);
-    wrap_help(dc, rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])].help, help_w - 16 * s, help_x + 8 * s,
-              help_top + 4 * s, true);
-    fill(dc, 0, foot_y, (int)w, (int)h - foot_y, th.header);
-    fill(dc, 0, foot_y, (int)w, s, th.divider);
-    SelectObject(dc, small);
-    SetTextColor(dc, th.text_dim);
-    const char* hint = "Arrows change    Q/E or L/R: categories    Insert / F1 / Home closes";
-    TextOutA(dc, 16 * s, foot_y + (kFootH * s - 12 * s) / 2, hint, (int)strlen(hint));
-    SelectObject(dc, old);
-    DeleteObject(title);
-    DeleteObject(body);
-    DeleteObject(small);
-    DeleteObject(help);
-}
-char fps_text[48] = "";
-char fps_sub[32] = "";
-/// The usual overlay: a bold green number with a dark edge, nothing behind it. Hard-edged letters: see-through pixels are copied or not.
-void outlined(HDC dc, int x, int y, const char* text, COLORREF colour, int edge) {
-    SetTextColor(dc, RGB(6, 8, 6));
-    const int n = (int)strlen(text);
-    for (int dy = -edge; dy <= edge; dy++)
-        for (int dx = -edge; dx <= edge; dx++)
-            if (dx || dy) TextOutA(dc, x + dx, y + dy, text, n);
-    SetTextColor(dc, colour);
-    TextOutA(dc, x, y, text, n);
-}
-HFONT hard_font(int px, int weight) {
-    return CreateFontA(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY,
-                       DEFAULT_PITCH, "Segoe UI");
-}
-void paint_fps(HDC dc, uint32_t w, uint32_t h, int s) {
-    fill(dc, 0, 0, (int)w, (int)h, RGB(0, 0, 0));
-    SetBkMode(dc, TRANSPARENT);
-    SetTextAlign(dc, TA_RIGHT | TA_TOP);
-    const COLORREF green = RGB(72, 255, 110);
-    const int right = (int)w - 2 * s;
-    HFONT label = hard_font(13 * s, FW_BOLD), big = hard_font(28 * s, FW_BOLD);
-    HGDIOBJ old = SelectObject(dc, label);
-    outlined(dc, right, 14 * s, "FPS", green, s);
-    SelectObject(dc, big);
-    outlined(dc, right - 30 * s, 0, fps_text, green, s);
-    if (fps_sub[0]) {
-        SelectObject(dc, label);
-        outlined(dc, right, 32 * s, fps_sub, RGB(226, 232, 226), s);
-    }
-    SelectObject(dc, old);
-    DeleteObject(label);
-    DeleteObject(big);
-}
-/// The tallest help text at scale s, in pixels: the menu keeps that height whichever row is selected
-int measure_help(int s) {
-    HDC dc = CreateCompatibleDC(nullptr);
-    HFONT f = font(13 * s, FW_NORMAL);
-    HGDIOBJ old = SelectObject(dc, f);
-    int most = 0;
-    const int help_w = (kMenuWidth - menu_hit::kSideW - 40) * s;
-    for (const Row& r : rows) most = std::max(most, wrap_help(dc, r.help, help_w, 0, 0, false));
-    SelectObject(dc, old);
-    DeleteObject(f);
-    DeleteDC(dc);
+/// Tallest help text across all rows at `width`, so the help box does not jump as rows change.
+float measure_help(ui::Ctx& c, float width) {
+    float most = 0;
+    for (const Row& r : rows)
+        if (r.help) most = std::max(most, ui::para(c, c.f.body, 18 * c.s, ImVec2(), 0, r.help, width, false));
     return most;
 }
-void redraw_menu(int s) {
-    menu_bmp.keyed = true;   // rounded card: black outside is see-through
-    if (page == 1) {
-        uint32_t ch = (uint32_t)((64 + (kControls + 1) * 24 + 52) * s);
-        if (dev.swap_extent.height && ch > dev.swap_extent.height) ch = dev.swap_extent.height;
-        gdi_draw(menu_bmp, (uint32_t)(menu_hit::kCtlWidth * s), ch, paint_menu, s);
-        return;
-    }
-    // Fit the panel inside the current swapchain. measure_help can exceed scale_of's earlier guess after a
-    // fullscreen resize (windowed → 4K), which used to leave menu_bmp taller than the image and invisible.
-    const uint32_t max_h = dev.swap_extent.height ? dev.swap_extent.height : 2160u;
-    const int rows = max_tab_rows();
-    while (s > 1) {
-        help_px = measure_help(s);
-        if ((uint32_t)menu_panel_h(s, rows, help_px) <= max_h) break;
-        --s;
-    }
-    help_px = measure_help(s);
-    uint32_t mh = (uint32_t)menu_panel_h(s, rows, help_px);
-    if (mh > max_h) {
-        help_px = std::max(0, (int)max_h - menu_panel_h(s, rows, 0));
-        mh = max_h;
-    }
-    gdi_draw(menu_bmp, (uint32_t)(kMenuWidth * s), mh, paint_menu, s);
+std::vector<size_t> char_starts(const std::string& t) {
+    std::vector<size_t> at;
+    for (size_t i = 0; i < t.size(); i++)
+        if (((unsigned char)t[i] & 0xC0) != 0x80) at.push_back(i);
+    at.push_back(t.size());
+    return at;
 }
-
-std::atomic<int64_t> game_frames{0}, shown_frames{0};
-int cur_scale = 1;
-
-struct Upload {
-    VkBuffer buf = VK_NULL_HANDLE;
-    VmaAllocation alloc = nullptr;
-    void* map = nullptr;
-    uint64_t size = 0, version = 0;
-};
-Upload ups[3][3];   // (menu, FPS counter, start-up screen; a frame in flight's each)
-
-void copy_over(VkCommandBuffer cmd, VkImage dst, Bitmap& b, Upload& u, int x, int y, uint32_t w, uint32_t h) {
-    std::lock_guard lk(bmp_mu);
-    // Negative origin (panel taller/wider than the swapchain) used to cast to a huge uint and skip the draw.
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (!b.w || !b.h || (uint32_t)x >= w || (uint32_t)y >= h) return;
-    // Clip instead of refusing: a fullscreen resize can leave one frame's bitmap slightly oversized.
-    const uint32_t cw = std::min(b.w, w - (uint32_t)x);
-    const uint32_t ch = std::min(b.h, h - (uint32_t)y);
-    const uint64_t size = (uint64_t)b.w * b.h * 4;
-    if (u.size < size) {
-        if (!create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, u.buf, u.alloc, &u.map)) return;
-        u.size = size, u.version = 0;
+std::string fit(ui::Ctx& c, ImFont* f, float px, float room, const std::string& label, bool sel) {
+    auto width = [&](const std::string& t) { return ui::size_of(f, px, t.c_str()).x; };
+    if (width(label) <= room) return label;
+    const std::vector<size_t> at = char_starts(label);
+    const int chars = (int)at.size() - 1;
+    if (sel) {
+        int start = chars;
+        while (start > 0 && width(label.substr(at[start - 1])) <= room) start--;
+        marquee_max = start;
+        const int from = std::min(marquee_pos, marquee_max);
+        int end = chars;
+        while (end > from + 1 && width(label.substr(at[from], at[end] - at[from])) > room) end--;
+        return label.substr(at[from], at[end] - at[from]);
     }
-    if (u.version != b.version) std::memcpy(u.map, b.px.data(), size), u.version = b.version;
-    if (b.keyed) {
-        static thread_local std::vector<VkBufferImageCopy> at;
-        at.clear();
-        for (auto r : b.runs) {
-            r.imageOffset.x += x;
-            r.imageOffset.y += y;
-            if (r.imageOffset.x < 0 || r.imageOffset.y < 0) continue;
-            if ((uint32_t)r.imageOffset.x >= w || (uint32_t)r.imageOffset.y >= h) continue;
-            const uint32_t rw = std::min(r.imageExtent.width, w - (uint32_t)r.imageOffset.x);
-            const uint32_t rh = std::min(r.imageExtent.height, h - (uint32_t)r.imageOffset.y);
-            if (!rw || !rh) continue;
-            r.imageExtent.width = rw;
-            r.imageExtent.height = rh;
-            at.push_back(r);
+    int end = chars;
+    while (end > 1 && width(label.substr(0, at[end]) + "...") > room) end--;
+    std::string t = label.substr(0, at[end]);
+    while (!t.empty() && t.back() == ' ') t.pop_back();
+    return t + "...";
+}
+float scroll_rows(int slot, int n, int sel, float top, float bottom, float pitch, int* shown) {
+    const int can_fit = std::max(1, (int)((bottom - top) / pitch));
+    *shown = can_fit;
+    float& at = scroll_at[slot];
+    float& want = scroll_want[slot];
+    const int wheel = std::exchange(wheel_rows[slot], 0);
+    if (n <= can_fit) want = 0;
+    else {
+        want -= (float)wheel;
+        static int fits[sizeof scroll_at / sizeof *scroll_at];
+        if (sel != scrolled_to[slot] || can_fit != std::exchange(fits[slot], can_fit)) {
+            const int margin = can_fit > 4 ? 1 : 0;
+            if (sel - margin < want) want = (float)(sel - margin);
+            if (sel + margin + 1 > want + can_fit) want = (float)(sel + margin + 1 - can_fit);
         }
-        if (!at.empty()) vkCmdCopyBufferToImage(cmd, u.buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)at.size(), at.data());
+        want = std::round(std::clamp(want, 0.0f, (float)(n - can_fit)));
+    }
+    scrolled_to[slot] = sel;
+    at += (want - at) * ease_step;
+    if (std::fabs(want - at) < 0.01f) at = want;
+    return at;
+}
+void scroll_bar(ui::Ctx& c, float x, float top, float bottom, int n, int shown, float first) {
+    if (n <= shown) return;
+    const float s = c.s, span = bottom - top, y0 = top + span * first / n, y1 = top + span * (first + shown) / n;
+    c.d->AddRectFilled(ImVec2(x - 2 * s, top), ImVec2(x + 2 * s, bottom), c.theme.scroll_track, 2 * s);
+    c.d->AddRectFilled(ImVec2(x - 2 * s, y0), ImVec2(x + 2 * s, y1), c.theme.accent, 2 * s);
+}
+float title_banner(ui::Ctx& c, const char* title, const char* right) {
+    const float hh = banner_h(c), s = c.s;
+    ui::banner(c, hh);
+    ui::text_mid_centre(c, c.f.heading, 24 * s, c.w * 0.5f, hh * 0.5f + s, c.theme.banner_ink, title);
+    if (right) ui::text_mid_right(c, c.f.body, 17 * s, c.w - c.safe, hh * 0.5f + s, c.theme.banner_ink, right);
+    return hh;
+}
+void help_box(ui::Ctx& c, float x0, float x1, float y0, const char* title, const char* help, const char* hint, const char* gold_line,
+              float min_h = 0, bool after_restart = false, float y_min = 0, float y_max = FLT_MAX) {
+    const float s = c.s, w = x1 - x0 - 48 * s;
+    const float th = help ? ui::para(c, c.f.body, 18 * s, ImVec2(), 0, help, w, false) : 0,
+                hh = hint ? ui::para(c, c.f.body, 16 * s, ImVec2(), 0, hint, w - 18 * s, false) : 0;
+    const float text_h = th + (hint ? 14 * s + hh : 0), note = after_restart ? 30 * s : 0;
+    const float fixed = 22 * s + (title ? 32 * s : 0) + note + (gold_line ? 52 * s : 0) + 22 * s;
+    float body = std::max(min_h, text_h);
+    if (y0 + fixed + body > y_max) y0 = std::max(y_min, y_max - fixed - body);
+    if (y0 + fixed + body > y_max) body = std::max(text_h, y_max - y0 - fixed);
+    const float y1 = std::min(y0 + fixed + body, y_max);
+    ui::box(c, ImVec2(x0, y0), ImVec2(x1, y1));
+    c.d->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
+    float y = y0 + 22 * s;
+    if (title) ui::text(c, c.f.heading, 21 * s, ImVec2(x0 + 24 * s, y), c.theme.ink, title), y += 32 * s;
+    if (after_restart) {
+        ui::diamond(c, ImVec2(x0 + 29 * s, y + 10 * s), 4 * s, c.theme.heading_col);
+        ui::text_mid(c, c.f.strong, 16 * s, x0 + 42 * s, y + 10 * s, c.theme.heading_col, "Takes effect after a restart");
+        y += note;
+    }
+    if (help) ui::para(c, c.f.body, 18 * s, ImVec2(x0 + 24 * s, y), c.theme.ink, help, w);
+    if (hint) {
+        const float hy = y + th + 14 * s;
+        c.d->AddRectFilled(ImVec2(x0 + 24 * s, hy + 2 * s), ImVec2(x0 + 26.5f * s, hy + hh - 2 * s), c.theme.accent, s);
+        ui::para(c, c.f.body, 16 * s, ImVec2(x0 + 40 * s, hy), c.theme.soft, hint, w - 18 * s);
+    }
+    if (gold_line) {
+        y += body + 20 * s;
+        c.d->AddLine(ImVec2(x0 + 24 * s, y), ImVec2(x1 - 24 * s, y), ui::alpha(c.theme.edge, 0.8f), std::max(1.0f, s));
+        ui::diamond(c, ImVec2(x0 + 29 * s, y + 20 * s), 4 * s, c.theme.heading_col);
+        ui::text_mid(c, c.f.strong, 16 * s, x0 + 42 * s, y + 20 * s, c.theme.heading_col, gold_line);
+    }
+    c.d->PopClipRect();
+}
+void columns(const ui::Ctx& c, float* x0, float* x1, float* hx0, float* hx1, bool* narrow) {
+    const float s = c.s;
+    *x0 = c.safe + 6 * s;
+    *x1 = std::min(c.w - c.safe, std::max(c.w * 0.585f, *x0 + 560 * s));
+    *hx0 = *x1 + 28 * s, *hx1 = c.w - c.safe;
+    *narrow = *hx1 - *hx0 < 260 * s;
+    if (*narrow) *hx0 = *x0 + 20 * s, *hx1 = *x1 - 20 * s;
+}
+void column(ui::Ctx& c, float x0, float x1, float top) {
+    const float s = c.s;
+    c.d->AddRectFilled(ImVec2(x0, top), ImVec2(x1, c.h), c.theme.column);
+    c.d->AddLine(ImVec2(x0, top), ImVec2(x0, c.h), ui::alpha(c.theme.edge, 1), 2 * s);
+    c.d->AddLine(ImVec2(x1, top), ImVec2(x1, c.h), ui::alpha(c.theme.edge, 1), 2 * s);
+}
+void name_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* name, bool sel, bool pending = false, float px = 18.5f) {
+    const float s = c.s, mid = (a.y + b.y) * 0.5f;
+    c.d->AddRectFilled(a, b, sel ? c.theme.cell_name_sel : c.theme.cell_name);
+    c.d->AddRect(a, b, c.theme.edge, 0, std::max(1.0f, s));
+    if (sel) c.d->AddRectFilled(a, ImVec2(a.x + 4 * s, b.y), c.theme.gold_hi);
+    float room = b.x - a.x - 36 * s;
+    if (pending) {
+        ui::diamond(c, ImVec2(b.x - 12 * s, mid), 4 * s, c.theme.heading_col);
+        room -= 14 * s;
+    }
+    ImFont* f = sel ? c.f.strong : c.f.body;
+    const std::string shown = fit(c, f, px * s, room, name, false);
+    ui::text_mid(c, f, px * s, a.x + 20 * s, mid, sel ? c.theme.ink_bright : c.theme.ink, shown.c_str());
+}
+void choice_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& value, bool sel, bool left, bool right, bool fixed = false) {
+    const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s;
+    c.d->AddRectFilled(a, b, c.theme.cell_dark);
+    c.d->AddRect(a, b, c.theme.edge, 0, std::max(1.0f, s));
+    if (sel && !fixed) ui::gold(c, a + ImVec2(in, in), b - ImVec2(in, in));
+    const ImU32 ink = sel && !fixed ? c.theme.gold_ink : fixed ? c.theme.dim : c.theme.ink,
+                arrow = sel && !fixed ? c.theme.gold_ink : c.theme.dim;
+    if (left) ui::triangle(c, ImVec2(a.x + in + 11 * s, mid), 9 * s, 0, arrow);
+    if (right) ui::triangle(c, ImVec2(b.x - in - 11 * s, mid), 9 * s, 1, arrow);
+    ImFont* f = sel ? c.f.strong : c.f.body;
+    const std::string shown = fit(c, f, px, b.x - a.x - 2 * in - (left || right ? 48 : 16) * s, value, sel);
+    ui::text_mid_centre(c, f, px, (a.x + b.x) * 0.5f, mid, ink, shown.c_str());
+    if (sel) ui::glow(c, a, b);
+}
+void halves_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* lo, const char* hi, bool high, bool sel, bool fixed) {
+    const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s, xm = (a.x + b.x) * 0.5f;
+    c.d->AddRectFilled(a, b, c.theme.cell_dark);
+    c.d->AddRect(a, b, c.theme.edge, 0, std::max(1.0f, s));
+    const ImVec2 fa = high ? ImVec2(xm, a.y + in) : a + ImVec2(in, in), fb = high ? b - ImVec2(in, in) : ImVec2(xm, b.y - in);
+    if (sel && !fixed) ui::gold(c, fa, fb);
+    else c.d->AddRectFilled(fa, fb, c.theme.bronze);
+    const ImU32 on = sel && !fixed ? c.theme.gold_ink : c.theme.ink;
+    ui::text_mid_centre(c, high ? c.f.body : c.f.strong, px, (a.x + xm) * 0.5f, mid, high ? c.theme.dim : on, lo);
+    ui::text_mid_centre(c, high ? c.f.strong : c.f.body, px, (xm + b.x) * 0.5f, mid, high ? on : c.theme.dim, hi);
+    if (sel) ui::glow(c, a, b);
+}
+void slider_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* value, int permille, bool sel, float* t0, float* t1) {
+    const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s;
+    c.d->AddRectFilled(a, b, c.theme.cell_dark);
+    c.d->AddRect(a, b, c.theme.edge, 0, std::max(1.0f, s));
+    if (sel) ui::gold(c, a + ImVec2(in, in), b - ImVec2(in, in));
+    const float x0 = a.x + in + 24 * s, x1 = b.x - in - 24 * s, xv = x0 + (x1 - x0) * permille / 1000.0f, ty = b.y - in - 5.5f * s;
+    const ImU32 track = sel ? c.theme.slider_track_sel : c.theme.slider_track, done = sel ? c.theme.gold_ink : c.theme.accent;
+    c.d->AddRectFilled(ImVec2(x0, ty - 1.5f * s), ImVec2(x1, ty + 1.5f * s), track, 1.5f * s);
+    c.d->AddRectFilled(ImVec2(x0, ty - 1.5f * s), ImVec2(xv, ty + 1.5f * s), done, 1.5f * s);
+    ui::diamond(c, ImVec2(xv, ty), 4.5f * s, done);
+    ui::text_mid_centre(c, c.f.strong, px, (a.x + b.x) * 0.5f, mid - 3 * s, sel ? c.theme.gold_ink : c.theme.ink, value);
+    const ImU32 arrow = sel ? c.theme.gold_ink : c.theme.dim;
+    ui::triangle(c, ImVec2(a.x + in + 11 * s, mid), 9 * s, 0, arrow), ui::triangle(c, ImVec2(b.x - in - 11 * s, mid), 9 * s, 1, arrow);
+    if (sel) ui::glow(c, a, b);
+    *t0 = x0, *t1 = x1;
+}
+std::string restart_line(ui::Ctx& c, float px, float width) {
+    const unsigned all = restart_pending();
+    std::string line;
+    for (int keep = restart_state.n; keep >= 0; keep--) {
+        unsigned shown = 0;
+        int named = 0, more = 0;
+        for (int i = 0; i < restart_state.n; i++)
+            if ((all >> i) & 1) (named < keep ? (shown |= 1u << i, named++) : more++);
+        const char* names[mr::kMax];
+        for (int i = 0; i < restart_state.n; i++) names[i] = i18n::tr(restart_names[i]);
+        line = std::string(i18n::tr("Restart needed: ")) + mr::names(names, restart_state.n, shown);
+        if (more) {
+            const int form = i18n::plural(more);
+            line += std::string(named ? i18n::tr(" and ") : "") + std::to_string(more) +
+                    i18n::tr(named ? " more" : form == 0 ? " setting" : form == 1 ? " settings" : " settings (many)");
+        }
+        if (ui::size_of(c.f.strong, px, line.c_str()).x <= width) break;
+    }
+    return line;
+}
+void row_value_cell(ui::Ctx& c, const Row& r, ImVec2 va, ImVec2 vb, bool selected, float* t0, float* t1) {
+    const float s = c.s;
+    if (!r.value) {
+        const char* label = !strcmp(r.name, "Controls") ? "Open" : "";
+        choice_cell(c, va, vb, label, selected, false, false);
         return;
     }
-    VkBufferImageCopy c{};
-    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    c.imageOffset = {x, y, 0};
-    c.imageExtent = {cw, ch, 1};
-    vkCmdCopyBufferToImage(cmd, u.buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    const bool fixed = r.hi <= r.lo;
+    if (is_slider(r)) {
+        slider_cell(c, va, vb, r.text(*r.value), menu_hit::slider_permille(*r.value, r.lo, r.hi), selected, t0, t1);
+        return;
+    }
+    const std::string lo = r.text(r.lo), hi = r.text(r.hi);
+    const float half = (vb.x - va.x) * 0.5f - 18 * s;
+    if (r.hi - r.lo == r.step && !fixed && ui::size_of(c.f.strong, 18 * s, lo.c_str()).x <= half &&
+        ui::size_of(c.f.strong, 18 * s, hi.c_str()).x <= half) {
+        halves_cell(c, va, vb, lo.c_str(), hi.c_str(), *r.value == r.hi, selected, fixed);
+    } else {
+        const bool left = !fixed && (!stops_at_ends(r) || *r.value > r.lo);
+        const bool right = !fixed && (!stops_at_ends(r) || *r.value < r.hi);
+        choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);
+    }
 }
 
-// ---- start-up prewarm screen (vk_startup_paint.h): centred on black ----
+void draw_options(ui::Ctx& c) {
+    const float s = c.s, hh = banner_h(c);
+    ui::banner(c, hh);
+    float tw[TAB_COUNT], total = 0;
+    for (int i = 0; i < TAB_COUNT; i++) tw[i] = ui::size_of(c.f.heading, 23 * s, tab_titles[i]).x + 56 * s, total += tw[i];
+    float x = (c.w - total) * 0.5f;
+    const float ty = hh * 0.5f + s;
+    const char* const keys[2] = {c.pad ? "L" : "Q", c.pad ? "R" : "E"};
+    for (int i = 0; i < 2; i++) {
+        const float cw = 26 * s, cx = i ? x + total + 22 * s : x - 22 * s - cw;
+        const bool hover = hover_tab == TAB_COUNT + i;
+        c.d->AddRectFilled(ImVec2(cx, ty - 13 * s), ImVec2(cx + cw, ty + 13 * s), hover ? c.theme.tab_inset : c.theme.keycap, 3 * s);
+        ui::text_mid_centre(c, c.f.strong, 14 * s, cx + cw * 0.5f, ty, hover ? c.theme.tab_ink : c.theme.keycap_ink, keys[i]);
+        hits.add(i ? cx - 10 * s : 0, 0, i ? c.w : cx + cw + 10 * s, hh, i ? menu_hit::kTabNext : menu_hit::kTabPrev, -1);
+    }
+    for (int i = 0; i < TAB_COUNT; i++) {
+        const bool shown = i == cur_tab;
+        if (shown || i == hover_tab) {
+            c.d->AddRectFilled(ImVec2(x, 0), ImVec2(x + tw[i], hh - 3 * s),
+                               shown ? c.theme.tab_inset : ui::alpha(c.theme.tab_inset, 0.35f));
+            if (shown) {
+                c.d->AddLine(ImVec2(x + 1, 0), ImVec2(x + 1, hh - 3 * s), c.theme.tab_inset_edge, std::max(1.0f, s));
+                c.d->AddLine(ImVec2(x + tw[i] - 1, 0), ImVec2(x + tw[i] - 1, hh - 3 * s), c.theme.tab_inset_edge, std::max(1.0f, s));
+            }
+        }
+        ui::text_mid(c, c.f.heading, 23 * s, x + 28 * s, ty, shown ? c.theme.tab_ink : c.theme.banner_ink, tab_titles[i]);
+        hits.add(x, 0, x + tw[i], hh, menu_hit::kTab, i);
+        x += tw[i];
+    }
+    {
+        std::string ver = std::string("MasterSword ") + version_text(HOOKSHOT_VERSION);
+        const float room = (c.w - total) * 0.5f - 60 * s - c.safe, px = 15 * s;
+        const auto width = [&](float p) { return ui::size_of(c.f.body, p, ver.c_str()).x; };
+        const float fitted = ui::fit_px(px, kVersionMinPt * s, 0.5f * s, room, width);
+        if (fitted > 0) ui::text_mid(c, c.f.body, fitted, c.safe, ty, c.theme.banner_ink, ver.c_str());
+    }
+    float cx0, cx1, hx0, hx1;
+    bool narrow;
+    columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
+    column(c, cx0, cx1, hh);
+    const int count = std::max(1, tab_row_count(cur_tab)), sel = tab_selected[cur_tab];
+    const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
+    const std::string pending_line = (cur_tab == TAB_GRAPHICS || cur_tab == TAB_GAMEPLAY) && restart_pending()
+                                         ? restart_line(c, 16 * s, hx1 - hx0 - 66 * s)
+                                         : "";
+    static float help_tall = 0, help_tall_w = 0;
+    if (help_tall_w != hx1 - hx0) help_tall_w = hx1 - hx0, help_tall = measure_help(c, hx1 - hx0 - 48 * s);
+    ui::Prompt prompt_list[6] = {{ui::kUpDown, "Choose"}};
+    int prompts_n = 1;
+    if (selr.value) prompt_list[prompts_n++] = {ui::kLeftRight, "Change"};
+    else prompt_list[prompts_n++] = {ui::kConfirm, !strcmp(selr.name, "Quit to Desktop") ? "Quit" : "Open"};
+    prompt_list[prompts_n++] = {ui::kTabs, "Tabs"};
+    prompt_list[prompts_n++] = {ui::kBack, "Close"};
+    const float bar_top = ui::prompt_bar_top(c);
+    float bottom = std::min(c.h - c.safe, bar_top) - 10 * s;
+    const bool after = restart_changed(selr);
+    if (narrow) {
+        const float help_h =
+            std::min(22 * s + 32 * s + help_tall + (after ? 30 * s : 0) + (pending_line.empty() ? 0 : 52 * s) + 22 * s,
+                     (bottom - hh) * 0.5f);
+        bottom = std::min(bar_top, c.h - c.safe) - help_h - 16 * s;
+        help_box(c, hx0, hx1, bottom + 8 * s, selr.name, selr.help, nullptr,
+                 pending_line.empty() ? nullptr : pending_line.c_str(), help_tall, after, bottom + 8 * s, bar_top - 10 * s);
+    } else {
+        help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * 0.30f), selr.name, selr.help, nullptr,
+                 pending_line.empty() ? nullptr : pending_line.c_str(), help_tall, after, hh + 18 * s, bar_top - 12 * s);
+    }
+    const float rh = 40 * s, pitch = 48 * s, top = hh + 24 * s, rx0 = cx0 + 44 * s, rx1 = cx1 - 44 * s,
+                split = rx0 + (rx1 - rx0) * 0.55f;
+    int shown = 0;
+    const float first = scroll_rows(cur_tab, count, sel, top, bottom, pitch, &shown);
+    scroll_bar(c, cx0 + 20 * s, top, top + shown * pitch - (pitch - rh), count, shown, first);
+    marquee_max = 0;
+    c.d->PushClipRect(ImVec2(cx0, top - 8 * s), ImVec2(cx1, bottom + 8 * s));
+    for (int i = 0; i < count; i++) {
+        const float y = top + (i - first) * pitch;
+        if (y + rh < top - 8 * s || y > bottom + 8 * s) continue;
+        const Row& r = rows[tab_row_to_global(cur_tab, i)];
+        const bool selected = i == sel;
+        name_cell(c, ImVec2(rx0, y), ImVec2(split, y + rh), r.name, selected, restart_changed(r));
+        const ImVec2 va(split, y), vb(rx1, y + rh);
+        float t0 = 0, t1 = 0;
+        row_value_cell(c, r, va, vb, selected, &t0, &t1);
+        hits.add(rx0, std::max(y, top - 8 * s), rx1, std::min(y + rh, bottom + 8 * s), menu_hit::kRow, i, va.x, vb.x, t0, t1);
+    }
+    c.d->PopClipRect();
+    ui::prompt_bar(c, prompt_list, prompts_n);
+}
+
+void draw_controls(ui::Ctx& c) {
+    using enum menu_hit::CtlColumn;
+    const float s = c.s, hh = title_banner(c, "Controls", nullptr);
+    float cx0, cx1, hx0, hx1;
+    bool narrow;
+    columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
+    column(c, cx0, cx1, hh);
+    const int n = kControls + 1;
+    const ui::Prompt idle[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Bind"},
+                               {ui::kKey, "Clear", "Del"}, {ui::kBack, "Back"}};
+    const ui::Prompt wait[] = {{ui::kBack, "Cancel"}};
+    const float bar_top = ui::prompt_bar_top(c);
+    const char* title = csel < kControls ? controls[csel].name : "Reset to defaults";
+    const char* help = listening
+                           ? (listening == 1 ? "Press the gamepad button to use. Esc cancels." : "Press the key to use. Esc cancels.")
+                           : "Either the gamepad button or either assigned keyboard key presses the selected Switch button. "
+                             "Enter binds the selected cell and Delete clears it. Swapping a gamepad button exchanges it with "
+                             "any button that held it so nothing is left unbound.";
+    const char* hint = "Gamepad: the D-pad moves, bottom button binds, right button goes back.";
+    float bottom = std::min(c.h - c.safe, bar_top) - 10 * s;
+    if (narrow) {
+        bottom = std::min(bar_top, c.h - c.safe) - 200 * s;
+        help_box(c, hx0, hx1, bottom + 8 * s, nullptr, help, hint, nullptr, 0, false, bottom + 8 * s, bar_top - 10 * s);
+    } else {
+        help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * 0.30f), title, help, hint, nullptr, 0, false, hh + 18 * s,
+                 bar_top - 12 * s);
+    }
+    const float rx0 = cx0 + 44 * s, rx1 = cx1 - 44 * s, width = rx1 - rx0;
+    const float pad_x = rx0 + width * 0.34f, key1_x = rx0 + width * 0.56f, key2_x = rx0 + width * 0.78f;
+    const float col_x[] = {pad_x, key1_x, key2_x, rx1};
+    float top = hh + 22 * s;
+    ui::text_mid_centre(c, c.f.body, 15 * s, (key1_x + rx1) * 0.5f, top + 8 * s, c.theme.dim, "Keyboard");
+    ui::text_mid(c, c.f.body, 15 * s, rx0 + 20 * s, top + 27 * s, c.theme.dim, "Button");
+    const char* titles[kCtlColumns] = {"Gamepad", "Key 1", "Key 2"};
+    for (int col = kCtlPrimary; col < kCtlColumns; col++)
+        ui::text_mid_centre(c, c.f.body, 15 * s, (col_x[col] + col_x[col + 1]) * 0.5f, top + 27 * s, c.theme.dim, titles[col]);
+    top += 43 * s;
+    const float rh = 36 * s, pitch = 42 * s;
+    int shown = 0;
+    const float first = scroll_rows(kControlsSlot, n, csel, top, bottom, pitch, &shown);
+    scroll_bar(c, cx0 + 20 * s, top, top + shown * pitch - (pitch - rh), n, shown, first);
+    c.d->PushClipRect(ImVec2(cx0, top - 8 * s), ImVec2(cx1, bottom + 8 * s));
+    for (int i = 0; i < n; i++) {
+        const float y = top + (i - first) * pitch;
+        if (y + rh < top - 8 * s || y > bottom + 8 * s) continue;
+        const bool sel = i == csel;
+        const float y0 = std::max(y, top - 8 * s), y1 = std::min(y + rh, bottom + 8 * s);
+        if (i == kControls) {
+            ui::button(c, ImVec2(rx0, y), ImVec2(pad_x - 8 * s, y + rh), "Reset to defaults", sel);
+            hits.add(rx0, y0, pad_x - 8 * s, y1, menu_hit::kCtlRow, i);
+            continue;
+        }
+        const Control& ctl = controls[i];
+        name_cell(c, ImVec2(rx0, y), ImVec2(pad_x, y + rh), ctl.name, sel, false, 17);
+        hits.add(rx0, y0, pad_x, y1, menu_hit::kCtlRow, i);
+        const bool ko = keys_only(i);
+        const int active_col = ko && ccol == kCtlPrimary ? (int)kCtlKeyboard : ccol;
+        for (int col = kCtlPrimary; col < kCtlColumns; col++) {
+            const bool is_pad = col == kCtlPrimary, disabled = ko && is_pad;
+            const float a = col_x[col] + (is_pad ? 0 : 3 * s), b = col_x[col + 1] - (col == kCtlKeyboard ? 0 : 3 * s);
+            const std::string v = disabled ? "-"
+                                : is_pad   ? std::string(pad_name(host->binding(HOS_BIND_PAD, ctl.button, 0)))
+                                           : key_slot_text(ctl.button, col - 1);
+            const bool here = sel && col == active_col;
+            const ImVec2 va(a, y), vb(b, y + rh);
+            if (here && listening) {
+                const float in = 4 * s;
+                c.d->AddRectFilled(va, vb, c.theme.cell_dark);
+                c.d->AddRect(va, vb, c.theme.edge, 0, std::max(1.0f, s));
+                c.d->AddRectFilled(va + ImVec2(in, in), vb - ImVec2(in, in), c.theme.listen);
+                const std::string prompt = fit(c, c.f.strong, 16.5f * s, b - a - 2 * in, is_pad ? "Press button" : "Press key", false);
+                ui::text_mid_centre(c, c.f.strong, 16.5f * s, (a + b) * 0.5f, y + rh * 0.5f, c.theme.ink_bright, prompt.c_str());
+                ui::glow(c, va, vb);
+            } else {
+                choice_cell(c, va, vb, v, here, false, false, disabled);
+            }
+            if (!disabled) hits.add(a, y0, b, y1, menu_hit::kCtlCell, i, 0, 0, 0, 0, col);
+        }
+    }
+    c.d->PopClipRect();
+    (void)(listening ? ui::prompt_bar(c, wait, 1) : ui::prompt_bar(c, idle, 5));
+}
+
+void draw_ask(ui::Ctx& c) {
+    const float s = c.s, W = 560 * s, H = 232 * s;
+    const ImVec2 p((c.w - W) * 0.5f, (c.h - H) * 0.5f), q = p + ImVec2(W, H);
+    ui::shadow(c, p, q, 30 * s, 1.0f, 8 * s);
+    c.d->AddRectFilled(p, q, c.theme.box);
+    c.d->AddRect(p, q, c.theme.box_edge, 0, 2 * s);
+    const float hb = 50 * s;
+    c.d->AddRectFilledMultiColor(p, ImVec2(q.x, p.y + hb), c.theme.banner_top, c.theme.banner_top, c.theme.banner, c.theme.banner);
+    c.d->AddRectFilled(ImVec2(p.x, p.y + hb - 3 * s), ImVec2(q.x, p.y + hb), c.theme.banner_edge);
+    ui::text_mid_centre(c, c.f.heading, 23 * s, (p.x + q.x) * 0.5f, p.y + hb * 0.5f, c.theme.banner_ink, "Restart Needed");
+    const std::string ask = std::string(i18n::tr("Restart to apply ")) + restart_list(i18n::tr(" and ")) + "?";
+    ui::para(c, c.f.body, 19 * s, ImVec2(p.x + 28 * s, p.y + 64 * s), c.theme.ink, ask.c_str(), W - 56 * s);
+    ui::text_mid(c, c.f.body, 16 * s, p.x + 28 * s, p.y + 124 * s, c.theme.soft, "Progress since your last save is lost.");
+    const float bw = 210 * s, bh = 46 * s, gap = 24 * s, by = p.y + 160 * s, x0 = (p.x + q.x) * 0.5f - bw - gap * 0.5f;
+    const char* labels[2] = {"Later", "Restart Now"};
+    for (int i = 0; i < 2; i++) {
+        const ImVec2 a(x0 + i * (bw + gap), by), b = a + ImVec2(bw, bh);
+        ui::button(c, a, b, labels[i], i == ask_sel);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
+    }
+    const ui::Prompt prompt_list[] = {{ui::kLeftRight, "Choose"}, {ui::kConfirm, "Confirm"}, {ui::kBack, "Later"}};
+    ui::prompt_bar(c, prompt_list, 3);
+}
+
+void draw_menu(ui::Ctx& c);
+float prebaked[3] = {0, 0, 0};
+bool prebake_needed(uint32_t w, uint32_t h) {
+    float m = 0;
+    return ui::unit((float)h, opts.menu_size, &m) != prebaked[0] || (float)w != prebaked[1] ||
+           ui::unit((float)h, opts.overlay_size, &m) != prebaked[2];
+}
+void prebake(const ui::Ctx& c) {
+    float m = 0;
+    const float os = ui::unit(c.h, opts.overlay_size, &m);
+    if (c.s == prebaked[0] && c.w == prebaked[1] && os == prebaked[2]) return;
+    prebaked[0] = c.s, prebaked[1] = c.w, prebaked[2] = os;
+    static const float points[] = {12, 13, 14, 14.5f, 15, 16, 16.5f, 17, 18, 18.5f, 19, 20, 21, 23, 24};
+    constexpr int n = sizeof points / sizeof points[0];
+    float px[n + 2];
+    for (int i = 0; i < n; i++) px[i] = points[i] * c.s;
+    px[n] = 28.0f * os;
+    px[n + 1] = 13.0f * os;
+    ui::prebake(px, n + 2);
+    if (open_now.load(std::memory_order_relaxed)) return;
+    const menu_hit::Map saved_hits = hits;
+    const int saved_marquee = marquee_max;
+    const float saved_ease = ease_step;
+    float saved_scroll[sizeof scroll_at / sizeof *scroll_at], saved_want[sizeof scroll_at / sizeof *scroll_at];
+    int saved_to[sizeof scroll_at / sizeof *scroll_at];
+    memcpy(saved_scroll, scroll_at, sizeof scroll_at);
+    memcpy(saved_want, scroll_want, sizeof scroll_want);
+    memcpy(saved_to, scrolled_to, sizeof scrolled_to);
+    ImDrawList scratch(ImGui::GetDrawListSharedData());
+    scratch._ResetForNewFrame();
+    scratch.PushTexture(ImGui::GetIO().Fonts->TexRef);
+    scratch.PushClipRectFullScreen();
+    ease_step = 0;
+    {
+        ui::Ctx dry = c;
+        dry.d = &scratch;
+        draw_menu(dry);
+    }
+    hits = saved_hits, marquee_max = saved_marquee, ease_step = saved_ease;
+    memcpy(scroll_at, saved_scroll, sizeof scroll_at);
+    memcpy(scroll_want, saved_want, sizeof scroll_want);
+    memcpy(scrolled_to, saved_to, sizeof scrolled_to);
+}
+
+void draw_menu(ui::Ctx& c) {
+    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), c.theme.dim_bg);
+    ui::Ctx k = c;
+    k.w = std::min(c.w, std::floor(c.h * 16.0f / 9.0f + 0.5f));
+    menu_ox = std::floor((c.w - k.w) * 0.5f);
+    const int vtx0 = c.d->VtxBuffer.Size, cmd0 = c.d->CmdBuffer.Size;
+    hits.clear(0, 0, k.w, k.h);
+    if (page == 5) draw_ask(k);
+    else if (page == 1) draw_controls(k);
+    else draw_options(k);
+    if (menu_ox <= 0) return;
+    for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].pos.x += menu_ox;
+    for (int i = std::max(0, cmd0 - 1); i < c.d->CmdBuffer.Size; i++) {
+        ImVec4& r = c.d->CmdBuffer[i].ClipRect;
+        if (r.x <= 0 && r.z >= c.w) continue;
+        r.x += menu_ox, r.z += menu_ox;
+    }
+}
+
+char fps_text[48] = "";
+char fps_sub[48] = "";
+
+struct Tab {
+    ImFont* font;
+    float px, digit;
+    Tab(ImFont* f, float size) : font(f), px(size), digit(0) {
+        char d[2] = {0, 0};
+        for (char k = '0'; k <= '9'; k++) d[0] = k, digit = std::max(digit, ui::size_of(f, size, d).x);
+    }
+    static bool dig(char c) { return c >= '0' && c <= '9'; }
+    template <class Fn>
+    float pieces(const char* t, float x, Fn fn) const {
+        const float x0 = x;
+        for (const char* q = t; *q;) {
+            const char* e = q + 1;
+            if (!dig(*q))
+                while (*e && !dig(*e)) e++;
+            const float w = dig(*q) ? digit : font->CalcTextSizeA(px, FLT_MAX, 0, q, e).x;
+            fn(q, e, x, w);
+            x += w, q = e;
+        }
+        return x - x0;
+    }
+    float width(const char* t) const { return pieces(t, 0, [](const char*, const char*, float, float) {}); }
+    void draw(ImDrawList* d, float x, float y, ImU32 col, const char* t, float s) const {
+        const float o = std::max(1.0f, s);
+        const int a = std::max(200, (int)((col >> IM_COL32_A_SHIFT) & 0xff));
+        const ImU32 shade = ui::rgba(0, 0, 0, a * 210 / 255), faint = ui::rgba(0, 0, 0, a * 160 / 255);
+        pieces(t, x, [&](const char* q, const char* e, float px0, float w) {
+            if (*q == ' ' && e == q + 1) return;
+            const float gx = px0 + (dig(*q) ? (w - font->CalcTextSizeA(px, FLT_MAX, 0, q, e).x) * 0.5f : 0);
+            static const float dx[4] = {-1, 1, -1, 1}, dy[4] = {-1, -1, 1, 1};
+            for (int k = 0; k < 4; k++) d->AddText(font, px, ImVec2(gx + dx[k] * o * 0.8f, y + dy[k] * o * 0.8f), faint, q, e);
+            d->AddText(font, px, ImVec2(gx, y + o), shade, q, e);
+            d->AddText(font, px, ImVec2(gx, y), col, q, e);
+        });
+    }
+};
+
+void draw_fps(ui::Ctx& c, bool under_banner) {
+    float ov_safe = c.safe;
+    const float s = ui::unit(c.h, opts.overlay_size, &ov_safe), big = 28 * s, small = 13 * s;
+    const ImU32 green = ui::rgba(72, 255, 110);
+    const Tab num(c.f.strong, big), tab(c.f.strong, small);
+    const float nw = num.width(fps_text), lw = ui::size_of(c.f.strong, small, "FPS").x;
+    const float sw = fps_sub[0] ? tab.width(fps_sub) : 0;
+    const bool beside = menu_ox >= std::max(nw + 4 * s + lw, sw) + ov_safe + c.safe + 8 * s;
+    const float edge = c.w - ov_safe;
+    const float top = under_banner && page != 5 && !beside ? banner_h(c) + 10 * s : ov_safe;
+    {
+        const float x = edge - (nw + 4 * s + lw), o = std::max(1.0f, s);
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+                if (dx || dy) {
+                    float gx = x;
+                    char one[2] = {0, 0};
+                    for (const char* q = fps_text; *q; q++) {
+                        one[0] = *q;
+                        const float adv = ui::size_of(c.f.strong, big, one).x;
+                        c.d->AddText(c.f.strong, big, ImVec2(gx + (num.digit - adv) * 0.5f + dx * o, top + dy * o), ui::rgba(0, 0, 0, 230), one);
+                        gx += num.digit;
+                    }
+                    c.d->AddText(c.f.strong, small, ImVec2(x + nw + 4 * s + dx * o, top + 14 * s + dy * o), ui::rgba(0, 0, 0, 230), "FPS");
+                }
+        float gx = x;
+        char one[2] = {0, 0};
+        for (const char* q = fps_text; *q; q++) {
+            one[0] = *q;
+            const float adv = ui::size_of(c.f.strong, big, one).x;
+            c.d->AddText(c.f.strong, big, ImVec2(gx + (num.digit - adv) * 0.5f, top), green, one);
+            gx += num.digit;
+        }
+        c.d->AddText(c.f.strong, small, ImVec2(x + nw + 4 * s, top + 14 * s), green, "FPS");
+    }
+    if (fps_sub[0]) tab.draw(c.d, edge - sw, top + 32 * s, ui::rgba(226, 232, 226), fps_sub, s);
+}
+
+// ---- start-up prewarm screen: Dear ImGui over dark/themed backdrop ----
 StartupView startup;
-Bitmap startup_bmp;
+std::mutex startup_mu;
 std::atomic<bool> startup_on{false};
-void paint_startup(HDC dc, uint32_t w, uint32_t h, int pct) { paint_startup_view(dc, w, h, pct, startup, paint_bits); }
+
+void draw_startup(ui::Ctx& c) {
+    StartupView v;
+    {
+        std::lock_guard lk(startup_mu);
+        v = startup;
+    }
+    const float s = c.s, w = c.w, h = c.h, cx = w * 0.5f, k = s * 0.86f;
+    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), c.theme.startup_bg);
+    const float lh = 112 * s, top = h * 0.5f - 176 * s;
+    for (int i = 40; i >= 1; i--) c.d->AddCircleFilled(ImVec2(cx, top + lh * 0.5f + 70 * s), h * 0.021f * i, c.theme.startup_glow, 128);
+    float aspect = 1;
+    ImTextureData* logo = ui::logo(&aspect);
+    if (logo) c.d->AddImage(logo->GetTexRef(), ImVec2(cx - lh * aspect * 0.5f, top), ImVec2(cx + lh * aspect * 0.5f, top + lh));
+    float y = top + lh + 16 * s;
+    ui::spaced(c, c.f.heading, 42 * k, ImVec2(cx, y), c.theme.startup_title, "MASTERSWORD", 6 * k);
+    ui::flourish(c, cx - 190 * k, cx + 190 * k, y + 66 * k, c.theme.accent);
+    ui::text_centre(c, c.f.body, 14.5f * k, ImVec2(cx, y + 78 * k), c.theme.dim, v.version.c_str());
+    if (!v.title.empty()) {
+        y += 120 * k;
+        if (!v.step.empty()) {
+            std::string step = v.step;
+            for (size_t i = 1; i < step.size(); i++) step[i] = (char)tolower((unsigned char)step[i]);
+            ui::text_centre(c, c.f.body, 15 * k, ImVec2(cx, y), c.theme.accent, step.c_str());
+        }
+        ui::text_centre(c, c.f.heading, 24 * k, ImVec2(cx, y + 20 * k), c.theme.ink, v.title.c_str());
+        const float x0 = cx - 270 * k, x1 = cx + 270 * k, by = y + 64 * k;
+        float under = by;
+        if (v.fraction >= 0) {
+            const float bh = 26 * k, in = 4 * k, fx = x0 + in + (x1 - x0 - 2 * in) * (float)std::min(v.fraction, 1.0);
+            c.d->AddRectFilled(ImVec2(x0, by), ImVec2(x1, by + bh), c.theme.cell_dark);
+            c.d->AddRect(ImVec2(x0, by), ImVec2(x1, by + bh), c.theme.edge, 0, std::max(1.0f, s));
+            if (fx > x0 + in) ui::gold(c, ImVec2(x0 + in, by + in), ImVec2(fx, by + bh - in));
+            const float split = std::max(fx, x0 + in);
+            c.d->PushClipRect(ImVec2(x0, by), ImVec2(split, by + bh), true);
+            ui::text_mid_centre(c, c.f.strong, 15 * k, cx, by + bh * 0.5f, c.theme.gold_ink, v.pct.c_str());
+            c.d->PopClipRect();
+            c.d->PushClipRect(ImVec2(split, by), ImVec2(x1, by + bh), true);
+            ui::text_mid_centre(c, c.f.strong, 15 * k, cx, by + bh * 0.5f, c.theme.ink, v.pct.c_str());
+            c.d->PopClipRect();
+            under = by + bh;
+        }
+        const float px = 16.5f * k;
+        ui::text(c, c.f.body, px, ImVec2(v.fraction >= 0 ? x0 : cx - ui::size_of(c.f.body, px, v.left.c_str()).x * 0.5f, under + 12 * k),
+                 c.theme.soft, v.left.c_str());
+        if (!v.right.empty())
+            ui::text(c, c.f.body, px, ImVec2(x1 - ui::size_of(c.f.body, px, v.right.c_str()).x, under + 12 * k), c.theme.soft, v.right.c_str());
+        if (!v.hint.empty()) ui::text_centre(c, c.f.body, 15.5f * k, ImVec2(cx, by + 92 * k), c.theme.dim, v.hint.c_str());
+    }
+    if (const float f = startup_fade.load(std::memory_order_relaxed); f > 0)
+        c.d->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), ui::rgba(0, 0, 0, (int)(std::min(f, 1.0f) * 255 + 0.5f)));
+}
 
 } // namespace
+
+void startup_fade_to(float f) { startup_fade.store(f, std::memory_order_relaxed); }
 
 // (#1916) Upscaler one-time probes on a background thread during start-up, so the first Insert open does not hitch.
 static void probe_upscalers_soon() {
@@ -1316,18 +1502,14 @@ static void probe_upscalers_soon() {
 void startup_screen(const StartupView* view) {
     if (!view) {
         startup_on.store(false, std::memory_order_release);
+        startup_fade.store(0, std::memory_order_relaxed);
         return;
     }
-    static int drawn_pct = 0;
-    const int pct = startup_scale(dev.swap_extent.width, dev.swap_extent.height);
     StartupView v = *view;
     if (v.version.empty()) v.version = version_text(HOOKSHOT_VERSION);
-    const double span = (kStartupW - 120) * pct / 100.0;
-    if (v.fraction >= 0) v.fraction = std::floor(std::min(v.fraction, 1.0) * span) / span;
-    if (pct != drawn_pct || !(v == startup)) {
+    {
+        std::lock_guard lk(startup_mu);
         startup = v;
-        drawn_pct = pct;
-        gdi_draw(startup_bmp, (uint32_t)(kStartupW * pct / 100), (uint32_t)(kStartupH * pct / 100), paint_startup, pct);
     }
     startup_on.store(true, std::memory_order_release);
     probe_upscalers_soon();
@@ -1414,10 +1596,12 @@ void menu_init() {
         // (v8 / #2147) FSR quality grew 92/83/75 between Native AA and Quality: old 1..4 → 4..7
         if (options_ver > 0 && options_ver < 8 && opts.fsr_quality >= 1 && opts.fsr_quality <= 4)
             opts.fsr_quality += 3;
-        // (v9) Menu theme: 0 OOT Mastersword (default), 1 Light, 2 Dark. First load of v9 takes OOT;
+        // (v9) Menu theme: 0 OOT Mastersword (default), 1 Light, 2 Dark, 3 Longshot. First load of v9 takes OOT;
         // after that the player's own Menu theme row is kept (saved as options_version 9).
         if (options_ver < 9) opts.menu_theme = 0;
-        opts.menu_theme = std::min(std::max(opts.menu_theme, 0), 2);
+        opts.menu_theme = std::min(std::max(opts.menu_theme, 0), 3);
+        opts.menu_size = std::min(std::max(opts.menu_size, 1), 3);
+        opts.overlay_size = std::min(std::max(opts.overlay_size, 1), 3);
         (void)has_menu_theme;
         // Older files only had the multiplier — that meant Hookshot's native FG.
         if (!has_fg_backend && opts.framegen >= 2) opts.fg_backend = 1;
@@ -1455,6 +1639,7 @@ void menu_init() {
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = std::min(std::max(atoi(e), 0), 2);
+    restart_init();
 }
 
 /// (#2187) First start with no options file: Quality preset from VRAM so small cards do not start at full docked budget.
@@ -1476,6 +1661,11 @@ void menu_first_start_for_gpu(const VkPhysicalDeviceProperties& props, const VkP
     sync_preset_budgets(preset);
     if (preset == 1) opts.upscale = 0, opts.sharpness = 0;
     opts.handheld = 0;   // docked: handheld Minimum gave a black picture on a GTX 1050
+    {
+        int now[mr::kMax];
+        restart_values(now);
+        restart_state.choose_later(now);
+    }
     save();
     logf("vk: first start on %s (%s, %llu MB of VRAM): the %s preset", props.deviceName, integrated ? "integrated" : "dedicated",
          (unsigned long long)mb, tx_preset(preset));
@@ -1601,13 +1791,15 @@ bool upscale_take_input(VkImage* img, VkImageView* view, VmaAllocation* alloc, V
 }
 
 void menu_set_gpu_count(int count) {
-    for (Row& r : rows) {
+    restart_init();
+    for (int i = 0; i < kRows; i++) {
+        Row& r = rows[i];
         if (r.value == &opts.gpu_device) {
             r.hi = count;
             if (opts.gpu_device > count) opts.gpu_device = 0;
+            if (restart_slot[i] >= 0) restart_state.restart_value(restart_slot[i], opts.gpu_device);
         }
     }
-    gpu_device_at_start = opts.gpu_device;
 }
 
 
@@ -1616,9 +1808,14 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     if (!r.value) return;
     if (r.value == &opts.framegen) v = snap_framegen(v, dir);
     if (r.value == &opts.vsync) v = vsync_cycle(*r.value, dir);
-    if (r.value == &opts.mouse_sens || r.value == &opts.stick_l_sens || r.value == &opts.stick_r_sens ||
-        r.value == &opts.fov)
-        v = std::min(std::max(v, r.lo), r.hi);
+    if (stops_at_ends(r)) v = std::min(std::max(v, r.lo), r.hi);
+    auto finish = [&] {
+        int now[mr::kMax];
+        restart_values(now);
+        restart_state.note(now);
+        clamp_tab_selection(cur_tab);
+        if (keep) save();
+    };
     // (#2000) Under DLSS / FSR 4, Resolution steps Auto ↔ Native ↔ real-size twelfths.
     if (r.value == &opts.resolution && temporal_sr_upscale()) {
         namespace ur = upscaler_rows;
@@ -1633,8 +1830,8 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         else opts.dlss_quality = dlss_quality_from_percent(ur::percent(new_res));
         opts.preset = 0;
         sync_preset_budgets(0);
-        clamp_tab_selection(cur_tab);
-        if (keep) save();
+        temporal_reset_failure();
+        finish();
         return;
     }
     if (r.value == &opts.dlss_quality && temporal_sr_upscale()) {
@@ -1650,8 +1847,8 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         }
         opts.preset = 0;
         sync_preset_budgets(0);
-        clamp_tab_selection(cur_tab);
-        if (keep) save();
+        temporal_reset_failure();
+        finish();
         return;
     }
     if (r.value == &opts.pad_layout) {
@@ -1681,26 +1878,28 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         if (r.value == &opts.color_brightness || r.value == &opts.color_contrast ||
             r.value == &opts.color_saturation || r.value == &opts.color_gamma)
             opts.color_preset = 3;
-        if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
-            r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
-            r.value != &opts.mouse_sens && r.value != &opts.stick_l_sens && r.value != &opts.stick_r_sens &&
-            r.value != &opts.mouse_invert && r.value != &opts.reflex &&
-            r.value != &opts.fov && r.value != &opts.text_speed && r.value != &opts.pad_background &&
-            r.value != &opts.ms_pacer &&
-            r.value != &opts.hybrid_cpu &&
-            r.value != &opts.color_preset && r.value != &opts.color_brightness &&
-            r.value != &opts.color_contrast && r.value != &opts.color_saturation &&
-            r.value != &opts.color_gamma) {
-            opts.preset = 0;
-            sync_preset_budgets(0);
+        if (!r.preset_exempt) {
+            if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
+                r.value != &opts.menu_size && r.value != &opts.overlay_size &&
+                r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
+                r.value != &opts.mouse_sens && r.value != &opts.stick_l_sens && r.value != &opts.stick_r_sens &&
+                r.value != &opts.mouse_invert && r.value != &opts.reflex &&
+                r.value != &opts.fov && r.value != &opts.text_speed && r.value != &opts.pad_background &&
+                r.value != &opts.ms_pacer &&
+                r.value != &opts.hybrid_cpu &&
+                r.value != &opts.color_preset && r.value != &opts.color_brightness &&
+                r.value != &opts.color_contrast && r.value != &opts.color_saturation &&
+                r.value != &opts.color_gamma) {
+                opts.preset = 0;
+                sync_preset_budgets(0);
+            }
         }
     }
     if (r.value == &opts.upscale || r.value == &opts.dlss || r.value == &opts.resolution ||
         r.value == &opts.output_res || r.value == &opts.dlss_quality || r.value == &opts.dlss_model ||
         r.value == &opts.fsr_quality)
         temporal_reset_failure();
-    clamp_tab_selection(cur_tab);
-    if (keep) save();
+    finish();
 }
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
@@ -1771,64 +1970,117 @@ void menu_tick() {
         const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
         press[i] = down && !held[i];
         held[i] = down;
+        if (press[i]) pad_last = false;
     }
-    // (hookshot) the gamepads, by position: Home, or Select and Start together, as Insert; the D-pad as the arrows,
-    // the bottom face button as Enter, the right one as Esc (not while a binding waits for its button)
     static uint32_t pad_held = 0;
     const uint32_t raw = mine && host && host->pad_raw ? host->pad_raw() : 0, pad_press = raw & ~pad_held;
     const uint32_t chord = 1u << HOS_PAD_BACK | 1u << HOS_PAD_START;
     const bool chord_now = (raw & chord) == chord && (pad_held & chord) != chord;
     pad_held = raw;
+    if (pad_press) pad_last = true;
+    {
+        static const char* force = getenv("RX_VK_UI_PROMPTS");
+        if (force) pad_last = !strcmp(force, "pad");
+    }
     auto pad = [&](int p) { return listening != 1 && (pad_press >> p & 1) != 0; };
-    if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
     if (pad(HOS_PAD_TOUCHPAD) && !touchpad_bound()) press[6] = true;
+    if (host && host->binding)
+        menu_keys::confirm_back(host->binding(HOS_BIND_PAD, HOS_SW_A, 0), host->binding(HOS_BIND_PAD, HOS_SW_B, 0),
+                                &pad_confirm, &pad_back);
+    if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
+    {   // holding an arrow or the D-pad repeats it: after 0.35 s, 12/s, then 30/s after 1.5 s held
+        static int64_t held_since[5], next_repeat[5];
+        const int pads[5] = {0, HOS_PAD_UP, HOS_PAD_DOWN, HOS_PAD_LEFT, HOS_PAD_RIGHT};
+        const int64_t t = prof_now();
+        for (int i = 1; i <= 4; i++) {
+            const bool down = held[i] || (open_now.load() && listening != 1 && (raw >> pads[i] & 1));
+            if (!down) { held_since[i] = 0; continue; }
+            if (!held_since[i]) { held_since[i] = t, next_repeat[i] = t + 350000000LL; continue; }
+            if (t >= next_repeat[i] && open_now.load() && listening == 0) {
+                press[i] = true;
+                next_repeat[i] = t + (t - held_since[i] > 1500000000LL ? 33000000LL : 83000000LL);
+            }
+        }
+    }
     if (open_now.load() && listening != 1) {
         press[1] |= pad(HOS_PAD_UP), press[2] |= pad(HOS_PAD_DOWN), press[3] |= pad(HOS_PAD_LEFT);
-        press[4] |= pad(HOS_PAD_RIGHT), press[5] |= pad(HOS_PAD_EAST), press[7] |= pad(HOS_PAD_SOUTH);
+        press[4] |= pad(HOS_PAD_RIGHT), press[5] |= pad(pad_back), press[7] |= pad(pad_confirm);
+    }
+    {   // RX_VK_MENU_SCRIPT (test runs): "<seconds>:<INS|UP|DOWN|LEFT|RIGHT|ESC|ENTER|TABL|TABR|PADS|PADE|PADW|PADN>,..."
+        static const char* next = getenv("RX_VK_MENU_SCRIPT");
+        static const int64_t start = prof_now();
+        double at;
+        char key[8];
+        int n = 0;
+        if (next && sscanf(next, "%lf:%7[A-Z]%n", &at, key, &n) == 2 && (prof_now() - start) / 1e9 >= at) {
+            static const char* const names[] = {"INS", "UP", "DOWN", "LEFT", "RIGHT", "ESC", "", "ENTER", "", "", "TABL", "TABR"};
+            for (int i = 0; i < 12; i++) press[i] |= *names[i] && !strcmp(key, names[i]);
+            static const char* const pads[] = {"PADS", "PADE", "PADW", "PADN"};
+            for (int p = 0; p < 4; p++)
+                if (!strcmp(key, pads[p]) && open_now.load() && listening != 1) {
+                    press[5] |= p == pad_back, press[7] |= p == pad_confirm;
+                    pad_last = true;
+                }
+            next = next[n] == ',' ? next + n + 1 : nullptr;
+        }
     }
     bool tab_left = press[10] || pad(HOS_PAD_LSHOULDER) || pad(HOS_PAD_LTRIGGER);
     bool tab_right = press[11] || press[12] || pad(HOS_PAD_RSHOULDER) || pad(HOS_PAD_RTRIGGER);
     if (press[12] && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) tab_left = true, tab_right = false;
-    const int scale = scale_of(dev.swap_extent.height);
-    // Fullscreen / resize: swapchain size can change without the preferred scale changing; still remake so the
-    // panel is clamped to the new image (otherwise Insert stays blank after Fullscreen On at 4K).
-    static uint32_t last_swap_w = 0, last_swap_h = 0;
-    const bool swap_changed = last_swap_w != dev.swap_extent.width || last_swap_h != dev.swap_extent.height;
-    last_swap_w = dev.swap_extent.width, last_swap_h = dev.swap_extent.height;
-    bool changed = scale != cur_scale || menu_refresh || (open_now.load() && swap_changed);
+    bool changed = menu_refresh;
     menu_refresh = false;
-    cur_scale = scale;
-    // (hookshot/#946) free mouse while the Insert menu is open
     MkwVkPointer ptr{};
-    int mx = -1, my = -1, mw = 0, mh = 0;
+    int mx = -1, my = -1;
     bool mouse = false, moved = false;
     if (open_now.load() && host && host->version >= 5 && host->pointer) {
         mouse = host->pointer(&ptr) != 0;
-        {
-            std::lock_guard lk(bmp_mu);
-            mw = (int)menu_bmp.w, mh = (int)menu_bmp.h;
-        }
-        int ix = 0, iy = 0, x0 = 0, y0 = 0;
+        int ix = 0, iy = 0;
         menu_hit::to_image(ptr.x, ptr.y, ptr.width, ptr.height, (int)dev.swap_extent.width, (int)dev.swap_extent.height,
                            &ix, &iy);
-        menu_hit::origin((int)dev.swap_extent.width, (int)dev.swap_extent.height, mw, mh, &x0, &y0);
-        if (mouse) mx = ix - x0, my = iy - y0;
+        if (mouse) mx = ix - (int)menu_ox, my = iy;
         static int last_x = -1, last_y = -1;
         moved = mouse && mouse_read && (mx != last_x || my != last_y);
         last_x = mx, last_y = my, mouse_read = true;
+        if (moved) pad_last = false;
         if (!mouse) ptr.pressed = 0, ptr.wheel = 0;
     }
-    if (press[0] || press[6]) {
+    auto later = [&] {
+        int now[mr::kMax];
+        restart_values(now);
+        restart_state.choose_later(now);
+        open_now = false, page = 0, changed = true;
+    };
+    if ((press[0] || press[6]) && open_now.load() && page == 5) {
+        later();
+    } else if ((press[0] || press[6]) && open_now.load() && restart_ask()) {
+        page = 5, ask_sel = 0, listening = 0, changed = true;
+    } else if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
-        // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved
-        // layout is not applied over them at start)
         if (open_now.load()) opts.pad_layout = detect_pad_layout();
     }
-    if (open_now.load() && page == 1) {   // (hookshot) the Controls page
+    if (open_now.load() && page == 5) {
+        if (mouse) {
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if (hit.part == menu_hit::kButton && (moved || ptr.pressed) && hit.index != ask_sel) ask_sel = hit.index, changed = true;
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kButton) press[7] = true;
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+        }
+        if (press[1] || press[2] || press[3] || press[4] || tab_left || tab_right) ask_sel ^= 1, changed = true;
+        if (press[5] || (press[7] && ask_sel == 0)) {
+            later();
+        } else if (press[7]) {
+            logf("menu: restart now, to apply %s", restart_list(", ").c_str());
+            save();
+            pipeline_cache_save(true);
+            open_now = false, page = 0, changed = true;
+            if (app_window()) PostMessageA(app_window(), WM_APP + 9, 0, 0);
+        }
+    } else if (open_now.load() && page == 1) {
+        using enum menu_hit::CtlColumn;
         if (!can_bind()) page = 0;
         else if (listening) {
-            if (press[5] || prof_now() > listen_end) listening = 0, changed = true;   // (Esc, or nothing for a while)
+            if (press[5] || prof_now() > listen_end) listening = 0, changed = true;
             else if (listening == 1) {
                 if (!listen_armed) listen_armed = (raw & ~(1u << HOS_PAD_GUIDE)) == 0;
                 else if (const uint32_t p = pad_press & ~(1u << HOS_PAD_GUIDE)) {
@@ -1848,57 +2100,70 @@ void menu_tick() {
                     }
                 if (!listen_armed) listen_armed = !down;
                 else if (down) {
-                    host->bind(HOS_BIND_KEY, controls[csel].button, 0, down);
-                    host->bind(HOS_BIND_KEY, controls[csel].button, 1, 0);
+                    const int slot = ccol == kCtlKeyboard ? 1 : 0;
+                    host->bind(HOS_BIND_KEY, controls[csel].button, slot, down);
                     listening = 0, changed = true;
                     save();
                 }
             }
         } else {
             if (mouse) {
-                const menu_hit::Hit hit = menu_hit::controls(mx, my, scale, mw, mh, kControls);
+                const menu_hit::Hit hit = hits.at((float)mx, (float)my);
                 const bool on = hit.part == menu_hit::kCtlRow || hit.part == menu_hit::kCtlCell;
                 if (on && (moved || ptr.pressed)) {
-                    if (hit.index != csel) csel = hit.index, changed = true;
-                    if (hit.part == menu_hit::kCtlCell && !keys_only(csel) && ccol != hit.side) ccol = hit.side, changed = true;
+                    if (hit.index != csel) csel = hit.index, scrolled_to[kControlsSlot] = csel, changed = true;
+                    if (hit.part == menu_hit::kCtlCell) {
+                        const int next_col = keys_only(csel) && hit.side == kCtlPrimary ? (int)kCtlKeyboard : hit.side;
+                        if (ccol != next_col) ccol = next_col, changed = true;
+                    }
                 }
                 if (ptr.pressed & HOS_MOUSE_LEFT) {
                     if (hit.part == menu_hit::kCtlCell || (hit.part == menu_hit::kCtlRow && hit.index == kControls))
                         press[7] = true;
                 }
                 if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
-                if (ptr.wheel) csel = ((csel - ptr.wheel) % (kControls + 1) + kControls + 1) % (kControls + 1), changed = true;
+                if (ptr.wheel) wheel_rows[kControlsSlot] += ptr.wheel, changed = true;
             }
+            const int n = kControls + 1;
             if (press[5]) page = 0, changed = true;
-            if (press[1]) csel = (csel + kControls) % (kControls + 1), changed = true;
-            if (press[2]) csel = (csel + 1) % (kControls + 1), changed = true;
-            if ((press[3] || press[4]) && csel < kControls && !keys_only(csel)) ccol ^= 1, changed = true;
-            if (keys_only(csel)) ccol = 1;   // (the stick's and the camera's directions: keys only)
+            if (press[1]) csel = (csel + kControls) % n, changed = true;
+            if (press[2]) csel = (csel + 1) % n, changed = true;
+            if ((press[3] || press[4]) && csel < kControls) {
+                if (keys_only(csel)) ccol = ccol == kCtlAlternate ? kCtlKeyboard : kCtlAlternate;
+                else ccol = (ccol + kCtlColumns + (press[3] ? -1 : 1)) % kCtlColumns;
+                changed = true;
+            }
+            if (keys_only(csel) && ccol == kCtlPrimary) ccol = kCtlKeyboard;
             if (press[7]) {
                 if (csel == kControls) {
                     host->bind(HOS_BIND_PAD, -1, 0, 0);
                     opts.pad_layout = 0;
                     save();
+                } else {
+                    listening = ccol == kCtlPrimary ? 1 : 2;
+                    listen_armed = false;
+                    listen_end = prof_now() + 6000000000LL;
                 }
-                else listening = ccol ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
                 changed = true;
             }
             if ((press[8] || press[9]) && csel < kControls) {
-                if (ccol == 0) {
+                if (ccol == kCtlPrimary) {
                     host->bind(HOS_BIND_PAD, controls[csel].button, 0, -1);
                     opts.pad_layout = detect_pad_layout();
+                } else {
+                    host->bind(HOS_BIND_KEY, controls[csel].button, ccol == kCtlKeyboard ? 1 : 0, 0);
                 }
-                else for (int k = 0; k < 2; k++) host->bind(HOS_BIND_KEY, controls[csel].button, k, 0);
                 changed = true;
                 save();
             }
         }
-        if (changed) redraw_menu(scale);
     } else if (open_now.load()) {
         if (mouse) {
-            const int count = tab_row_count(cur_tab);
-            const menu_hit::Hit hit = menu_hit::options(mx, my, scale, mw, mh, TAB_COUNT, count, row_value_l, row_slider);
-            const int ht = hit.part == menu_hit::kTab ? hit.index : -1;
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            const int ht = hit.part == menu_hit::kTab     ? hit.index
+                         : hit.part == menu_hit::kTabPrev ? TAB_COUNT
+                         : hit.part == menu_hit::kTabNext ? TAB_COUNT + 1
+                                                          : -1;
             if (ht != hover_tab) hover_tab = ht, changed = true;
             int& sel = tab_selected[cur_tab];
             const bool on_row = hit.part == menu_hit::kRow || hit.part == menu_hit::kSlider;
@@ -1908,11 +2173,12 @@ void menu_tick() {
                     drag_row = -1;
                     save();
                 } else {
-                    const int v = menu_hit::slider_value(menu_hit::slider_drag(mx, scale), d.lo, d.hi, d.step);
+                    const int permille = hits.drag((float)mx, drag_row);
+                    const int v = permille < 0 ? *d.value : menu_hit::slider_value(permille, d.lo, d.hi, d.step);
                     if (v != *d.value) set_row(d, v, v > *d.value ? 1 : -1, false), changed = true;
                 }
             } else if (on_row && (moved || ptr.pressed) && hit.index != sel) {
-                sel = hit.index, changed = true;
+                sel = hit.index, scrolled_to[cur_tab] = sel, changed = true;
             }
             if ((ptr.pressed & HOS_MOUSE_LEFT) && drag_row < 0) {
                 if (hit.part == menu_hit::kTabPrev) tab_left = true;
@@ -1926,34 +2192,21 @@ void menu_tick() {
                     changed = true;
                 } else if (hit.part == menu_hit::kRow) {
                     Row& d = rows[tab_row_to_global(cur_tab, hit.index)];
-                    if (!d.value) press[7] = true;
-                    else if (d.hi - d.lo == d.step || hit.side >= 0) press[4] = true;
-                    else press[3] = true;
+                    switch (menu_hit::row_click(d.value != nullptr, d.hi - d.lo == d.step, hit.side, d.value && *d.value == d.hi)) {
+                    case menu_hit::kClickConfirm: press[7] = true; break;
+                    case menu_hit::kClickRight: press[4] = true; break;
+                    case menu_hit::kClickLeft: press[3] = true; break;
+                    case menu_hit::kClickSelect: break;
+                    }
                 }
             }
             if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
-            if (ptr.wheel && drag_row < 0) {
-                Row& d = rows[tab_row_to_global(cur_tab, sel)];
-                const bool on_value = on_row && hit.index == sel && d.value &&
-                                      (hit.part == menu_hit::kSlider || hit.side != 0);
-                if (hit.part == menu_hit::kTab || hit.part == menu_hit::kTabPrev || hit.part == menu_hit::kTabNext) {
-                    if (ptr.wheel > 0) tab_left = true;
-                    else tab_right = true;
-                } else if (on_value) {
-                    const int dir = ptr.wheel > 0 ? 1 : -1;
-                    for (int n = ptr.wheel > 0 ? ptr.wheel : -ptr.wheel; n > 0; n--) {
-                        const int v = *d.value + dir * d.step;
-                        if (is_slider(d) && (v < d.lo || v > d.hi)) break;
-                        set_row(d, v, dir);
-                    }
-                    changed = true;
-                } else if (on_row || hit.part == menu_hit::kNone) {
-                    sel = ((sel - ptr.wheel) % count + count) % count, changed = true;
-                }
-            }
+            if (ptr.wheel && drag_row < 0) wheel_rows[cur_tab] += ptr.wheel, changed = true;
         }
-        if (press[5]) open_now = false;
-        // (the tabs: LB and RB, Q and E, or Tab)
+        if (press[5]) {
+            if (restart_ask()) page = 5, ask_sel = 0, changed = true;
+            else open_now = false;
+        }
         if (tab_left) cur_tab = (cur_tab + TAB_COUNT - 1) % TAB_COUNT, changed = true;
         else if (tab_right) cur_tab = (cur_tab + 1) % TAB_COUNT, changed = true;
         clamp_tab_selection(cur_tab);
@@ -1962,98 +2215,27 @@ void menu_tick() {
         if (press[1]) selected = (selected + tab_count - 1) % tab_count, changed = true;
         if (press[2]) selected = (selected + 1) % tab_count, changed = true;
         Row& r = rows[tab_row_to_global(cur_tab, selected)];
-        if (press[7] && !r.value && !strcmp(r.name, "Controls") && can_bind())
-            page = 1, csel = 0, ccol = 0, changed = true;
-        if ((press[3] || press[4] || press[7]) && !r.value && !strcmp(r.name, "Quit to Desktop")) {
+        if (press[7] && !r.value && !strcmp(r.name, "Controls") && can_bind()) {
+            page = 1, csel = 0, ccol = menu_hit::kCtlPrimary, changed = true;
+        } else if (press[7] && !r.value && !strcmp(r.name, "Quit to Desktop")) {
             save();
-            ExitProcess(0);
-        }
-        if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
+            if (const HWND window = app_window()) PostMessageA(window, WM_CLOSE, 0, 0);
+            else ExitProcess(0);
+        } else if ((press[3] || press[4] || press[7]) && r.value) {
             if (press[7]) press[4] = true;
-            if (r.value == &opts.resolution && temporal_sr_upscale()) {
-                set_row(r, *r.value, press[4] ? 1 : -1);
-                changed = true;
-            } else if (r.value == &opts.dlss_quality && temporal_sr_upscale()) {
-                int v = *r.value + (press[4] ? r.step : -r.step);
-                v = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-                set_row(r, v, press[4] ? 1 : -1);
-                changed = true;
-            } else {
-            int v = *r.value + (press[4] ? r.step : -r.step);
-            if (r.value == &opts.vsync) v = vsync_cycle(*r.value, press[4] ? 1 : -1);
-            if (r.value == &opts.framegen) v = snap_framegen(v, press[4] ? 1 : -1);
-            if (r.value == &opts.mouse_sens || r.value == &opts.stick_l_sens || r.value == &opts.stick_r_sens)
-                v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
-            if (r.value == &opts.pad_layout) {
-                if (v > 2) v = press[4] ? 0 : 2;
-                if (v < 0) v = 2;
-                *r.value = v;
-                apply_pad_layout(*r.value);
-            } else if (r.value == &opts.preset) {
-                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-                apply_preset(*r.value);
-            } else if (r.value == &opts.color_preset) {
-                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-                if (*r.value <= 2) apply_color_preset(*r.value);
-            } else if (r.value == &opts.framegen) {
-                *r.value = v;
-                if (*r.value >= 2 && opts.fg_backend == 0) opts.fg_backend = 1;   // mult with engine Off → Hookshot
-                opts.preset = 0;
-                sync_preset_budgets(0);
-            } else {
-                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-                if (r.value == &opts.fg_backend) {
-                    if (*r.value > 0 && opts.framegen < 2) opts.framegen = 2;
-                    if (*r.value == 0) opts.framegen = 0;
-                    clamp_framegen_steps();   // engine change: keep only that engine's steps
-                }
-                if (r.value == &opts.color_brightness || r.value == &opts.color_contrast ||
-                    r.value == &opts.color_saturation || r.value == &opts.color_gamma)
-                    opts.color_preset = 3;   // Custom
-                if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
-                    r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
-                    r.value != &opts.mouse_sens && r.value != &opts.stick_l_sens && r.value != &opts.stick_r_sens &&
-                    r.value != &opts.mouse_invert &&
-                    r.value != &opts.ms_pacer &&
-                    r.value != &opts.hybrid_cpu &&
-                    r.value != &opts.color_preset && r.value != &opts.color_brightness &&
-                    r.value != &opts.color_contrast && r.value != &opts.color_saturation &&
-                    r.value != &opts.color_gamma) {   // (the controls / colour are not the quality preset's)
-                    opts.preset = 0; // Custom
-                    sync_preset_budgets(0);
-                }
-            }
-            clamp_tab_selection(cur_tab);   // (FG / upscale sub-rows appear or hide)
+            set_row(r, *r.value + (press[4] ? r.step : -r.step), press[4] ? 1 : -1);
             changed = true;
-            save();
-            }  // else not DLSS Resolution / quality via set_row
         }
         const int64_t now = prof_now();
-        if (changed) {   // (a new row or value: its name from the start, after a rest)
+        if (changed) {
             marquee_pos = 0, marquee_next = now + kMarqueeRest;
         } else if (marquee_max > 0 && now >= marquee_next) {
-            if (marquee_pos >= marquee_max) marquee_pos = 0, marquee_next = now + kMarqueeRest;   // (back to the start)
-            else if (++marquee_pos >= marquee_max) marquee_next = now + kMarqueeRest;            // (rest at the end)
+            if (marquee_pos >= marquee_max) marquee_pos = 0, marquee_next = now + kMarqueeRest;
+            else if (++marquee_pos >= marquee_max) marquee_next = now + kMarqueeRest;
             else marquee_next = now + kMarqueeStep;
             changed = true;
         }
-        if (changed) redraw_menu(scale);
     }
-    if (opts.show_fps) {
-        static int64_t next = 0, last_game = 0, last_shown = 0;
-        const int64_t now = prof_now();
-        double shown = 0, game = 0;
-        if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
-            snprintf(fps_text, sizeof fps_text, "%.0f", shown);
-            if (opts_fg_on()) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
-            else fps_sub[0] = 0;
-            fps_bmp.keyed = true;
-            gdi_draw(fps_bmp, 120u * scale, 54u * scale, paint_fps, scale);
-        }
-    }
-}
-
-void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h) {
     {   // (hookshot/#946) free the mouse while open; restore capture on close
         static bool told = false;
         const bool now_open = open_now.load();
@@ -2066,51 +2248,49 @@ void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_
             PostMessageA(app_window(), WM_APP + 8, (WPARAM)now_open, 0);
         }
     }
-    if (startup_on.load(std::memory_order_acquire)) {
-        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
-        vkCmdPipelineBarrier2(cmd, &di);
-        std::unique_lock lk(bmp_mu);
-        const uint32_t sw = startup_bmp.w, sh = startup_bmp.h;
-        lk.unlock();
-        if (sw) copy_over(cmd, dst, startup_bmp, ups[2][slot], (int)(w - sw) / 2, (int)(h - sh) / 2, w, h);
-    }
-    if (opts.show_fps && !startup_on.load(std::memory_order_relaxed)) {
-        // The game image was just blitted (or cleared) into dst. Its write must
-        // finish before the FPS pixels overwrite it; command order alone does
-        // not order these transfer writes. The menu below has its own barrier.
-        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
-        vkCmdPipelineBarrier2(cmd, &di);
-        std::unique_lock lk(bmp_mu);
-        const uint32_t fw = fps_bmp.w;
-        lk.unlock();
-        if (fw) copy_over(cmd, dst, fps_bmp, ups[1][slot], (int)w - (int)fw - (int)(12 * cur_scale), (int)(10 * cur_scale), w, h);
-    }
-    if (open_now.load(std::memory_order_relaxed)) {
-        std::unique_lock lk(bmp_mu);
-        const uint32_t mw = menu_bmp.w, mh = menu_bmp.h;
-        lk.unlock();
-        // (one copy finished before the next: on a Radeon the menu came out with its top torn away beside the FPS counter)
-        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
-        vkCmdPipelineBarrier2(cmd, &di);
-        if (mw) {
-            int mx = (int)(w - mw) / 2, my = (int)(h - mh) / 2;
-            if (mx < 0) mx = 0;
-            if (my < 0) my = 0;
-            copy_over(cmd, dst, menu_bmp, ups[0][slot], mx, my, w, h);
+    if (opts.show_fps) {
+        static int64_t next = 0, last_game = 0, last_shown = 0;
+        const int64_t now = prof_now();
+        double shown = 0, game = 0;
+        if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
+            snprintf(fps_text, sizeof fps_text, "%.0f", shown);
+            if (opts_fg_on()) {
+                if (const char* who = fg_short_name(opts.fg_backend)) snprintf(fps_sub, sizeof fps_sub, "Base %.0f, %s", game, who);
+                else snprintf(fps_sub, sizeof fps_sub, "Base %.0f", game);
+            } else {
+                fps_sub[0] = 0;
+            }
         }
     }
+}
+
+void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
+    const bool start = startup_on.load(std::memory_order_acquire);
+    const bool fps = opts.show_fps && !start;
+    const bool open = open_now.load(std::memory_order_relaxed);
+    if (!start && !fps && !open) {
+        if (prebake_needed(w, h) && ui::begin(w, h)) {
+            ui::Ctx c = ui_ctx(w, h);
+            prebake(c);
+            ui::record(cmd, index, w, h);
+            return;
+        }
+        ui::idle();
+        return;
+    }
+    if (!ui::begin(w, h)) return;
+    {
+        static int64_t last = 0;
+        const int64_t now = prof_now();
+        ease_step = last ? std::min(1.0f, (float)((now - last) / 1e9) * 15.0f) : 1.0f;
+        last = now;
+    }
+    ui::Ctx c = ui_ctx(w, h);
+    prebake(c);
+    if (start) draw_startup(c);
+    if (open) draw_menu(c);
+    if (fps) draw_fps(c, open);
+    ui::record(cmd, index, w, h);
 }
 
 } // namespace mkwvk

@@ -693,7 +693,8 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     ci.codeSize = spirv.size() * 4;
     ci.pCode = spirv.data();
     VkShaderModule m = VK_NULL_HANDLE;
-    vkCreateShaderModule(dev.device, &ci, nullptr, &m);
+    IntelDriverGate gate;
+    if (extern_guarded_shader_module(&ci, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
     if (m) {   // (MasterSword: the memory census's count of the game's shader code the driver holds)
         g_module_bytes += (int64_t)ci.codeSize, g_modules++;
     }
@@ -2054,7 +2055,7 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
 
 const Program* mesh_program_for(const NvnState& s, const uint8_t color_types[8]) {
     PROF_EXACT();
-    ParLock plk;
+    ParLock plk(ParSite::ProgramPick);
     std::lock_guard lk(shader_mu);
     return mesh_program_locked(s, color_types);
 }

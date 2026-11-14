@@ -576,14 +576,26 @@ static int serial_name(const char *name) {
 int hos_thread_serial(const HosThread *t) {
     return t && __atomic_load_n(&t->serial, __ATOMIC_RELAXED);
 }
-/* HOS_SPIN_US (default 20 µs) on serial threads; HOS_SPIN_OTHER_US (default 5 µs, capped by HOS_SPIN_US) on others.
+enum { SHORT_SLEEP_TIMER_THREADS = 6 };
+static int process_threads(void) {
+    int threads = 0;
+#if defined(_WIN32)   /* (measured on Windows only) */
+    /* (with more than one processor group the mask is one group's, not the process's: not known then) */
+    DWORD_PTR proc = 0, sys = 0;
+    if (GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
+        threads = __builtin_popcountll((uint64_t)proc);
+#endif
+    return threads;
+}
+
+/* HOS_SPIN_US (default 20 µs) on serial threads; HOS_SPIN_OTHER_US (default 5 µs on 7+ thread CPUs, capped by HOS_SPIN_US) on others.
    Idle workers were burning most of a flat 20 µs spin. HOS_SPIN_OTHER_US=20 restores the old one-spin-for-all. */
 int64_t hos_spin_ns(void) {
     static int64_t both = -1;   /* serial ns << 32 | other ns */
     int64_t b = __atomic_load_n(&both, __ATOMIC_RELAXED);
     if (b < 0) {
         const char *e = getenv("HOS_SPIN_US"), *o = getenv("HOS_SPIN_OTHER_US");
-        int64_t s = e ? atoll(e) : 20, other = o ? atoll(o) : 5;
+        int64_t s = e ? atoll(e) : 20, other = o ? atoll(o) : process_threads() > SHORT_SLEEP_TIMER_THREADS ? 5 : s;
         s = (s < 0 ? 0 : s > 1000000 ? 1000000 : s) * 1000;
         other = (other < 0 ? 0 : other > 1000000 ? 1000000 : other) * 1000;
         if (other > s) other = s;
@@ -1012,10 +1024,18 @@ static void sleep_ns(int64_t ns, int guest);
    frame's CPU time fell 9 %. On 8 threads and more yielding stays: with the timer for all sleeps there were no long
    frames either way and Kokiri lost 0.2 fps under its cap, and the timer made TOTK's 20 us waits for its job workers 25x
    longer, ~2000 a second on the frame's critical path. */
-enum { SHORT_SLEEP_TIMER_THREADS = 6 };
 static int hos_short_sleep_timer(const char *asked, int threads) {
     if (asked) return env_value_off(asked) ? 0 : 2;
     return threads > 0 && threads <= SHORT_SLEEP_TIMER_THREADS ? 1 : 0;
+}
+/* (#2709) At most HOS_SHORT_SLEEP_POLLERS non-serial guest threads yield through a short sleep at once on 7+ thread CPUs;
+   the rest wait on the timer until a poller slot frees. */
+static volatile LONG short_pollers;   /* (the game's threads in the yield loop now) */
+static int hos_short_sleep_pollers(const char *asked, int threads) {
+    char *end = NULL;
+    const long n = asked && *asked ? strtol(asked, &end, 10) : 0;
+    if (end && end != asked && *end == 0) return n > 0 ? (int)(n < 1024 ? n : 1024) : 0;
+    return threads > SHORT_SLEEP_TIMER_THREADS ? threads / 4 : 0;
 }
 /* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) guest: the game's own sleep */
 static void sleep_away(int64_t ns, int guest) {
@@ -1058,15 +1078,11 @@ static void sleep_ns(int64_t ns, int guest) {
 #endif
     /* Under a millisecond: yielded away until the time, or the timer for the game's own sleeps where the processors
        are few (hos_short_sleep_timer). HOS_SHORT_SLEEP_TIMER=1: the timer always, 0: never, not set: by the processors */
-    static int short_timer = -1;
-    if (short_timer < 0) {
-        int threads = 0;
-#if defined(_WIN32)   /* (measured on Windows only: elsewhere the timer when asked for) */
-        /* (with more than one processor group the mask is one group's, not the process's: not known then) */
-        DWORD_PTR proc = 0, sys = 0;
-        if (GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
-            threads = __builtin_popcountll((uint64_t)proc);
-#endif
+    /* (the choice, how | the cap << 2: one atomic word, so a thread sees both or neither) */
+    static int choice = -1;
+    int chosen = __atomic_load_n(&choice, __ATOMIC_RELAXED);
+    if (chosen < 0) {
+        const int threads = process_threads();
         const int how = hos_short_sleep_timer(getenv("HOS_SHORT_SLEEP_TIMER"), threads);
         /* (the line says what was chosen, before any thread has made its timer: where the high-resolution timer cannot
            be made, Windows before 10 1803, a short sleep falls through to the yield loop at the end and nothing changes) */
@@ -1075,12 +1091,24 @@ static void sleep_ns(int64_t ns, int guest) {
             hos_log("sleep: %s sleeps under a millisecond wait on the timer where Windows has the high-resolution one "
                     "(%d logical processors; HOS_SHORT_SLEEP_TIMER=0: all yield)",
                     how == 2 ? "all" : "the game's", threads);
-        short_timer = how;
+        /* (HOS_SHORT_SLEEP_TIMER set says how all short sleeps wait: no limit then) */
+        const int cap = how || getenv("HOS_SHORT_SLEEP_TIMER") ? 0 : hos_short_sleep_pollers(getenv("HOS_SHORT_SLEEP_POLLERS"), threads);
+        if (cap && !InterlockedExchange(&told, 1))
+            hos_log("sleep: at most %d of the game's threads yield through a short sleep at a time, the others wait on the "
+                    "timer (%d logical processors; HOS_SHORT_SLEEP_POLLERS=0: all yield)", cap, threads);
+        chosen = how | (cap << 2);
+        __atomic_store_n(&choice, chosen, __ATOMIC_RELAXED);
     }
+    const int short_timer = chosen & 3, poll_cap = chosen >> 2;
     if (ns < 1000000 && short_timer < (guest ? 1 : 2)) {
-        while (hos_now_ns() < until)
-            if (!SwitchToThread()) YieldProcessor();
-        return;
+        const int counted = guest && poll_cap && !hos_thread_serial(hos_self());
+        if (!counted || InterlockedIncrement(&short_pollers) <= poll_cap) {
+            while (hos_now_ns() < until)
+                if (!SwitchToThread()) YieldProcessor();
+            if (counted) InterlockedDecrement(&short_pollers);
+            return;
+        }
+        InterlockedDecrement(&short_pollers);   /* (enough of them poll already: the timer, below) */
     }
     if (!tried) {
         tried = 1;
@@ -1555,22 +1583,7 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
     const char *e = getenv(name);
     return (e ? atoll(e) : us) * 1000;
 }
-static void vc_acquire(HosThread *t) {
-    static int64_t esc_better = -1, esc_eq, slice;
-    if (esc_better < 0) {
-        /* (#2127 / #1929) 2 s default: 250 ms escaped 6–8×/run on waits that finish alone within ~1.2 s */
-        esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 2000000);
-        esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 2000000);
-        slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
-    }
-    AcquireSRWLockExclusive(&vc_lock);
-    vc_st.takes++;
-    int c = vc_free_for(t);
-    if (c >= 0) {
-        vc_take(t, c);
-        ReleaseSRWLockExclusive(&vc_lock);
-        return;
-    }
+static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int64_t slice) {   /* (vc_lock held) */
     const int64_t t0 = hos_now_ns();
     t->vc_since = t0;
     t->vc_queued = 1;
@@ -1587,7 +1600,9 @@ static void vc_acquire(HosThread *t) {
             HosThread *h = vc_owner[k];
             if ((m >> k & 1) && h && h->priority > t->priority && (!worst || h->priority > worst->priority)) worst = h;
         }
-        if (!worst && hos_now_ns() - t0 > slice)
+        const int64_t now = hos_now_ns();
+        const int64_t elapsed = now - t0;
+        if (!worst && elapsed > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
         if (worst && !worst->vc_kick) {
@@ -1596,8 +1611,15 @@ static void vc_acquire(HosThread *t) {
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
         }
-        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, 1, 0);
+        const int64_t esc_lim = worst ? esc_better : esc_eq;
+        const int64_t rem_esc_ms = esc_lim > elapsed ? (esc_lim - elapsed + 999999LL) / 1000000LL : 1;
+        int64_t wait_ms = worst ? 4 : (slice > elapsed ? (slice - elapsed + 999999LL) / 1000000LL : 1);
+        if (wait_ms < 1) wait_ms = 1;
+        if (wait_ms > 4) wait_ms = 4;
+        if (wait_ms > rem_esc_ms) wait_ms = rem_esc_ms;
+        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, (DWORD)wait_ms, 0);
         if (t->vc_held) break;   /* granted by a release */
+        int c;
         if ((c = vc_free_for(t)) >= 0) {
             vc_dequeue(t);
             vc_take(t, c);
@@ -1627,6 +1649,27 @@ static void vc_acquire(HosThread *t) {
     vc_st.wait_ns += waited;
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
     vc_stats_locked(hos_now_ns());
+}
+static int64_t vc_esc_better = -1, vc_esc_eq, vc_slice;
+static void vc_init_params(void) {
+    if (vc_esc_better < 0) {
+        /* (#2127 / #1929) 2 s default: 250 ms escaped 6-8x/run on waits that finish alone within ~1.2 s */
+        vc_esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 2000000);
+        vc_esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 2000000);
+        vc_slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
+    }
+}
+static void vc_acquire(HosThread *t) {
+    vc_init_params();
+    AcquireSRWLockExclusive(&vc_lock);
+    vc_st.takes++;
+    const int c = vc_free_for(t);
+    if (c >= 0) {
+        vc_take(t, c);
+        ReleaseSRWLockExclusive(&vc_lock);
+        return;
+    }
+    vc_wait_locked(t, vc_esc_better, vc_esc_eq, vc_slice);
     ReleaseSRWLockExclusive(&vc_lock);
 }
 static void vc_release(HosThread *t) {
@@ -1639,10 +1682,12 @@ static void vc_release(HosThread *t) {
     vc_grant(c);
     ReleaseSRWLockExclusive(&vc_lock);
 }
-/* gives the core to a waiter allowed on it that is better than t (strict) or as good (a yield) */
+/* gives the core to a waiter allowed on it that is better than t (strict) or as good (a yield), under a single vc_lock hold */
 static void vc_yield(HosThread *t, int strict) {
     if (!t->vc_held) return;
+    vc_init_params();
     AcquireSRWLockExclusive(&vc_lock);
+    if (!t->vc_held) { ReleaseSRWLockExclusive(&vc_lock); return; }
     const int c = t->vc_held - 1;
     int any = 0;
     for (int i = 0; i < vc_nq && !any; i++) {
@@ -1650,11 +1695,23 @@ static void vc_yield(HosThread *t, int strict) {
         any = (vc_allowed(w) >> c & 1) && (strict ? w->priority < t->priority : w->priority <= t->priority);
     }
     t->vc_kick = 0;
-    if (any) vc_st.yields++;
+    if (!any) {
+        ReleaseSRWLockExclusive(&vc_lock);
+        return;
+    }
+    vc_st.yields++;
+    vc_owner[c] = NULL;
+    t->vc_held = 0;
+    vc_grant(c);
+    vc_st.takes++;
+    const int nc = vc_free_for(t);
+    if (nc >= 0) {
+        vc_take(t, nc);
+        ReleaseSRWLockExclusive(&vc_lock);
+        return;
+    }
+    vc_wait_locked(t, vc_esc_better, vc_esc_eq, vc_slice);
     ReleaseSRWLockExclusive(&vc_lock);
-    if (!any) return;
-    vc_release(t);
-    vc_acquire(t);
 }
 /* 1 when the caller is to take a core again after its block (hos_vcore_back): it gave its core up, or it has run without
    one since an escape. An escape lasts until the thread's next block, as every other thread waits for a core after one;

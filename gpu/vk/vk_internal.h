@@ -10,6 +10,7 @@
 
 #include "vk_loader.h"
 #include "vk_api.h"
+#include "hookshot_env.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -57,7 +58,8 @@ struct Device {
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
          native_mma = false,    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
          present_id = false,    // (VK_KHR_present_id: NVIDIA Reflex present IDs)
-         reflex = false;        // (VK_NV_low_latency2: NVIDIA Reflex, vk_reflex.cpp)
+         reflex = false,        // (VK_NV_low_latency2: NVIDIA Reflex, vk_reflex.cpp)
+         swap_mutable = false;  // (VK_KHR_swapchain_mutable_format: UNORM view of an sRGB window image for ImGui overlays)
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
     bool task_mesh_fallback = false;   // (AMD RX 6700 XT class: task+mesh as compute even with mesh shaders, #1747)
@@ -78,6 +80,8 @@ struct Device {
     VkFormat swap_format = VK_FORMAT_UNDEFINED;
     VkExtent2D swap_extent{};
     std::vector<VkImage> swap_images;
+    std::vector<VkImageView> swap_views;
+    VkFormat swap_view_format = VK_FORMAT_UNDEFINED;
     std::vector<VkSemaphore> swap_rendered;   // present waits belong to acquired images, not frame slots
     uint64_t swapchain_generation = 0;   // (under the presentation lock)
     std::mutex present_mu;   // (the swapchain: presents and resizes)
@@ -90,6 +94,39 @@ struct Device {
     uint32_t present_family = 0;   // (present_queue's family, the swapchain's images shared with it)
 };
 extern Device dev;
+
+/// (longshot) Windows Intel's compiler (igvk64, UHD and Arc) faults when two threads hand it shaders at once. One
+/// thread enters vkCreateShaderModule and vkCreate*Pipelines. Other vendors, and Intel on other systems, are not held.
+/// RX_VK_NO_INTEL_SERIAL=1: side by side, as before.
+/// ask: a create that compiles nothing (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), on the replay thread so
+/// a draw or dispatch never waits for a compile. It never waits here either: while a worker holds the gate, busy is set and
+/// the caller answers VK_PIPELINE_COMPILE_REQUIRED (cold) without asking the driver.
+inline bool intel_gate_on() {
+#ifdef _WIN32
+    static const bool on = !env_on("RX_VK_NO_INTEL_SERIAL") && dev.props.vendorID == 0x8086;
+    return on;
+#else
+    return false;
+#endif
+}
+struct IntelDriverGate {
+    std::unique_lock<std::mutex> hold;
+    bool busy = false;
+    explicit IntelDriverGate(bool ask = false) {
+        if (!intel_gate_on()) return;
+        static std::mutex mu;
+        static std::once_flag once;
+        std::call_once(once, [] {
+            logf("vk: Intel's compiler is entered by one thread (RX_VK_NO_INTEL_SERIAL: side by side)");
+        });
+        if (ask) {
+            hold = std::unique_lock<std::mutex>(mu, std::try_to_lock);
+            busy = !hold.owns_lock();
+        } else {
+            hold = std::unique_lock<std::mutex>(mu);
+        }
+    }
+};
 
 /// A range of guest memory as the GPU sees it: a buffer (an imported pool), the offset in it, and its device address
 struct BufferRef {
@@ -146,17 +183,44 @@ void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
 /// one lock; the per-draw caches are each thread's own
 extern std::atomic<bool> par_active;
 extern std::atomic<int64_t> par_lock_wait_ns, par_locks;   // (contention: the time threads waited for it)
+enum class ParSite : uint8_t {
+    Other = 0,
+    Pipe,
+    Sampler,
+    TexTouch,
+    TexView,
+    StorageImg,
+    Targets,
+    PassMarks,
+    Clear,
+    EnsureLayout,
+    Compute,
+    BufPool,
+    BufBind,
+    ReplayCopy,
+    ProgramPick,
+    Count
+};
+struct ParSiteStat {
+    std::atomic<int64_t> locks{0}, wait_ns{0};
+};
+extern ParSiteStat par_site_stats[(size_t)ParSite::Count];
+const char* par_site_name(ParSite s);
 std::recursive_mutex& par_mutex();
 int64_t par_now_ns();
 struct ParLock {
     bool on;
-    explicit ParLock(bool want = true) : on(want && par_active.load(std::memory_order_relaxed)) {
+    explicit ParLock(bool want = true) : ParLock(ParSite::Other, want) {}
+    ParLock(ParSite site, bool want = true) : on(want && par_active.load(std::memory_order_relaxed)) {
         if (!on) return;
         par_locks.fetch_add(1, std::memory_order_relaxed);
+        par_site_stats[(size_t)site].locks.fetch_add(1, std::memory_order_relaxed);
         if (par_mutex().try_lock()) return;
         const int64_t t0 = par_now_ns();
         par_mutex().lock();
-        par_lock_wait_ns.fetch_add(par_now_ns() - t0, std::memory_order_relaxed);
+        const int64_t dt = par_now_ns() - t0;
+        par_lock_wait_ns.fetch_add(dt, std::memory_order_relaxed);
+        par_site_stats[(size_t)site].wait_ns.fetch_add(dt, std::memory_order_relaxed);
     }
     ~ParLock() {
         if (on) par_mutex().unlock();
@@ -220,6 +284,7 @@ void memory_note_cpu_read(uint64_t guest, uint64_t size);   // (invalidate) a CP
 void memory_note_cpu_access(uint64_t guest, uint64_t size, bool write);   // (and a CPU write a mirror sync copies: wb_learn.h)
 bool memory_wb_followed(uint64_t lo, uint64_t hi);   // (whether a large binding wb_learn.h follows overlaps [lo, hi))
 bool memory_rb_refresh(VkCommandBuffer up);
+bool pools_mirrored();   // (vk_memory.cpp mirror_on: the buffer pools have VRAM mirrors)
 void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its thread: the submission it joins (memory_rb_refresh)
 void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel replay's segments: their order, base on)
 /// (hookshot) a range a program may write in the mirror that is not bound as written (not copied back): memory_rb_refresh
@@ -315,7 +380,42 @@ void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 namespace mkwvk {
 enum ProfPhase { PROF_SUBMIT, PROF_PRESENT, PROF_DRAW, PROF_DESC, PROF_TEXGET, PROF_UPLOAD, PROF_PIPE, PROF_PROGRAM,
                  PROF_CMDS, PROF_DISPATCH, PROF_MEMSYNC, PROF_QSUBMIT, PROF_SLOTWAIT, PROF_COUNT };
-extern int64_t prof_ns[PROF_COUNT];
+enum { PROF_MAX_SLOTS = 128 };
+struct alignas(64) ProfSlot {
+    int64_t ns[PROF_COUNT]{};
+};
+extern ProfSlot prof_slots[PROF_MAX_SLOTS + 1];
+extern std::atomic<int> prof_slot_count;
+inline thread_local ProfSlot* prof_my_slot = nullptr;   // (raw pointer: no TLS ctor/dtor; one cache-line-isolated slot per thread)
+ProfSlot* prof_alloc_slot();
+inline void prof_add(int phase, int64_t dt) {
+    ProfSlot* s = prof_my_slot;
+    if (!s) s = prof_alloc_slot();
+    if (s == &prof_slots[PROF_MAX_SLOTS]) {
+        std::atomic_ref<int64_t>(s->ns[phase]).fetch_add(dt, std::memory_order_relaxed);
+    } else {
+        int64_t& cell = s->ns[phase];
+        std::atomic_ref<int64_t>(cell).store(cell + dt, std::memory_order_relaxed);
+    }
+}
+inline int64_t prof_phase_ns(int phase) {
+    const int n_raw = prof_slot_count.load(std::memory_order_acquire);
+    const int n = n_raw < PROF_MAX_SLOTS ? n_raw : PROF_MAX_SLOTS;
+    int64_t sum = std::atomic_ref<const int64_t>(prof_slots[PROF_MAX_SLOTS].ns[phase]).load(std::memory_order_relaxed);
+    for (int i = 0; i < n; i++)
+        sum += std::atomic_ref<const int64_t>(prof_slots[i].ns[phase]).load(std::memory_order_relaxed);
+    return sum;
+}
+inline void prof_snapshot(int64_t out[PROF_COUNT]) {
+    for (int i = 0; i < PROF_COUNT; i++) out[i] = 0;
+    const int n_raw = prof_slot_count.load(std::memory_order_acquire);
+    const int n = n_raw < PROF_MAX_SLOTS ? n_raw : PROF_MAX_SLOTS;
+    for (int s = 0; s < n; s++)
+        for (int i = 0; i < PROF_COUNT; i++)
+            out[i] += std::atomic_ref<const int64_t>(prof_slots[s].ns[i]).load(std::memory_order_relaxed);
+    for (int i = 0; i < PROF_COUNT; i++)
+        out[i] += std::atomic_ref<const int64_t>(prof_slots[PROF_MAX_SLOTS].ns[i]).load(std::memory_order_relaxed);
+}
 /// Nanoseconds from a performance-counter reading. An integer number of nanoseconds per tick is a multiply, so a
 /// reading past 2^53 does not lose its low bits the way the double divide does.
 inline int64_t perf_ticks_to_ns(int64_t ticks, int64_t freq) {
@@ -370,7 +470,7 @@ struct ProfScope {
     explicit ProfScope(int p) : phase(p), t0(prof_now()), x0(prof_t.exact) {}
     ~ProfScope() {
         const int64_t dt = prof_now() - t0;
-        if (phase >= 0) prof_ns[phase] += dt;
+        if (phase >= 0) prof_add(phase, dt);
         prof_t.exact = x0 + dt;   // (what was exact inside is part of dt: not counted twice)
     }
 };
@@ -399,11 +499,15 @@ struct ProfScopeHot {
     ~ProfScopeHot() {
         ProfThread& t = prof_t;
         const int64_t x = t.exact - x0;   // (timed exactly inside: once, as it is)
-        if (k) prof_ns[phase] += (prof_now() - t0 - x) * k + x;
-        else if (x) prof_ns[phase] += x;
+        if (k) prof_add(phase, (prof_now() - t0 - x) * k + x);
+        else if (x) prof_add(phase, x);
         t.open--;
     }
 };
+// Slate 3 / Temper 3 (vk_mempack.cpp): ABI-safe draw/frame attribution by program key and area picture.
+void temper3_note_draw(uint64_t prog_key, bool desc_rebuilt, bool uniform_only);
+void temper3_frame(double total_ms, double submit_ms, int64_t par_locks, double par_wait_ms, int draws);
+void heros_shade_tune(int default_threads, int default_seg, int* out_threads, int* out_seg);
 } // namespace mkwvk
 #define PROF(phase) ::mkwvk::ProfScope prof_scope_##phase(::mkwvk::phase)
 #define PROF_HOT(phase) ::mkwvk::ProfScopeHot prof_scope_##phase(::mkwvk::phase)   // (the per-draw phases: sampled, above)

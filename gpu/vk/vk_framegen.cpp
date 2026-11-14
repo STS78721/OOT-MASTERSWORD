@@ -23,6 +23,7 @@
 #include "vk_menu.h"
 #include "vk_reflex.h"
 #include "vk_texture.h"
+#include "vk_draw.h"   // (extern_guarded_shader_module, extern_guarded_compute)
 
 #include "shaders/fg_copy_comp_spv.h"
 #include "shaders/fg_flow_comp_spv.h"
@@ -124,15 +125,19 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
     mi.codeSize = bytes;
     mi.pCode = code;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    ci.stage.module = m;
-    ci.stage.pName = "main";
-    ci.stage.pSpecializationInfo = spec;
-    ci.layout = p.layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe);
+    VkResult r;
+    {
+        IntelDriverGate gate;
+        if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = m;
+        ci.stage.pName = "main";
+        ci.stage.pSpecializationInfo = spec;
+        ci.layout = p.layout;
+        r = extern_guarded_compute(VK_NULL_HANDLE, &ci, &p.pipe);
+    }
     vkDestroyShaderModule(dev.device, m, nullptr);
     return r == VK_SUCCESS;
 }
@@ -467,15 +472,20 @@ bool framegen_on() {
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
     const int scale_mode = opts_spatial_upscale();
-    if (!scale_mode && !opts.sharpness) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
-    if (crop && crop[2] > 0 && crop[3] > 0 &&
-        (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
+    const bool has_crop = crop && crop[2] > 0 && crop[3] > 0;
+    if (has_crop && (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
+    const bool cropped = has_crop && (crop[0] || crop[1] || (uint32_t)crop[2] < sw || (uint32_t)crop[3] < sh);
+    const uint32_t cw = cropped ? std::min((uint32_t)crop[2], sw - (uint32_t)crop[0]) : sw;
+    const uint32_t ch = cropped ? std::min((uint32_t)crop[3], sh - (uint32_t)crop[1]) : sh;
+    // (a picture larger than the window takes the pass even with the filter Off: the blit's linear filter reads 2 x 2 of the
+    // picture whatever the shrink, and fine detail shimmered)
+    const bool shrink = cw > dw || ch > dh;
+    if (!scale_mode && !opts.sharpness && !shrink) return VK_NULL_HANDLE;
     if (!init_scale()) return VK_NULL_HANDLE;
     // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
     // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
-    if (crop && crop[2] > 0 && crop[3] > 0 && (crop[0] || crop[1] || (uint32_t)crop[2] < sw || (uint32_t)crop[3] < sh)) {
-        const uint32_t cw = std::min((uint32_t)crop[2], sw - (uint32_t)crop[0]), ch = std::min((uint32_t)crop[3], sh - (uint32_t)crop[1]);
+    if (cropped) {
         if (scale.cropped_w != cw || scale.cropped_h != ch) {
             {
                 std::lock_guard qk(dev.present_mu);

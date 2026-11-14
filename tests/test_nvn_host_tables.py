@@ -39,7 +39,7 @@ def main():
     hos = (ROOT / "host/hos.h").read_text(encoding="utf-8")
     start = nvn.index("typedef struct { uint64_t owner; uint8_t *seg, *cur, *end; } cmd_rec;")
     table_decls = nvn[start:nvn.index("static cmd_rec *cmd_slot(", start)]
-    live_decls_start = nvn.index("static uint64_t *live_handles;")
+    live_decls_start = nvn.index("#define LIVE_SHARDS ")
     live_decls = nvn[live_decls_start:nvn.index("static void live_handle_add(", live_decls_start)]
     pieces = [
         block(hos, "static inline void *hos_guest_range("),
@@ -53,6 +53,7 @@ def main():
         block(nvn, "static void cmd_release("),
         live_decls,
         block(nvn, "static void live_handle_add("),
+        block(nvn, "static int live_shard_has("),
         block(nvn, "static int live_handle_has("),
         block(nvn, "static void live_handle_remove("),
         block(nvn, "static uint64_t texels_extent("),
@@ -75,6 +76,8 @@ typedef long long LONG64;
 #define SRWLOCK_INIT 0
 static void AcquireSRWLockExclusive(SRWLOCK *l) { (void)l; }
 static void ReleaseSRWLockExclusive(SRWLOCK *l) { (void)l; }
+static void AcquireSRWLockShared(SRWLOCK *l) { (void)l; }
+static void ReleaseSRWLockShared(SRWLOCK *l) { (void)l; }
 static LONG InterlockedIncrement(volatile LONG *v) { return ++*v; }
 static LONG64 InterlockedAdd64(volatile LONG64 *v, LONG64 d) { return *v += d; }
 static LONG64 InterlockedIncrement64(volatile LONG64 *v) { return ++*v; }
@@ -144,6 +147,8 @@ int main(void) {
             "a handle that was never made counts as live");
     for (int i = 0; i < 5000; i += 3) live_handle_remove(h[i]);
     for (int i = 0; i < 5000; i++) require(live_handle_has(h[i]) == (i % 3 != 0), "removing handles lost others");
+    size_t nlive = 0;
+    for (unsigned s = 0; s < LIVE_SHARDS; s++) nlive += live_shards[s].n;
     require(nlive == 5000 - 1667, "the live count");
     /* ReadTexels / WriteTexels: the buffer span the strides reach */
     require(texels_extent(64, 4, 1, 64, 256) == 256, "a packed 64x4 region");

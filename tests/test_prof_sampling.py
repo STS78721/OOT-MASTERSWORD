@@ -26,7 +26,7 @@ static int64_t now_ns, clock_reads;
 namespace mkwvk {
 enum ProfPhase { PROF_SUBMIT, PROF_PRESENT, PROF_DRAW, PROF_DESC, PROF_TEXGET, PROF_UPLOAD, PROF_PIPE, PROF_PROGRAM,
                  PROF_CMDS, PROF_DISPATCH, PROF_MEMSYNC, PROF_QSUBMIT, PROF_SLOTWAIT, PROF_COUNT };
-int64_t prof_ns[PROF_COUNT];
+@SLOTS@
 inline int64_t prof_now() { return clock_reads++, now_ns; }
 @SCOPES@
 }
@@ -47,8 +47,8 @@ static bool rare(int in) { return work() % in == 0; }
 struct Draw { int64_t d[PROF_COUNT]; int k; bool slow; int64_t exact; };   // (exact: its slow paths' time)
 /// One draw as vk_draw.cpp's draw() nests its phases: a program, a pipeline, descriptors with texture lookups, commands
 static Draw draw() {
-    int64_t before[PROF_COUNT];
-    std::memcpy(before, prof_ns, sizeof before);
+    int64_t before[PROF_COUNT], after[PROF_COUNT];
+    prof_snapshot(before);
     Draw r{};
     {
         PROF_HOT(PROF_DRAW);
@@ -91,11 +91,18 @@ static Draw draw() {
         r.k = prof_t.k;
     }
     CHECK(prof_t.open == 0);
-    for (int i = 0; i < PROF_COUNT; i++) r.d[i] = prof_ns[i] - before[i];
+    prof_snapshot(after);
+    for (int i = 0; i < PROF_COUNT; i++) r.d[i] = after[i] - before[i];
     return r;
 }
 
-static void reset() { std::memset(prof_ns, 0, sizeof prof_ns), std::memset(truth, 0, sizeof truth), clock_reads = 0; }
+static void reset() {
+    std::memset(prof_slots, 0, sizeof prof_slots);
+    prof_slot_count = 0;
+    prof_my_slot = nullptr;
+    std::memset(truth, 0, sizeof truth);
+    clock_reads = 0;
+}
 
 int main(int argc, char** argv) {
     const bool all = argc > 1 && !std::strcmp(argv[1], "all");
@@ -124,7 +131,7 @@ int main(int argc, char** argv) {
     }
     if (all) {   // (d) every scope timed: exactly the true times
         CHECK(sampled == n);
-        for (int p = 0; p < PROF_COUNT; p++) CHECK(prof_ns[p] == truth[p]);
+        for (int p = 0; p < PROF_COUNT; p++) CHECK(prof_phase_ns(p) == truth[p]);
         std::printf("PASS: RX_VK_PROF_ALL=1 times every scope exactly (%d draws)\n", n);
         return 0;
     }
@@ -132,7 +139,7 @@ int main(int argc, char** argv) {
     CHECK(sampled > n / 8 * 0.95 && sampled < n / 8 * 1.05);
     // (c) unbiased: the long-run totals within 2% of the true ones
     for (int p : {PROF_DRAW, PROF_PROGRAM, PROF_PIPE, PROF_DESC, PROF_TEXGET, PROF_CMDS}) {
-        const double e = (double)prof_ns[p] / (double)truth[p] - 1.0;
+        const double e = (double)prof_phase_ns(p) / (double)truth[p] - 1.0;
         std::printf("phase %d: %.3f%% off the true total\n", p, e * 100.0);
         CHECK(e > -0.02 && e < 0.02);
     }
@@ -141,7 +148,7 @@ int main(int argc, char** argv) {
     prof_full++;
     reset();
     for (int i = 0; i < n; i++) CHECK(draw().k == 1);
-    for (int p = 0; p < PROF_COUNT; p++) CHECK(prof_ns[p] == truth[p]);
+    for (int p = 0; p < PROF_COUNT; p++) CHECK(prof_phase_ns(p) == truth[p]);
     prof_full--;
     std::printf("clock reads: %lld sampled, %lld all\n", (long long)reads, (long long)clock_reads);
     CHECK(reads * 4 < clock_reads);
@@ -152,21 +159,32 @@ int main(int argc, char** argv) {
 
 
 def scopes(source):
-    """The sampled timers, from their comment to the namespace's end, and the PROF macros"""
+    """The per-thread slots, sampled timers, and the PROF macros"""
+    slot_start = source.index("enum { PROF_MAX_SLOTS")
+    slot_end = source.index("/// Nanoseconds from a performance-counter reading", slot_start)
+    slots = (source[slot_start:slot_end]
+             + "\nProfSlot prof_slots[PROF_MAX_SLOTS + 1];\n"
+             + "std::atomic<int> prof_slot_count{0};\n"
+             + "ProfSlot* prof_alloc_slot() {\n"
+             + "    const int idx = prof_slot_count.fetch_add(1, std::memory_order_acq_rel);\n"
+             + "    ProfSlot* const s = &prof_slots[idx < PROF_MAX_SLOTS ? idx : PROF_MAX_SLOTS];\n"
+             + "    prof_my_slot = s;\n"
+             + "    return s;\n"
+             + "}\n")
     start = source.index("// (hookshot) The per-draw phases (PROF_HOT)")
-    end = source.index("} // namespace mkwvk", start)
+    end = source.index("// Slate 3 / Temper 3", start)
     macros = [line for line in source[end:].splitlines() if line.startswith("#define PROF")]
     if len(macros) != 3:
         raise SystemExit("PROF, PROF_HOT and PROF_EXACT are not all defined after the scopes")
-    return source[start:end], "\n".join(macros)
+    return slots, source[start:end], "\n".join(macros)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cxx", default="clang++")
     a = p.parse_args()
-    body, macros = scopes((ROOT / "gpu" / "vk" / "vk_internal.h").read_text(encoding="utf-8"))
-    fixture = FIXTURE.replace("@SCOPES@", body).replace("@MACROS@", macros)
+    slots, body, macros = scopes((ROOT / "gpu" / "vk" / "vk_internal.h").read_text(encoding="utf-8"))
+    fixture = FIXTURE.replace("@SLOTS@", slots).replace("@SCOPES@", body).replace("@MACROS@", macros)
     with tempfile.TemporaryDirectory(prefix="prof-sampling-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture.exe"

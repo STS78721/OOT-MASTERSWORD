@@ -40,7 +40,9 @@ import lifted_c
 import logo_rgba
 import rtgen
 import toolchain
+import ui_fonts
 import version
+import win_manifest
 
 NX2_RT = os.path.join(kit.HERE, "rt")
 HOST = os.path.join(kit.HERE, "..", "host")
@@ -724,10 +726,13 @@ def main():
     elif a.standalone and not a.only and vk_headers and spirv_headers:
         cxx = toolchain.need(toolchain.find("clang++"))
         vk = os.path.join(GPU, "vk")
-        # (MasterSword) start-up logo from assets/mastersword.png as RGBA bytes (nx2/logo_rgba.py) in the build's own folder
+        # (MasterSword) start-up logo from assets/mastersword.png as RGBA bytes (nx2/logo_rgba.py) and bundled UI fonts (nx2/ui_fonts.py)
+        # in the build's own folder (outside gpu/vk so vk_sources() and HOOKSHOT_SHADER_STAMP stay untouched)
         gen_dir = os.path.join(out, "gen")
         os.makedirs(gen_dir, exist_ok=True)
         logo_text = logo_rgba.write(os.path.join(gen_dir, "hookshot_logo.h")).encode()
+        fonts_cpp = os.path.join(gen_dir, "ui_fonts.cpp")
+        fonts_bytes = ui_fonts.write(fonts_cpp)
         # (what the shader caches are good for: what translates shaders, not the whole DLL, so a build that changes something else
         # keeps them)
         stamp = hashlib.sha1()
@@ -764,14 +769,38 @@ def main():
         fsr_flags = ["-DHOOKSHOT_FSR", "-I" + os.path.join(kit.HERE, "..", "third_party", "fidelityfx")] if FSR else []
         if FSR:
             print("the Vulkan back end: with AMD FSR 4 (third_party/fidelityfx)", flush=True)
+        # Dear ImGui (third_party/imgui) draws the overlays over the window's image (vk_imgui.cpp; vk_menu.cpp draws with it),
+        # plus third_party/zbic's single-file zstd for reading the game's romfs Font2 files in memory.
+        imgui = os.path.normpath(os.path.join(kit.ROOT, "third_party", "imgui"))
+        zbic = os.path.normpath(os.path.join(kit.ROOT, "third_party", "zbic"))
+        imgui_flags = ["-I" + imgui, "-I" + zbic, "-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES",
+                       "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", "-DIMGUI_DISABLE_WIN32_FUNCTIONS",
+                       "-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"]
+        imgui_deps = b"".join(open(os.path.join(d, f), "rb").read()
+                              for d in (imgui, os.path.join(imgui, "backends"), zbic)
+                              for f in sorted(os.listdir(d)) if f.endswith(".h"))
+        imgui_users = ("vk_imgui.cpp", "vk_menu.cpp")
+        for f in ("imgui.cpp", "imgui_draw.cpp", "imgui_tables.cpp", "imgui_widgets.cpp", "backends/imgui_impl_vulkan.cpp"):
+            vk_jobs.append((cxx, os.path.join(imgui, *f.split("/")),
+                            os.path.join(obj_dir, "vk_imgui_" + os.path.basename(f)[:-4] + ".o"),
+                            vflags + imgui_flags, imgui_deps))
+        vk_jobs.append((cxx, fonts_cpp, os.path.join(obj_dir, "vk_ui_fonts.o"),
+                        target() + (["-fPIC"] if LINUX else []) + ["-O0", "-g0", "-w"], fonts_bytes))
+        zstd_src = os.path.join(zbic, "zstd.c")
+        zstd_deps = b"".join(open(os.path.join(zbic, f), "rb").read() for f in ("zstd.h", "zstd_errors.h"))
+        vk_jobs.append((cc, zstd_src, os.path.join(obj_dir, "vk_zstd.o"),
+                        target() + CPU + (["-fPIC"] if LINUX else []) +
+                        ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-I" + zbic], zstd_deps))
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             base = os.path.basename(src)
-            deps = vk_lib_deps if lib else (vdeps + logo_text if base == "vk_menu.cpp" else vdeps)
+            deps = vk_lib_deps if lib else vdeps + (logo_text if base in imgui_users else b"") + \
+                   (imgui_deps if base in imgui_users else b"")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
                             vflags + ([stamp_def] if base == "vk_menu.cpp" else []) +
                             (ngx_flags if base == "vk_dlss.cpp" else []) +
+                            (imgui_flags if base in imgui_users else []) +
                             (fsr_flags if base == "vk_fsr4.cpp" else []),
                             deps + (ngx_deps if base == "vk_dlss.cpp" else b"")))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
@@ -873,6 +902,7 @@ def main():
                            ["-o", exe, toolchain.link_opt("/map:" + exe[:-4] + ".map"), toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
                            ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if PGO == "gen" else []) +
                            ([os.path.join(kit.WORK, "mastersword.res")] if os.path.exists(os.path.join(kit.WORK, "mastersword.res")) else []) +   # (nx2/make_icon.py)
+                           [win_manifest.write(os.path.join(out, "hookshot_manifest.res"))] +   # (UTF-8 paths + SegmentHeap: nx2/win_manifest.py)
                            ([toolchain.link_opt("/subsystem:windows"), toolchain.link_opt("/entry:mainCRTStartup")] if os.environ.get("RX_RELEASE") == "1" else []) +   # (no console window)
                            ([os.path.join(WGPU, "lib", "wgpu_native.dll.lib")] if wgpu else []) +
                            ([os.path.join(FFMPEG, "lib", l + ".lib") for l in ("avcodec", "swscale", "swresample", "avutil")] +

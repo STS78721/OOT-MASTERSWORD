@@ -606,14 +606,15 @@ bool astc_ready() {
     mi.codeSize = sizeof ASTC_DECODER_COMP_SPV;
     mi.pCode = ASTC_DECODER_COMP_SPV;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    IntelDriverGate gate;
+    if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = m;
     ci.stage.pName = "main";
     ci.layout = astc_layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &astc_pipe);
+    const VkResult r = extern_guarded_compute(VK_NULL_HANDLE, &ci, &astc_pipe);
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (r != VK_SUCCESS) return false;
     state = 1;
@@ -793,14 +794,15 @@ bool bc_ready() {
         mi.codeSize = bytes;
         mi.pCode = code;
         VkShaderModule m = VK_NULL_HANDLE;
-        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+        IntelDriverGate gate;
+        if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         ci.stage.module = m;
         ci.stage.pName = "main";
         ci.layout = bc_layout;
-        const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe);
+        const VkResult r = extern_guarded_compute(VK_NULL_HANDLE, &ci, &pipe);
         vkDestroyShaderModule(dev.device, m, nullptr);
         return r == VK_SUCCESS;
     };
@@ -1317,14 +1319,15 @@ bool unswizzle_ready() {
     mi.codeSize = sizeof BLOCK_LINEAR_UNSWIZZLE_2D_COMP_SPV;
     mi.pCode = BLOCK_LINEAR_UNSWIZZLE_2D_COMP_SPV;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
+    IntelDriverGate gate;
+    if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = m;
     ci.stage.pName = "main";
     ci.layout = unsw_layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &unsw_pipe);
+    const VkResult r = extern_guarded_compute(VK_NULL_HANDLE, &ci, &unsw_pipe);
     vkDestroyShaderModule(dev.device, m, nullptr);
     if (r != VK_SUCCESS) return false;
     state = 1;
@@ -2592,7 +2595,7 @@ unsigned view_layer(const nvn_view* v) {
 }
 
 Texture* texture_get(const nvn_tex* t, bool for_sampling) {
-    PROF(PROF_TEXGET);
+    PROF_HOT(PROF_TEXGET);
     if (!t || !t->gpu || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return nullptr;
     const VkFormatInfo fi = vk_format(t->d.format);
     if (fi.format == VK_FORMAT_UNDEFINED) {
@@ -2662,10 +2665,14 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         // (hookshot) and a texture the GPU only cleared: the game's font cache, whose letters the CPU writes as text appears. Its menu text
         // went missing at random (Hookshot issues 40 and 44), whenever the clear reached the image first
         static const bool take = getenv("RX_VK_CPU_OVER_GPU") != nullptr;
-        if ((!take && !tex->only_cleared) || tex->checked_epoch == epoch) return tex;
-        tex->checked_epoch = epoch;
+        if ((!take && !tex->only_cleared) ||
+            std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire) == epoch)
+            return tex;
         static thread_local Ranges cpu, inner;
-        if (!texture_dirty(*tex, std::max(tex->upload_gen, tex->gpu_gen), cpu)) return tex;
+        if (!texture_dirty(*tex, std::max(tex->upload_gen, tex->gpu_gen), cpu)) {
+            std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
+            return tex;
+        }
         const uint64_t first = (0x1000 - (tex->gpu & 0xFFF)) & 0xFFF;
         const uint64_t last = ((tex->gpu + tex->guest_size) & ~0xFFFull) - tex->gpu;
         inner.clear();
@@ -2683,6 +2690,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
                      tex->width, tex->height, tex->layers, tex->nvn_format, (unsigned long long)(bytes >> 10));
         }
         tex->upload_gen = gen;
+        std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
         return tex;
     }
     {   // (RX_VK_REUPLOAD_DIM=<w>x<h> (debugging): textures that size uploaded whole again every frame: is what a
@@ -2694,11 +2702,12 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         }();
         (void)parsed;
         static thread_local uint64_t last;
-        if (rw && tex->width == rw && tex->height == rh && tex->uploaded && tex->checked_epoch != epoch &&
+        if (rw && tex->width == rw && tex->height == rh && tex->uploaded &&
+            std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire) != epoch &&
             last != frame_no) {
             last = frame_no;
-            tex->checked_epoch = epoch;
             upload(*tex, nullptr);
+            std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
             return tex;
         }
     }
@@ -2709,8 +2718,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         tex->upload_seg = tl_seg;
         return tex;
     }
-    if (tex->uploaded && tex->checked_epoch == epoch) return tex;
-    tex->checked_epoch = epoch;
+    if (tex->uploaded && std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire) == epoch) return tex;
     static thread_local Ranges dirty;
     static const bool no_partial = getenv("RX_VK_NO_PARTIAL") != nullptr;   // (A/B: whole re-uploads)
     // (a buffer the GPU wrote over its storage, done since: all of it again; the tiles of MKW's terrain are filled so
@@ -2737,9 +2745,13 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     static const bool upload_finalized_rt = env_on("RX_VK_UPLOAD_FINALIZED_RT");
     if (tex->uploaded && tex->gpu_written && tex->released && !upload_finalized_rt) {
         tex->upload_gen = memory_generation();
+        std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
         return tex;
     }
-    if (tex->uploaded && !gpu_dirty && !texture_dirty(*tex, since, dirty)) return tex;
+    if (tex->uploaded && !gpu_dirty && !texture_dirty(*tex, since, dirty)) {
+        std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
+        return tex;
+    }
     const uint32_t gen = memory_generation();
     // (storage render targets took last, which the CPU has not written since: nothing to upload, the memory holds
     // nothing the GPU's images did not replace. The game's transient heaps move with the dynamic resolution, and a
@@ -2794,6 +2806,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
                 remade.erase(r);
             }
         }
+        if (tex->uploaded) std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
         return tex;
     }
     if (partial && getenv("RX_VK_LOG_PARTIAL")) {
@@ -2923,6 +2936,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         tex->uploaded = true;   // (not retried every draw; a write to its memory tries again)
         tex->upload_gen = gen;
     }
+    if (tex->uploaded) std::atomic_ref<uint32_t>(tex->checked_epoch).store(epoch, std::memory_order_release);
     return tex;
 }
 
@@ -3745,6 +3759,14 @@ void texture_written(Texture* tex, const char* why) {
     }
     watch_tex(tex, "written");
     if (!tex->gpu_written || tex->released) tex->first_written = frame_no, drawn_writeback_note(tex);
+    // (longshot) A texture in a virtual pool that the GPU writes first is marked uploaded below without the first upload,
+    // which notes its pages' mapping (texture_touch): its first check after finalize took all storage as remapped and
+    // uploaded guest memory over what the GPU drew. RX_VK_NO_DRAWN_PAGE_MAP=1: as before
+    static const bool note_map = !env_on("RX_VK_NO_DRAWN_PAGE_MAP");
+    if (why && strcmp(why, "?") != 0 && note_map && tex->gpu >= (1ull << 40) && tex->page_map.empty() && tex->guest_size) {
+        static thread_local Ranges mapped;
+        texture_dirty(*tex, 0, mapped);
+    }
     tex->last_written = frame_no;
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
@@ -3754,12 +3776,13 @@ void texture_written(Texture* tex, const char* why) {
 
 
 bool texture_touch_quick(Texture* tex, bool for_sampling) {
-    tex->last_frame = frame_no;   // (the same values whichever thread stores them)
-    tex->last_value = rec_value;
+    if (tex->last_frame != frame_no) tex->last_frame = frame_no;   // (avoid dirtying shared cache lines when already current)
+    if (tex->last_value != rec_value) tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
+    const uint32_t ep = std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire);
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) return false;
-    return tex->uploaded && tex->checked_epoch == epoch;
+    return tex->uploaded && ep == epoch;
 }
 void texture_gpu_wrote(uint64_t gpu, uint64_t size) {
     if (!gpu || !size) return;
@@ -4962,6 +4985,18 @@ void texture_frame(uint64_t completed) {
         evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted});
         pending_bytes += tex->bytes + tex->pad;
         if (by_hold && !overwritten) hold_live += tex->bytes + tex->pad;
+    }
+    {   // (longshot) nor one whose storage another image was drawn into after its own last drawing: its write-back puts old texels
+        // over memory that is the other image's now, and marks those pages written (HUD labels turning to noise)
+        std::vector<const Texture*> ts;
+        for (const Evict& e : evict)
+            if (e.flush) ts.push_back(e.tex);
+        if (!ts.empty()) {
+            const std::vector<uint64_t> other = drawn_others(ts);
+            size_t i = 0;
+            for (Evict& e : evict)
+                if (e.flush && other[i++] > e.tex->last_written) e.flush = false;
+        }
     }
     for (const Evict& e : evict) {
         Texture* tex = e.tex;

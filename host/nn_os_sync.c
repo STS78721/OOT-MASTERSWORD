@@ -41,7 +41,7 @@ typedef struct Obj {
        condvar: its waiters, those a signal has given the mutex to and not yet out, the mutex they wait with
        (cv_mixed: waiters with more than one: no handoff) */
     int reserved;
-    int cv_waiting, cv_owed, cv_mixed;
+    int cv_waiting, cv_in, cv_owed, cv_mixed;   /* (cv_waiting: counted before cv->lk, read by Signal without it; cv_in: under cv->lk) */
     struct Obj *cv_mutex, *cv_owed_mutex[8];
     /* multi-wait holder: its event; multi-wait: linked holders */
     uint64_t event;
@@ -461,17 +461,25 @@ static int handoff_on(void) {   /* HOS_NO_HANDOFF=1: the old way (any thread may
     if (v < 0) v = getenv("HOS_NO_HANDOFF") ? 0 : 1;
     return v;
 }
+/* a waiter counted in for SignalConditionVariable's check, before it takes cv->lk: a signal that reads 0 then came
+   before this waiter started to wait. Counted after cv->lk instead, a signal made without the guest mutex could read 0
+   while the waiter held cv->lk between its generation read and cv_enter, and return without the wake the old Signal
+   (which waited for cv->lk) gave it. cv_leave counts it out. */
+static void cv_count_in(Obj *cv) {
+    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
+}
 /* a waiter in: (cv->lk held) */
 static void cv_enter(Obj *cv, Obj *m) {
-    if (cv->cv_waiting && cv->cv_mutex != m) cv->cv_mixed = 1;
-    if (!cv->cv_waiting) cv->cv_mixed = 0;
+    if (cv->cv_in && cv->cv_mutex != m) cv->cv_mixed = 1;
+    if (!cv->cv_in) cv->cv_mixed = 0;
     cv->cv_mutex = m;
-    __atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);   /* (atomic: a signal reads it without cv->lk) */
+    cv->cv_in++;
 }
 /* a waiter out (cv->lk held): whether a signal reserved its mutex m for it. A reservation made on another mutex (a
    waiter with a different one came in after the signal) is given back: never left owed to nobody */
 static int cv_leave(Obj *cv, Obj *m) {
-    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);
+    cv->cv_in--;
+    __atomic_sub_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);   /* (counted in by cv_count_in) */
     if (cv->cv_owed <= 0) return 0;
     Obj *r = cv->cv_owed_mutex[--cv->cv_owed];
     if (r == m) return 1;
@@ -480,7 +488,7 @@ static int cv_leave(Obj *cv, Obj *m) {
 }
 /* a signal (cv->lk held): the mutex reserved for the waiter it wakes */
 static void cv_reserve(Obj *cv) {
-    if (!handoff_on() || cv->cv_mixed || !cv->cv_mutex || cv->cv_waiting <= cv->cv_owed || cv->cv_owed >= 8) return;
+    if (!handoff_on() || cv->cv_mixed || !cv->cv_mutex || cv->cv_in <= cv->cv_owed || cv->cv_owed >= 8) return;
     cv->cv_owed_mutex[cv->cv_owed++] = cv->cv_mutex;
     __atomic_add_fetch(&cv->cv_mutex->reserved, 1, __ATOMIC_SEQ_CST);
 }
@@ -605,7 +613,7 @@ HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {
     if (watched_cv(ARG(0))) watch_log("signal", watch_mutex(), ARG(0), c, NULL);
     if (!__atomic_load_n(&cv->cv_waiting, __ATOMIC_SEQ_CST) && !cv_signal_always()) return;
     AcquireSRWLockExclusive(&cv->lk);
-    const int had_waiters = cv->cv_waiting > 0;
+    const int had_waiters = cv->cv_in > 0;
     cv_reserve(cv);
     cv->gen++;
     ReleaseSRWLockExclusive(&cv->lk);
@@ -620,6 +628,7 @@ HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTyp
         if (i < 8) watch_cvs[i] = ARG(0);
         watch_log("cv wait", ARG(1), ARG(0), c, m);
     }
+    cv_count_in(cv);
     AcquireSRWLockExclusive(&cv->lk);
     uint64_t gen = cv->gen;
     cv_enter(cv, m);
@@ -1288,6 +1297,7 @@ HLE(_ZN2nn2os17TryWaitTimerEventEPNS0_14TimerEventTypeE) {
 HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
     int64_t deadline = hos_now_ns() + ((int64_t)ARG(2) > 0 ? (int64_t)ARG(2) : 0);
+    cv_count_in(cv);
     AcquireSRWLockExclusive(&cv->lk);
     uint64_t gen = cv->gen;
     cv_enter(cv, m);

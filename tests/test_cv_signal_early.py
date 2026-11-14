@@ -1,14 +1,15 @@
 """SignalConditionVariable with no waiter returns at once; with one it signals as before.
 
 host/nn_os_sync.c's SignalConditionVariable reads the condition variable's waiter count (cv_waiting, atomic) and returns
-without its lock pair and wake call when it is 0. A waiter counts itself in (cv_enter) under cv->lk before it gives the
-guest mutex back (mutex_release_all), and out (cv_leave) once it has left the wait, so a waiter woken and not yet out
+without its lock pair and wake call when it is 0. A waiter counts itself in (cv_count_in) before it takes cv->lk, and
+so before it gives the guest mutex back (mutex_release_all), and out (cv_leave) once it has left the wait, so a waiter woken and not yet out
 still counts. HOS_CV_SIGNAL_ALWAYS=1: every signal takes the lock, as before.
 
-The fixture runs the real code cut from the source (handoff_on, cv_enter, cv_leave, cv_reserve, cv_signal_always and the
+The fixture runs the real code cut from the source (handoff_on, cv_count_in, cv_enter, cv_leave, cv_reserve, cv_signal_always and the
 SignalConditionVariable HLE) over stubs that count lock pairs and wake calls, through the steps of a wait: in, signalled,
 out; a signal with nobody in, after the last one left, and between two waiters. A structural check pins the order the
-argument rests on: in both waits, cv_enter comes before mutex_release_all.
+argument rests on: in both waits, cv_count_in comes before cv->lk is taken, and cv_enter before mutex_release_all.
+(tests/test_cv_signal_race.py runs the waits on threads.)
 
 python -I -B tests/test_cv_signal_early.py [--cc gcc]
 """
@@ -25,7 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SIGNAL = "HLE(_ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE) {"
 WAIT = "HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeE) {"
 TIMED = "HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE) {"
-PARTS = {"@HANDOFF@": "static int handoff_on(void) {", "@ENTER@": "static void cv_enter(Obj *cv, Obj *m) {",
+PARTS = {"@HANDOFF@": "static int handoff_on(void) {", "@COUNT@": "static void cv_count_in(Obj *cv) {",
+         "@ENTER@": "static void cv_enter(Obj *cv, Obj *m) {",
          "@LEAVE@": "static int cv_leave(Obj *cv, Obj *m) {", "@RESERVE@": "static void cv_reserve(Obj *cv) {",
          "@ALWAYS@": "static int cv_signal_always(void) {", "@SIGNAL@": SIGNAL}
 
@@ -61,7 +63,7 @@ typedef struct Obj {
     CONDITION_VARIABLE cv;
     uint64_t gen;
     int reserved;
-    int cv_waiting, cv_owed, cv_mixed;
+    int cv_waiting, cv_in, cv_owed, cv_mixed;
     struct Obj *cv_mutex, *cv_owed_mutex[8];
 } Obj;
 static Obj cvo, mo, mo2;
@@ -77,6 +79,7 @@ enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL };
 #define HLE(name) static void name(Ctx *c)
 
 @HANDOFF@
+@COUNT@
 @ENTER@
 @LEAVE@
 @RESERVE@
@@ -90,7 +93,7 @@ static int signal_once(void) {
     Ctx c = {{0x1000}};
     _ZN2nn2os23SignalConditionVariableEPNS0_21ConditionVariableTypeE(&c);
     const int took = locks != l;
-    CHECK(took == (wakes != w) && took == (cvo.gen != g));
+    CHECK(took == (cvo.gen != g) && (wakes != w) == (took && cvo.cv_in > 0));
     return took;
 }
 
@@ -101,7 +104,7 @@ int main(int argc, char **argv) {
     CHECK(signal_once() == always);
     /* a waiter in (as WaitConditionVariable does under cv->lk, before it gives the mutex back): the signal is made, and
        reserves the mutex for it */
-    cv_enter(&cvo, &mo);
+    cv_count_in(&cvo), cv_enter(&cvo, &mo);
     CHECK(signal_once() == 1 && mo.reserved == 1);
     /* woken and not yet out: still counted, so another signal is made (and reserves nothing more: one waiter) */
     CHECK(signal_once() == 1 && mo.reserved == 1);
@@ -110,14 +113,14 @@ int main(int argc, char **argv) {
     /* the last one out: back to returning at once */
     CHECK(signal_once() == always);
     /* two waiters with different mutexes, one leaves: the other is still signalled */
-    cv_enter(&cvo, &mo);
-    cv_enter(&cvo, &mo2);
+    cv_count_in(&cvo), cv_enter(&cvo, &mo);
+    cv_count_in(&cvo), cv_enter(&cvo, &mo2);
     CHECK(cvo.cv_mixed);
     CHECK(cv_leave(&cvo, &mo) == 0);
     CHECK(signal_once() == 1);
     CHECK(cv_leave(&cvo, &mo2) == 0);
     CHECK(signal_once() == always);
-    CHECK(cvo.cv_waiting == 0 && cvo.cv_owed == 0 && !cvo.lk.held);
+    CHECK(cvo.cv_waiting == 0 && cvo.cv_in == 0 && cvo.cv_owed == 0 && !cvo.lk.held);
     return 0;
 }
 '''
@@ -136,6 +139,8 @@ def main():
         check("cv_enter(cv, m);" in body and "mutex_release_all(m);" in body
               and body.index("cv_enter(cv, m);") < body.index("mutex_release_all(m);"),
               "%s no longer counts its waiter in (cv_enter) before it gives the mutex back" % name)
+        check("cv_count_in(cv);" in body and body.index("cv_count_in(cv);") < body.index("AcquireSRWLockExclusive(&cv->lk);"),
+              "%s no longer counts its waiter in (cv_count_in) before it takes cv->lk" % name)
         check(body.index("AcquireSRWLockExclusive(&cv->lk);") < body.index("cv_enter(cv, m);"),
               "%s counts its waiter in outside cv->lk" % name)
     check("cv_waiting++" not in src and "cv_waiting--" not in src, "cv_waiting written without an atomic again")
@@ -173,7 +178,7 @@ def main():
                "a signal returning with a waiter in passes")
         broken("owed-count", "@SIGNAL@", early, early.replace("cv->cv_waiting", "cv->cv_owed"),
                "a signal looking at the owed count, not the waiters, passes")
-        broken("leave-early", "@ENTER@", "__atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);", "",
+        broken("leave-early", "@COUNT@", "__atomic_add_fetch(&cv->cv_waiting, 1, __ATOMIC_SEQ_CST);", "(void)cv;",
                "a waiter never counted in passes")
 
 

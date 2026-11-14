@@ -1,5 +1,6 @@
 // Present-path SMAA 1x (iryoku/smaa Medium): edge detection → blending weights → neighborhood blend.
 #include "vk_smaa.h"
+#include "vk_draw.h"   // (extern_guarded_shader_module, extern_guarded_compute)
 #include "vk_menu.h"
 #include "shaders/smaa_edge_comp_spv.h"
 #include "shaders/smaa_weight_comp_spv.h"
@@ -69,12 +70,16 @@ bool make_pipe(const uint32_t* spv, size_t spv_bytes, VkDescriptorSetLayout dsl,
     mi.codeSize = spv_bytes;
     mi.pCode = spv;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
-                nullptr};
-    ci.layout = *layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, pipe);
+    VkResult r;
+    {
+        IntelDriverGate gate;
+        if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main",
+                    nullptr};
+        ci.layout = *layout;
+        r = extern_guarded_compute(VK_NULL_HANDLE, &ci, pipe);
+    }
     vkDestroyShaderModule(dev.device, m, nullptr);
     return r == VK_SUCCESS;
 }

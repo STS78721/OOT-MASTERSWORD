@@ -12,6 +12,7 @@
    free registered buffer (host memory: the pool's guest memory is not used). The video service itself (nn::gsv) is
    not emulated: nn::codec::video::Initialize does nothing. */
 #include "hos.h"
+#include "../gpu/vk/compat/hookshot_env.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,10 +94,14 @@ typedef struct {
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
+    int64_t decode_ns, decode_worst_ns, decoded, skipped;   /* (hookshot) the movie's decoding, for catch-up */
+    int64_t recent_ns;   /* (hookshot) the recent pictures' decode time, for the catch-up (dec_acquire) */
+    int64_t first_pts, end_pts;
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
     int64_t clock_ns, clock_pts;
     int64_t last_pts;                /* the pts of the last picture handed out */
     int64_t log_submits;             /* (HOS_VIDEO_LOG) submissions still to log, after a flush or the end */
+    int stopped;                     /* (after a Stop/Flush with nothing submitted since) */
     SRWLOCK lock;
 } Dec;
 
@@ -432,6 +437,12 @@ static void decode_next(Dec *d) {
         Pending *n = d->phead;
         d->phead = n->next;
         if (!d->phead) d->ptail = NULL;
+        const int64_t t0 = hos_now_ns();
+        const int picture = n->pkt != NULL;
+        if (n->pkt) {
+            if (!d->decoded++) d->first_pts = n->pkt->pts;
+            d->end_pts = n->pkt->pts;
+        }
         if (d->mf) {   /* (hookshot) */
             if (n->pkt) {
                 d->eos = 0;
@@ -459,6 +470,10 @@ static void decode_next(Dec *d) {
             if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
             avcodec_flush_buffers(d->ctx);   /* (a stream after it starts again) */
         }
+        const int64_t ns = hos_now_ns() - t0;
+        d->decode_ns += ns;
+        if (ns > d->decode_worst_ns) d->decode_worst_ns = ns;
+        if (picture) d->recent_ns = d->recent_ns ? (d->recent_ns * 7 + ns) / 8 : ns;   /* (about the last 8) */
         free(n);
     }
 }
@@ -558,6 +573,7 @@ static void dec_submit(Ctx *c) {
         }
     }
     d->submits++;
+    d->stopped = 0;
     if (ARG(5) & 1) pending_push(d, NULL);
     const int logged_one = d->log_submits > 0;
     if (logged_one) d->log_submits--;
@@ -583,6 +599,8 @@ static void dec_flush(Ctx *c, const char *what) {
         d->qhead = d->qn = 0;
         d->eos = 0;
         d->clock_set = 0;
+        d->stopped = 1;
+        d->decode_ns = d->decode_worst_ns = d->decoded = d->skipped = d->recent_ns = 0;
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
         ReleaseSRWLockExclusive(&d->lock);
     }
@@ -605,10 +623,18 @@ static void dec_acquire(Ctx *c) {
     if (ARG(1)) G64(ARG(1)) = 0;
     if (!d) { RET(RESULT_NO_OUTPUT); return; }
     /* (the library aborts on any failure here: the hardware call waits for a picture. Up to ~100 ms for one decoded
-       by another thread's submission; then a free buffer as it was, so the caller is never refused) */
+       by another thread's submission. Then a free buffer as it was, so the caller is never refused) */
+    const int away = hos_vcore_away();
     AcquireSRWLockExclusive(&d->lock);
     decode_pending(d);
-    for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
+    /* (hookshot) The wait is for a picture another thread's submission is about to bring. It was 50 tries of a
+       2 ms sleep, and such a sleep takes 4-5 ms: 245-257 ms, on the thread a movie's end joins (title to game: the game's main
+       thread in hos_thread_join for a frame of ~250 ms, every start). Now by the clock, ~100 ms, and none after a Stop or a Flush
+       with nothing submitted since: no picture is coming then. HOS_VIDEO_ACQUIRE_TRIES=1: 50 tries */
+    static int by_tries = -1;
+    if (by_tries < 0) by_tries = env_on("HOS_VIDEO_ACQUIRE_TRIES");
+    const int64_t wait_until = hos_now_ns() + 100000000;
+    for (int tries = 0; !d->qn && !d->eos && (by_tries ? tries < 50 : !d->stopped && hos_now_ns() < wait_until); tries++) {
         ReleaseSRWLockExclusive(&d->lock);
         hos_sleep_ns(2000000);
         AcquireSRWLockExclusive(&d->lock);
@@ -619,6 +645,7 @@ static void dec_acquire(Ctx *c) {
         if (d->slots[i] && !d->busy[i] && host_of(d->slots[i], POOL_MAGIC)) slot = i;
     if (slot < 0) {
         ReleaseSRWLockExclusive(&d->lock);
+        if (away) hos_vcore_back();
         RET(RESULT_NO_OUTPUT);
         return;
     }
@@ -634,15 +661,20 @@ static void dec_acquire(Ctx *c) {
         else if (d->acquires == 1 && !d->eos)   /* (the start: the frame shows the buffer as it was, black since the pool's fill) */
             hos_log("video: the first buffer went out before the first picture was decoded (shown black)");
         ReleaseSRWLockExclusive(&d->lock);
+        if (away) hos_vcore_back();
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
         RET(0);
         return;
     }
     {   /* (hookshot) The game takes one picture a frame, and the sound plays on: under 60 fps the movie fell behind its
-           sound (the intro "slow motion, audio ahead", issues 146 and 179). Pictures behind the movie's clock are skipped:
-           the next ones decoded, as the whole movie is submitted at once. HOS_VIDEO_NO_CATCHUP=1: as before */
+           sound (the intro "slow motion, audio ahead", issues 146 and 179). Pictures already decoded are skipped.
+           Decoding the next one in order to skip it is not, when that decode takes longer than the gap between
+           pictures: the clock gains the decode and the picture is thrown away, so the next acquire is further behind.
+           The decode time is the recent pictures' (recent_ns), not the movie's mean, which a slow first decode held high.
+           At most one picture's time of decoding ahead in an acquire, so the frame that takes it waits no longer.
+           HOS_VIDEO_NO_CATCHUP=1: nothing skipped */
         static int off = -1;
-        if (off < 0) off = getenv("HOS_VIDEO_NO_CATCHUP") != NULL;
+        if (off < 0) off = env_on("HOS_VIDEO_NO_CATCHUP");
         const int64_t now = hos_now_ns(), late = 25000000;   /* (a frame and a half at 60 fps) */
         Picture *h = &d->queue[d->qhead];
         if (!d->clock_set || h->pts < d->clock_pts) d->clock_set = 1, d->clock_ns = now, d->clock_pts = h->pts;   /* (a start, a loop) */
@@ -652,12 +684,14 @@ static void dec_acquire(Ctx *c) {
             if (d->queue[d->qhead].pts + late >= due) break;
             if (d->qn < 2) {
                 if (!d->phead) break;
+                const int64_t spacing = d->decoded > 1 ? (d->end_pts - d->first_pts) / (d->decoded - 1) : 0;
+                if (spacing > 0 && (d->recent_ns > spacing || hos_now_ns() - now >= spacing)) break;
                 decode_next(d);
                 continue;
             }
             picture_free(&d->queue[d->qhead]);
             d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
-            skipped++;
+            skipped++, d->skipped++;
         }
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
     }
@@ -716,6 +750,7 @@ static void dec_acquire(Ctx *c) {
     picture_free(p);
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
     ReleaseSRWLockExclusive(&d->lock);
+    if (away) hos_vcore_back();
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
     RET(0);
 }

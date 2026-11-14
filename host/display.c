@@ -56,18 +56,35 @@ static int pointer_tracking;
 
 /* Auto-hide the OS cursor while playing (foreground client area). Insert menu and window chrome keep it.
    HOS_AUTO_HIDE_CURSOR=0: off. ShowCursor / SetWindowPos can inject a synthetic WM_MOUSEMOVE at the same pixel —
-   wake only on >= 2 px screen delta so idle-hide does not blink. */
-enum { kAutoHideIdleMs = 1500, kAutoHideWakePx = 2 };
+   wake only past 4 px (scaled by DPI) while hidden so sensor jitter or fullscreen focus transitions do not keep it onscreen.
+   Controller/keyboard input (hos_player_input_ns) hides it right away in both fullscreen and windowed play (#245). */
+int64_t hos_player_input_ns(void);
+static UINT window_dpi(HWND w);
+enum { kAutoHideIdleMs = 1500, kAutoHideWakePx = 4 };
 static int auto_hide_cursor = -1;
 static POINT auto_hide_last_pt;
 static int auto_hide_last_valid;
 static ULONGLONG auto_hide_last_move_ms;
+static volatile LONG64 auto_hide_mouse_ns;
 static int auto_hide_force_now;   /* fullscreen enter / focus / menu close: hide without waiting for idle */
 
 static int auto_hide_enabled(void) {
     if (auto_hide_cursor < 0)
         auto_hide_cursor = !getenv("HOS_AUTO_HIDE_CURSOR") || atoi(getenv("HOS_AUTO_HIDE_CURSOR")) != 0;
     return auto_hide_cursor;
+}
+
+static int cursor_in_client(HWND w, POINT *screen_out) {
+    POINT at = {0};
+    RECT rc = {0};
+    if (!GetCursorPos(&at) || !GetClientRect(w, &rc)) return 0;
+    /* In fullscreen the client covers the monitor; transparent overlays must not hold the OS cursor onscreen. */
+    if (!fullscreen && WindowFromPoint(at) != w) return 0;
+    POINT client = at;
+    if (!ScreenToClient(w, &client)) return 0;
+    if (client.x < 0 || client.y < 0 || client.x >= rc.right || client.y >= rc.bottom) return 0;
+    if (screen_out) *screen_out = at;
+    return 1;
 }
 
 static void cursor_set_hidden(int hide) {
@@ -77,25 +94,15 @@ static void cursor_set_hidden(int hide) {
     if (hide) {
         POINT at;
         if (GetCursorPos(&at)) auto_hide_last_pt = at, auto_hide_last_valid = 1;
+        SetCursor(NULL);
     }
-}
-
-static int cursor_in_client(HWND w, POINT *screen_out) {
-    POINT at = {0};
-    RECT rc = {0};
-    if (!GetCursorPos(&at) || !GetClientRect(w, &rc)) return 0;
-    if (WindowFromPoint(at) != w) return 0;
-    POINT client = at;
-    if (!ScreenToClient(w, &client)) return 0;
-    if (client.x < 0 || client.y < 0 || client.x >= rc.right || client.y >= rc.bottom) return 0;
-    if (screen_out) *screen_out = at;
-    return 1;
 }
 
 static int cursor_should_hide(HWND w) {
     if (mouse_captured) return 1;
     if (!auto_hide_enabled() || menu_open || IsIconic(w) || GetForegroundWindow() != w) return 0;
     if (!cursor_in_client(w, NULL)) return 0;
+    if (hos_player_input_ns() > InterlockedCompareExchange64(&auto_hide_mouse_ns, 0, 0)) return 1;
     if (auto_hide_force_now) return 1;
     if (fullscreen) {
         /* Fullscreen: hide at once until a deliberate move; after a move, idle 1.5 s then hide again. */
@@ -107,10 +114,12 @@ static int cursor_should_hide(HWND w) {
 }
 
 static void cursor_tick(HWND w) {
-    cursor_set_hidden(cursor_should_hide(w));
+    const int hide = cursor_should_hide(w);
+    cursor_set_hidden(hide);
+    if (hide && !menu_open && GetForegroundWindow() == w && cursor_in_client(w, NULL)) SetCursor(NULL);
 }
 
-/* Real mouse motion (>= 2 px). Synthetic ShowCursor/SetWindowPos moves at the same pixel do not wake. */
+/* Deliberate mouse motion: any move when shown, or > 4 px at 96 DPI (scaled) when hidden. */
 static void cursor_note_motion(HWND w) {
     POINT at;
     if (!GetCursorPos(&at)) return;
@@ -121,9 +130,11 @@ static void cursor_note_motion(HWND w) {
     }
     const int dx = at.x - auto_hide_last_pt.x, dy = at.y - auto_hide_last_pt.y;
     const int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
-    if (adx < kAutoHideWakePx && ady < kAutoHideWakePx) return;
+    const int slack = cursor_hidden ? MulDiv(kAutoHideWakePx, (int)window_dpi(w), 96) : 0;
+    if (adx <= slack && ady <= slack) return;
     auto_hide_last_pt = at;
     auto_hide_last_move_ms = GetTickCount64();
+    InterlockedExchange64(&auto_hide_mouse_ns, (LONG64)hos_now_ns());
     auto_hide_force_now = 0;
     cursor_tick(w);
 }
@@ -131,6 +142,7 @@ static void cursor_note_motion(HWND w) {
 static void cursor_hide_now(HWND w) {
     auto_hide_force_now = 1;
     auto_hide_last_move_ms = 0;
+    InterlockedExchange64(&auto_hide_mouse_ns, 0);
     cursor_tick(w);
 }
 
@@ -372,6 +384,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         cursor_set_hidden(0);   /* unfocused: never leave the cursor hidden for other apps */
         break;
     case WM_SETCURSOR:
+        cursor_tick(w);
         if (LOWORD(lp) == HTCLIENT && (mouse_captured || cursor_hidden)) {
             SetCursor(NULL);
             return TRUE;
@@ -457,7 +470,10 @@ static DWORD WINAPI display_main(void *p) {
     if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(hwnd, 1);
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);
-    auto_hide_last_move_ms = GetTickCount64();
+    if (!fullscreen) {
+        auto_hide_last_move_ms = GetTickCount64();
+        InterlockedExchange64(&auto_hide_mouse_ns, (LONG64)hos_now_ns());
+    }
     pointer_update(hwnd, 0, 0);
     cursor_tick(hwnd);
     renderer = rx_start(hwnd);

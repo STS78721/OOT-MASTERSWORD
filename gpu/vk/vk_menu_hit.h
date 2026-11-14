@@ -1,46 +1,26 @@
-// The Insert menu's layout (vk_menu.cpp draws with these sizes, times its scale) and what a point over it is on: the
-// mouse's hover and clicks while the menu is open. Plain arithmetic, no Vulkan or GDI: tests/test_menu_hit.cpp checks it.
-// Switch-style card: header, left category sidebar, right option page, footer.
+// The Insert menu's mouse: what a point over it is on. The menu records each control's rectangle as it draws it (Map::add, in
+// the window image's pixels), and the next frame's mouse is tested against them (Map::at): the picture and the hit-test cannot
+// drift apart, at any size. Plain arithmetic, no Vulkan or ImGui: tests/test_menu_hit.cpp checks it.
 #pragma once
 
 namespace mkwvk::menu_hit {
 
-// ---- the options page, at a scale of 1 (the window 720 pixels high; 1440 and up: 2, and so on) ----
-constexpr int kWidth = 900;               // Switch-style card (wider than the old 520 strip)
-constexpr int kHeadH = 52;                // title bar
-constexpr int kSideW = 180;               // category sidebar
-constexpr int kFootH = 40;                // footer hints
-constexpr int kContentPad = 14;           // pad under the header into the page
-constexpr int kTabY = kHeadH;             // top of the sidebar / body (kept name: tests + menu draw)
-constexpr int kTabH = 36;                 // one category row in the sidebar
-constexpr int kTabSide = 0;               // unused (was horizontal strip side); L/R live at sidebar bottom
-constexpr int kRowGap = kContentPad;      // body pad under the header
-constexpr int kRowH = 30;                 // option rows
-constexpr int kRowX = 8;                  // inset inside the content pane (from sidebar edge)
-constexpr int kValueRight = 20;           // a value ends kValueRight from the right
-// slider track in the content pane (absolute from the menu's left)
-constexpr int kSliderL = kSideW + 220, kSliderR = kSideW + 380;
-constexpr int kSliderGrab = 6;
-// ---- the Controls page (bindings) ----
-constexpr int kCtlWidth = 900, kCtlTop = 64, kCtlRowH = 24, kCtlPad = 280, kCtlKey = 520, kCtlCellPad = 6;
-// ---- Cheats / lists (hit helpers kept for the shared header; MasterSword's menu does not open them) ----
-constexpr int kCheatTop = 44, kCheatRowH = 28;
-constexpr int kListTop = 48, kListRowH = 24;
-constexpr int kListValueRight = 16;
-
 enum Part {
     kNone,      // off the menu's controls (still over the menu: a click does nothing)
     kOutside,   // off the menu
-    kTabPrev,   // sidebar L pill
-    kTab,       // a category: index
-    kTabNext,   // sidebar R pill
+    kTabPrev,   // the tab strip's left end
+    kTab,       // a tab: index
+    kTabNext,   // its right end
     kRow,       // an option's row: index (the tab's own), side -1 the value's left half, 1 its right half, 0 the name
     kSlider,    // a slider row's track: index, permille 0 to 1000 along it
+    kCtlOption, // the Controls page: one of its own rows above the grid (index), side -1 the value's left half, 1 its right
+                // half, 0 the name
     kCtlRow,    // the Controls page: a row's name (index; index == the count: Reset to defaults)
-    kCtlCell,   // a binding: index the row, side 0 the gamepad's, 1 the keyboard's
-    kCheatRow,
-    kListLine,
+    kCtlCell,   // a binding: index the row, side the CtlColumn
+    kListLine,  // a list (the teleport list, the inventory): a line as shown (index, 0 the top one), side -1 the left half, 1 the right half
+    kButton,    // the restart question's buttons: index 0 Later, 1 Restart now
 };
+enum CtlColumn { kCtlPrimary, kCtlAlternate, kCtlKeyboard, kCtlColumns };
 struct Hit {
     Part part = kNone;
     int index = -1;
@@ -48,120 +28,89 @@ struct Hit {
     int permille = 0;
 };
 
+/// A point in the window's pixels (the cursor's, in a window win_w x win_h pixels) in the window's image (img_w x img_h:
+/// the swapchain's; the same size as a rule, but not while a resize is on its way)
 inline void to_image(int x, int y, int win_w, int win_h, int img_w, int img_h, int* ix, int* iy) {
     *ix = win_w > 0 ? (int)((long long)x * img_w / win_w) : x;
     *iy = win_h > 0 ? (int)((long long)y * img_h / win_h) : y;
 }
-inline void origin(int img_w, int img_h, int menu_w, int menu_h, int* x0, int* y0) {
-    *x0 = (img_w - menu_w) / 2;
-    *y0 = (img_h - menu_h) / 2;
-}
-/// Top of the first option row (below header + content pad).
-inline int rows_top(int s) { return (kHeadH + kContentPad) * s; }
-/// Content pane's left edge (right of the sidebar).
-inline int content_x(int s) { return kSideW * s; }
-/// Kept for source checks / older call sites: horizontal slot width is unused with a sidebar.
-inline int tab_slot_w(int s, int w, int tabs = 4) {
-    (void)w;
-    (void)tabs;
-    return (kTabH + 6) * s;   // vertical step between categories
-}
+/// A slider's value for a point along its track (lo to hi in steps of step), nearest step, held to its ends
 inline int slider_value(int permille, int lo, int hi, int step) {
     if (step <= 0 || hi <= lo) return lo;
     const int steps = (hi - lo) / step;
     const int k = (permille * steps + 500) / 1000;
     return lo + (k < 0 ? 0 : k > steps ? steps : k) * step;
 }
+/// Where along the track a value is, in permille (the knob's place)
 inline int slider_permille(int v, int lo, int hi) {
     if (hi <= lo) return 0;
     const int p = (int)((long long)(v - lo) * 1000 / (hi - lo));
     return p < 0 ? 0 : p > 1000 ? 1000 : p;
 }
 
-/// Options page hit-test: sidebar categories on the left, rows in the content pane.
-inline Hit options(int x, int y, int s, int w, int h, int tabs, int rows, const int* value_l, const bool* slider) {
-    Hit hit;
-    if (x < 0 || y < 0 || x >= w || y >= h) return hit.part = kOutside, hit;
-    if (y < kHeadH * s || y >= h - kFootH * s) return hit;   // title / footer
-    const int side = kSideW * s;
-    // L / R pills at the bottom of the sidebar
-    if (x < side) {
-        const int ph = (int)(kTabH * 0.7f) * s;
-        const int py = h - kFootH * s - ph - 12 * s;
-        if (y >= py && y < py + ph) {
-            const int mid = side / 2;
-            hit.part = x < mid ? kTabPrev : kTabNext;
+/// What a left click on an option's row does after it selects the row (side: the Hit's): kClickSelect nothing more, kClickRight
+/// and kClickLeft as Right and Left, kClickConfirm as Enter. The name only selects the row and shows its help: a click there
+/// used to change the value as Right, so clicking "Output resolution" to read about it moved it a step, and closing the menu
+/// asked to restart. A choice's halves lower and raise it; a toggle's halves are its two values (left lo, right hi), so the half already
+/// chosen leaves it as it is (on: the toggle is at hi) and the other flips it. A row without a value (a page, Restart, Quit)
+/// opens
+enum RowClick { kClickLeft = -1, kClickSelect = 0, kClickRight = 1, kClickConfirm = 2 };
+inline RowClick row_click(bool has_value, bool toggle, int side, bool on = false) {
+    if (!has_value) return kClickConfirm;
+    if (side == 0) return kClickSelect;
+    if (toggle) return (side > 0) == on ? kClickSelect : kClickRight;   // (a toggle's Right flips it either way)
+    return side > 0 ? kClickRight : kClickLeft;
+}
+
+/// The controls as last drawn
+struct Map {
+    struct Box {
+        float x0, y0, x1, y1;
+        Part part;
+        int index;
+        float v0, v1;   // (a value's span, for its halves: side -1 left of the middle, 1 right; v0 >= v1: none)
+        float t0, t1;   // (a slider's track: kSlider along it; t0 >= t1: none)
+        int side;       // (a fixed side: the Controls page's cells)
+    };
+    static constexpr int kMax = 96;
+    static constexpr float kGrab = 6;   // (a click this far past either end of a track still takes the end, in pixels)
+    Box box[kMax];
+    int n = 0;
+    float ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;   // (the menu's area: off it, kOutside)
+
+    void clear(float x0, float y0, float x1, float y1) { n = 0, ax0 = x0, ay0 = y0, ax1 = x1, ay1 = y1; }
+    void add(float x0, float y0, float x1, float y1, Part part, int index, float v0 = 0, float v1 = 0, float t0 = 0, float t1 = 0,
+             int side = 0) {
+        if (n < kMax) box[n++] = {x0, y0, x1, y1, part, index, v0, v1, t0, t1, side};
+    }
+    Hit at(float x, float y) const {
+        Hit hit;
+        if (x < ax0 || y < ay0 || x >= ax1 || y >= ay1) return hit.part = kOutside, hit;
+        for (int i = n - 1; i >= 0; i--) {   // (the last drawn on top)
+            const Box& b = box[i];
+            if (x < b.x0 || y < b.y0 || x >= b.x1 || y >= b.y1) continue;
+            hit.part = b.part, hit.index = b.index, hit.side = b.side;
+            if (b.t0 < b.t1 && x >= b.t0 - kGrab && x < b.t1 + kGrab) {
+                hit.part = kSlider;
+                hit.permille = permille(b, x);
+                return hit;
+            }
+            if (b.v0 < b.v1 && x >= b.v0 && x < b.v1) hit.side = x < (b.v0 + b.v1) / 2 ? -1 : 1;
             return hit;
         }
-        const int iy0 = (kHeadH + 12) * s;
-        const int step = (kTabH + 6) * s;
-        if (y >= iy0) {
-            const int i = (y - iy0) / step;
-            if (i >= 0 && i < tabs && y < iy0 + (i + 1) * step - 6 * s) {
-                hit.part = kTab;
-                hit.index = i;
-            }
-        }
         return hit;
     }
-    const int top = rows_top(s);
-    const int cx0 = side + kRowX * s;
-    if (y < top || x < cx0 || x >= w - kRowX * s) return hit;
-    const int i = (y - top) / (kRowH * s);
-    if (i >= rows) return hit;
-    hit.index = i;
-    if (slider && slider[i] && x >= (kSliderL - kSliderGrab) * s && x < (kSliderR + kSliderGrab) * s) {
-        hit.part = kSlider;
-        const int p = (int)((long long)(x - kSliderL * s) * 1000 / ((kSliderR - kSliderL) * s));
-        hit.permille = p < 0 ? 0 : p > 1000 ? 1000 : p;
-        return hit;
+    /// A drag that started on row's slider: the point's place along its track, held to its ends, wherever the cursor went;
+    /// -1 when the row has no track now
+    int drag(float x, int row) const {
+        for (int i = 0; i < n; i++)
+            if (box[i].part == kRow && box[i].index == row && box[i].t0 < box[i].t1) return permille(box[i], x);
+        return -1;
     }
-    hit.part = kRow;
-    const int vl = value_l ? value_l[i] : w;
-    const int vr = w - kValueRight * s;
-    if (x >= vl && vl < vr) hit.side = x < (vl + vr) / 2 ? -1 : 1;
-    return hit;
-}
-inline int slider_drag(int x, int s) {
-    const int p = (int)((long long)(x - kSliderL * s) * 1000 / ((kSliderR - kSliderL) * s));
-    return p < 0 ? 0 : p > 1000 ? 1000 : p;
-}
-
-inline Hit controls(int x, int y, int s, int w, int h, int count) {
-    Hit hit;
-    if (x < 0 || y < 0 || x >= w || y >= h) return hit.part = kOutside, hit;
-    const int top = kCtlTop * s;
-    if (y < top || x < kRowX * s || x >= w - kRowX * s) return hit;
-    const int i = (y - top) / (kCtlRowH * s);
-    if (i > count) return hit;
-    hit.index = i;
-    if (i < count && x >= (kCtlPad - kCtlCellPad) * s) {
-        hit.part = kCtlCell;
-        hit.side = x >= (kCtlKey - kCtlCellPad) * s ? 1 : 0;
-    } else {
-        hit.part = kCtlRow;
+    static int permille(const Box& b, float x) {
+        const int p = (int)((x - b.t0) * 1000 / (b.t1 - b.t0));
+        return p < 0 ? 0 : p > 1000 ? 1000 : p;
     }
-    return hit;
-}
-
-inline Hit row_list(int x, int y, int s, int w, int h, int top, int row_h, int count, const int* value_l, Part part) {
-    Hit hit;
-    if (x < 0 || y < 0 || x >= w || y >= h) return hit.part = kOutside, hit;
-    if (y < top * s || x < kRowX * s || x >= w - kRowX * s) return hit;
-    const int i = (y - top * s) / (row_h * s);
-    if (i >= count) return hit;
-    hit.part = part;
-    hit.index = i;
-    const int vl = value_l ? value_l[i] : w;
-    const int vr = w - kListValueRight * s;
-    if (x >= vl && vl < vr) hit.side = x < (vl + vr) / 2 ? -1 : 1;
-    return hit;
-}
-inline Hit cheats(int x, int y, int s, int w, int h, int count, const int* value_l) {
-    return row_list(x, y, s, w, h, kCheatTop, kCheatRowH, count, value_l, kCheatRow);
-}
-inline Hit list_lines(int x, int y, int s, int w, int h, int count, const int* value_l) {
-    return row_list(x, y, s, w, h, kListTop, kListRowH, count, value_l, kListLine);
-}
+};
 
 } // namespace mkwvk::menu_hit

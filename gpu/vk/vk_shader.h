@@ -48,8 +48,9 @@ struct StageCode {
     }
 };
 /// si's code: st.module, or st's SPIR-V read back from the pack into holder and chained inline (after pin_subgroup, which
-/// sets si.pNext). false: the pack could not be read
-bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder);
+/// sets si.pNext). busy: when given, Intel's compiler gate is only tried when creating a hot-cache module; while a worker
+/// holds it, *busy is set and false comes back so the dispatch leaves both module and pipeline to a worker
+bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder, bool* busy = nullptr);
 struct Program;
 /// (vk_mempack.cpp) MasterSword Sheikah Sensor: a draw of p (one relaxed increment; the Slate is told only at a power of two
 /// of its draws, or at its first draw since an area began streaming in)

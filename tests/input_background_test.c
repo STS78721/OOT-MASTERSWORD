@@ -70,6 +70,7 @@ void binds_load(void) {
 int hos_mouse_native(void) { return -1; }
 static void mouse_setup(void) {}
 static void mouse_sens_keys(void) {}
+static void player_used(void) {}
 int mouse_stick(int32_t *x, int32_t *y, int held) { (void)x; (void)y; (void)held; mouse_queries++; return 0; }
 void rx_request_frame_dump(void) { commands++; }
 void rx_set_screenshot_ms(int64_t ms) { (void)ms; commands++; }

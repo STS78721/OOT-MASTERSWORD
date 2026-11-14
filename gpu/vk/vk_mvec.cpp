@@ -15,6 +15,7 @@
 #include "shaders/mv_merge_comp_spv.h"
 #include "shaders/mv_reproject_comp_spv.h"
 #include "vk_dlss.h"
+#include "vk_draw.h"   // (extern_guarded_shader_module, extern_guarded_compute)
 #include "vk_menu.h"
 #include "vk_work.h"
 
@@ -108,15 +109,19 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
     mi.codeSize = bytes;
     mi.pCode = code;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    ci.stage.module = m;
-    ci.stage.pName = "main";
-    ci.stage.pSpecializationInfo = spec;
-    ci.layout = p.layout;
-    const VkResult r = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe);
+    VkResult r;
+    {
+        IntelDriverGate gate;
+        if (extern_guarded_shader_module(&mi, &m) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = m;
+        ci.stage.pName = "main";
+        ci.stage.pSpecializationInfo = spec;
+        ci.layout = p.layout;
+        r = extern_guarded_compute(VK_NULL_HANDLE, &ci, &p.pipe);
+    }
     vkDestroyShaderModule(dev.device, m, nullptr);
     return r == VK_SUCCESS;
 }

@@ -44,6 +44,8 @@ struct Options {
     int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)
     int ultrawide = 0;    // the camera at the monitor's shape when it is wider than 16:9; read once, at the start (host/hos_main.c)
     int show_fps = 0;
+    // In-game FPS overlay scale (1 Small, 2 Medium default, 3 Large); independent of menu_size.
+    int overlay_size = 2;
     int fullscreen = 0;   // borderless fullscreen + cursor hide: F11 is the same setting
     int gpu_device = 0;   // graphics card index: 0 Auto, 1..N device 0..N-1 (gpu/vk/vk_main.cpp; RX_VK_DEVICE)
     int pad_background = 0;   // the controllers count while another window has the focus (host/nn_hid.c; HOS_INPUT_BACKGROUND)
@@ -64,8 +66,10 @@ struct Options {
     int mirror_mb = 0;    // staging mirror limit in MB
     // NVIDIA Reflex (VK_NV_low_latency2): 0 Off, 1 On, 2 Boost. Hardware-gated; ignored on non-NVIDIA.
     int reflex = 0;
-    // Insert menu look: 0 OOT Mastersword (default), 1 Light, 2 Dark.
+    // Insert menu look: 0 OOT Mastersword (default), 1 Light, 2 Dark, 3 Longshot.
     int menu_theme = 0;
+    // Insert menu and start-up screen scale (1 Small, 2 Medium default, 3 Large); independent of overlay_size.
+    int menu_size = 2;
 };
 extern Options opts;
 
@@ -133,10 +137,11 @@ int upscaler_render_percent(); // 0 = Resolution row; else FSR/XeSS/Nodix qualit
 void menu_output_size(uint32_t& w, uint32_t& h);
 void menu_option_set(int id, int value);   // (from the game's side: 7 the mouse's sensitivity, the - and = keys)
 void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter shows)
-/// Over the window's image (TRANSFER_DST_OPTIMAL), w x h: the menu and the FPS counter. slot: the frame in flight, 0 to 2.
-void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h);
+/// Over the window's image (index: swapchain image index), w x h: the menu, FPS counter, and start-up screen.
+void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
 /// Start-up prewarm screen while shaders/pipelines prepare (vk_startup_paint.h). Null clears it.
 struct StartupView;
 void startup_screen(const StartupView* view);
+void startup_fade_to(float f);
 
 } // namespace mkwvk

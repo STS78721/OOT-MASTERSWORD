@@ -13,8 +13,9 @@ namespace mkwvk {
 void jobs_push(std::function<void()> fn, bool urgent = false, const std::atomic<bool>* flag = nullptr);
 /// Queues fn for the one thread that runs such jobs one at a time, in order
 void jobs_push_serial(std::function<void()> fn);
-/// Waits until flag is set by a job (which calls jobs_notify after setting it)
-void jobs_wait(const std::atomic<bool>& flag);
+/// Waits until flag is set by a job (which calls jobs_notify after setting it). Its job still queued (pushed with flag) is
+/// taken out and run on this thread first, so it runs once and never waits behind the queue: true when it ran here
+bool jobs_wait(const std::atomic<bool>& flag);
 void jobs_notify();
 int jobs_pending();
 

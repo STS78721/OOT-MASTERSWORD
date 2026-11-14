@@ -91,9 +91,18 @@ static uint32_t *alloc_page_buf(size_t *cap_out, int *slot_out) {
     return malloc(4096 * sizeof(uint32_t));
 }
 
+/* (256 marks, none set? Read as 32 words in one pass the compiler makes AVX2 loads of: most of the ranges hold no
+   mark at a submit, and at 32/64 marks a step the walk itself, not the memory, was what a scan cost) */
+static inline int marks_clear_256(const uint8_t *m) {
+    uint64_t w[32], any = 0;
+    memcpy(w, m, sizeof w);
+    for (int i = 0; i < 32; i++) any |= w[i];
+    return !any;
+}
+
 #if defined(__x86_64__) || defined(_M_X64)
 __attribute__((target("avx2,bmi")))
-static size_t collect_range_avx2(uint64_t p, uint64_t p1, uint32_t **out_p, size_t n, size_t *cap_p) {
+static size_t collect_range_avx2(uint64_t p, uint64_t p1, uint32_t **out_p, size_t n, size_t *cap_p, int wide) {
     uint32_t *out = *out_p;
     size_t cap = *cap_p;
     const __m256i zero = _mm256_setzero_si256();
@@ -105,11 +114,29 @@ static size_t collect_range_avx2(uint64_t p, uint64_t p1, uint32_t **out_p, size
         }
         p++;
     }
-    for (; p + 64 <= p1; p += 64) {
+    if (wide && (p & 63) && p + 32 <= p1) {
+        const __m256i v0 = _mm256_loadu_si256((const __m256i *)&a64_dirty[p]);
+        if (!_mm256_testz_si256(v0, v0)) {
+            uint32_t m0 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, zero));
+            while (m0) {
+                const uint32_t b = (uint32_t)__builtin_ctz(m0);
+                m0 &= m0 - 1;
+                __atomic_store_n(&a64_dirty[p + b], 0, __ATOMIC_RELAXED);
+                if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
+                out[n++] = (uint32_t)(p + b);
+            }
+        }
+        p += 32;
+    }
+    while (p + 64 <= p1) {
+        if (wide && !(p & 255) && p + 256 <= p1 && marks_clear_256(&a64_dirty[p])) {
+            p += 256;
+            continue;
+        }
         const __m256i v0 = _mm256_loadu_si256((const __m256i *)&a64_dirty[p]);
         const __m256i v1 = _mm256_loadu_si256((const __m256i *)&a64_dirty[p + 32]);
         const __m256i u = _mm256_or_si256(v0, v1);
-        if (_mm256_testz_si256(u, u)) continue;
+        if (_mm256_testz_si256(u, u)) { p += 64; continue; }
         uint32_t m0 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, zero));
         while (m0) {
             const uint32_t b = (uint32_t)__builtin_ctz(m0);
@@ -126,6 +153,7 @@ static size_t collect_range_avx2(uint64_t p, uint64_t p1, uint32_t **out_p, size
             if (n == cap) out = realloc(out, (cap *= 2) * sizeof *out);
             out[n++] = (uint32_t)(p + 32 + b);
         }
+        p += 64;
     }
     for (; p < p1; p++) {
         if (__atomic_load_n(&a64_dirty[p], __ATOMIC_RELAXED)) {
@@ -140,10 +168,14 @@ static size_t collect_range_avx2(uint64_t p, uint64_t p1, uint32_t **out_p, size
 }
 #endif
 
-static size_t collect_range_scalar(uint64_t p, uint64_t p1, uint32_t **out_p, size_t n, size_t *cap_p) {
+static size_t collect_range_scalar(uint64_t p, uint64_t p1, uint32_t **out_p, size_t n, size_t *cap_p, int wide) {
     uint32_t *out = *out_p;
     size_t cap = *cap_p;
     for (; p < p1;) {
+        if (wide && !(p & 255) && p + 256 <= p1 && marks_clear_256(&a64_dirty[p])) {
+            p += 256;
+            continue;
+        }
         if (!(p & 31) && p + 32 <= p1) {
             uint64_t w[4];
             memcpy(w, &a64_dirty[p], 32);
@@ -185,6 +217,12 @@ static size_t collect_range_scalar(uint64_t p, uint64_t p1, uint32_t **out_p, si
    the Vulkan back end's own collection (gpu/render's rx_collect_written works only with the WebGPU renderer started).
    One consumer: with Vulkan the WebGPU renderer never runs. */
 static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **pages) {
+    /* (HOS_COLLECT_WIDE=0: 32/64 marks a step at most, as before; the pages found are the same either way) */
+    static int wide = -1;
+    if (wide < 0) {
+        const char *e = getenv("HOS_COLLECT_WIDE");
+        wide = !(e && e[0] == '0');
+    }
     size_t n = 0, cap = 0;
     int slot = -1;
     uint32_t *out = alloc_page_buf(&cap, &slot);
@@ -210,11 +248,11 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
         if (p0 >= p1) continue;
 #if defined(__x86_64__) || defined(_M_X64)
         if (use_avx2) {
-            n = collect_range_avx2(p0, p1, &out, n, &cap);
+            n = collect_range_avx2(p0, p1, &out, n, &cap, wide);
             continue;
         }
 #endif
-        n = collect_range_scalar(p0, p1, &out, n, &cap);
+        n = collect_range_scalar(p0, p1, &out, n, &cap, wide);
     }
     if (n) __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (slot >= 0) {

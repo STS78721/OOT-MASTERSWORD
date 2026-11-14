@@ -1200,7 +1200,7 @@ NV(nvnQueueSetDebugLabel) {}
 #define POOL_MIN 6       /* 64 bytes */
 #define POOL_MAX 26      /* 64 MiB: bigger blocks use the heap */
 #define POOL_KEEP (64ull << 20)
-static SRWLOCK pool_lock = SRWLOCK_INIT;
+static SRWLOCK pool_locks[POOL_MAX + 1];
 static void *pool_head[POOL_MAX + 1];
 static uint64_t pool_bytes[POOL_MAX + 1];
 static int pool_off(void) {
@@ -1218,13 +1218,13 @@ static void *pool_get(size_t n, unsigned *cls) {
     const unsigned c = pool_off() ? POOL_MAX + 1 : pool_class(n);
     *cls = c;
     if (c > POOL_MAX) return malloc(n);
-    AcquireSRWLockExclusive(&pool_lock);
+    AcquireSRWLockExclusive(&pool_locks[c]);
     void *b = pool_head[c];
     if (b) {
         pool_head[c] = *(void **)b;
         pool_bytes[c] -= (uint64_t)1 << c;
     }
-    ReleaseSRWLockExclusive(&pool_lock);
+    ReleaseSRWLockExclusive(&pool_locks[c]);
     return b ? b : malloc((size_t)1 << c);
 }
 static void pool_put(void *b, unsigned cls) {
@@ -1233,14 +1233,14 @@ static void pool_put(void *b, unsigned cls) {
         free(b);
         return;
     }
-    AcquireSRWLockExclusive(&pool_lock);
+    AcquireSRWLockExclusive(&pool_locks[cls]);
     const int keep = pool_bytes[cls] + ((uint64_t)1 << cls) <= POOL_KEEP;
     if (keep) {
         *(void **)b = pool_head[cls];
         pool_head[cls] = b;
         pool_bytes[cls] += (uint64_t)1 << cls;
     }
-    ReleaseSRWLockExclusive(&pool_lock);
+    ReleaseSRWLockExclusive(&pool_locks[cls]);
     if (!keep) free(b);
 }
 
@@ -1387,6 +1387,26 @@ static rec_node **rec_buckets;
 static size_t ncopies;
 static size_t npins;   /* (tex_copy: the texture copies, logged with the recordings) */
 static unsigned rec_shift = 16;   /* (set when the buckets are made) */
+static rec_node *rec_free;
+static size_t nrec_free;
+static rec_node *rec_alloc_node(void) {   /* (copy_lock held) */
+    rec_node *n = rec_free;
+    if (n) {
+        rec_free = n->next;
+        nrec_free--;
+        return n;
+    }
+    return (rec_node *)malloc(sizeof *n);
+}
+static void rec_free_node(rec_node *n) {   /* (copy_lock held) */
+    if (nrec_free < 32768) {
+        n->next = rec_free;
+        rec_free = n;
+        nrec_free++;
+    } else {
+        free(n);
+    }
+}
 static unsigned rec_bucket(uint64_t ctl) { return (unsigned)(((ctl >> rec_shift) * 0x9E3779B97F4A7C15ull) >> 48) & (REC_BUCKETS - 1); }
 static SRWLOCK copy_lock = SRWLOCK_INIT;
 static volatile LONG64 copy_bytes;
@@ -1396,67 +1416,103 @@ typedef struct { uint64_t magic, bytes, cls; } copy_prefix;   /* (cls: its pool 
 typedef struct { copy_prefix *p; uint64_t after; } dead_copy;
 static dead_copy *dead;
 static size_t ndead, cap_dead;
-/* (hookshot) The live handles, a host set (open addressing, copy_lock held): a handle the game passes back is a host
-   address, so it is used only when it is in the set, never on what the memory at that address holds. */
-static uint64_t *live_handles;
-static size_t live_cap, nlive;
+/* (hookshot) The live handles, sharded host sets (lock order: copy_lock -> live_shards[0..LIVE_SHARDS-1]):
+   check_handle/check_handles only take shared shard locks and never block behind EndRecording or sweep. */
+#define LIVE_SHARDS 16u
+typedef struct { SRWLOCK lock; uint64_t *tab; size_t cap, n; } live_shard;
+static live_shard live_shards[LIVE_SHARDS];
+static unsigned live_shard_of(uint64_t h) { return (unsigned)(((h * 0x9E3779B97F4A7C15ull) >> 60) & (LIVE_SHARDS - 1u)); }
 static size_t live_at(uint64_t h, size_t cap) { return (size_t)((h * 0x9E3779B97F4A7C15ull) >> 24) & (cap - 1); }
 static void live_handle_add(uint64_t h) {   /* (copy_lock held exclusively) */
-    if ((nlive + 1) * 2 > live_cap) {
-        const size_t cap = live_cap ? live_cap * 2 : 65536;
+    live_shard *ls = &live_shards[live_shard_of(h)];
+    AcquireSRWLockExclusive(&ls->lock);
+    if ((ls->n + 1) * 2 > ls->cap) {
+        const size_t cap = ls->cap ? ls->cap * 2 : 4096;
         uint64_t *t = (uint64_t *)calloc(cap, sizeof *t);
         if (!t) die("recording handle set");
-        for (size_t i = 0; i < live_cap; i++) {
-            if (!live_handles[i]) continue;
-            size_t k = live_at(live_handles[i], cap);
+        for (size_t i = 0; i < ls->cap; i++) {
+            if (!ls->tab[i]) continue;
+            size_t k = live_at(ls->tab[i], cap);
             while (t[k]) k = (k + 1) & (cap - 1);
-            t[k] = live_handles[i];
+            t[k] = ls->tab[i];
         }
-        free(live_handles);
-        live_handles = t, live_cap = cap;
+        free(ls->tab);
+        ls->tab = t, ls->cap = cap;
     }
-    size_t k = live_at(h, live_cap);
-    while (live_handles[k] && live_handles[k] != h) k = (k + 1) & (live_cap - 1);
-    if (!live_handles[k]) live_handles[k] = h, nlive++;
+    size_t k = live_at(h, ls->cap);
+    while (ls->tab[k] && ls->tab[k] != h) k = (k + 1) & (ls->cap - 1);
+    if (!ls->tab[k]) ls->tab[k] = h, ls->n++;
+    ReleaseSRWLockExclusive(&ls->lock);
 }
-static int live_handle_has(uint64_t h) {   /* (copy_lock held) */
-    if (!h || !live_cap) return 0;
-    for (size_t k = live_at(h, live_cap); live_handles[k]; k = (k + 1) & (live_cap - 1))
-        if (live_handles[k] == h) return 1;
+static int live_shard_has(const live_shard *ls, uint64_t h) {   /* (ls->lock held) */
+    if (!h || !ls->cap) return 0;
+    for (size_t k = live_at(h, ls->cap); ls->tab[k]; k = (k + 1) & (ls->cap - 1))
+        if (ls->tab[k] == h) return 1;
     return 0;
 }
+static int live_handle_has(uint64_t h) {
+    if (!h) return 0;
+    live_shard *ls = &live_shards[live_shard_of(h)];
+    AcquireSRWLockShared(&ls->lock);
+    const int has = live_shard_has(ls, h);
+    ReleaseSRWLockShared(&ls->lock);
+    return has;
+}
 static void live_handle_remove(uint64_t h) {   /* (copy_lock held exclusively; backward shift, no tombstones) */
-    if (!h || !live_cap) return;
-    size_t k = live_at(h, live_cap);
-    while (live_handles[k] && live_handles[k] != h) k = (k + 1) & (live_cap - 1);
-    if (!live_handles[k]) return;
-    live_handles[k] = 0, nlive--;
-    for (size_t j = (k + 1) & (live_cap - 1); live_handles[j]; j = (j + 1) & (live_cap - 1)) {
-        const size_t want = live_at(live_handles[j], live_cap);
-        /* (move it into the hole when its probe run starts at or before the hole) */
-        if (((j - want) & (live_cap - 1)) >= ((j - k) & (live_cap - 1))) {
-            live_handles[k] = live_handles[j], live_handles[j] = 0;
-            k = j;
+    if (!h) return;
+    live_shard *ls = &live_shards[live_shard_of(h)];
+    AcquireSRWLockExclusive(&ls->lock);
+    if (!ls->cap) { ReleaseSRWLockExclusive(&ls->lock); return; }
+    size_t k = live_at(h, ls->cap);
+    while (ls->tab[k] && ls->tab[k] != h) k = (k + 1) & (ls->cap - 1);
+    if (ls->tab[k]) {
+        ls->tab[k] = 0, ls->n--;
+        for (size_t j = (k + 1) & (ls->cap - 1); ls->tab[j]; j = (j + 1) & (ls->cap - 1)) {
+            const size_t want = live_at(ls->tab[j], ls->cap);
+            /* (move it into the hole when its probe run starts at or before the hole) */
+            if (((j - want) & (ls->cap - 1)) >= ((j - k) & (ls->cap - 1))) {
+                ls->tab[k] = ls->tab[j], ls->tab[j] = 0;
+                k = j;
+            }
         }
     }
+    ReleaseSRWLockExclusive(&ls->lock);
 }
-static void free_dead_copies(void) {   /* (copy_lock held) */
+#define DEAD_FLUSH_BATCH 256
+static size_t pop_dead_copies(copy_prefix **out, size_t cap) {   /* (copy_lock held) */
     const uint64_t done = rx_nvn_replayed();
-    for (size_t i = 0; i < ndead;) {
+    size_t got = 0;
+    for (size_t i = 0; i < ndead && got < cap;) {
         if (dead[i].after <= done) {
-            InterlockedAdd64(&copy_bytes, -(LONG64)dead[i].p->bytes);
-            pool_put(dead[i].p, (unsigned)dead[i].p->cls);
+            copy_prefix *p = dead[i].p;
+            InterlockedAdd64(&copy_bytes, -(LONG64)p->bytes);
+            out[got++] = p;
             dead[i] = dead[--ndead];
         } else {
             i++;
         }
     }
+    return got;
+}
+static void put_dead_batch(copy_prefix *const *ready, size_t n) {   /* (no copy_lock held) */
+    for (size_t i = 0; i < n; i++) pool_put(ready[i], (unsigned)ready[i]->cls);
+}
+static void queue_dead_copy(copy_prefix *p, uint64_t after) {   /* (copy_lock held) */
+    if (ndead == cap_dead) {
+        cap_dead = cap_dead ? cap_dead * 2 : 1024;
+        dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
+    }
+    dead[ndead].p = p;
+    dead[ndead].after = after;
+    ndead++;
 }
 static void release_copies(uint64_t lo, uint64_t hi) {
     if (hi <= lo || !rec_buckets) return;
     const uint64_t after = rx_nvn_pushed() + held_count();   /* (held submits name them too) */
+    copy_prefix *ready[DEAD_FLUSH_BATCH];
+    size_t nready = 0;
     AcquireSRWLockExclusive(&copy_lock);
-    free_dead_copies();
+    nready = pop_dead_copies(ready, DEAD_FLUSH_BATCH);
     /* (a range over 4 GiB: every bucket once instead of every block) */
     const uint64_t pages = ((hi - 1) >> rec_shift) - (lo >> rec_shift) + 1;
     const uint64_t steps = pages > REC_BUCKETS ? REC_BUCKETS : pages;
@@ -1471,34 +1527,39 @@ static void release_copies(uint64_t lo, uint64_t hi) {
             copy_prefix *p = (copy_prefix *)n->copy - 1;
             p->magic = 0;   /* (no submit names it any more) */
             live_handle_remove((uint64_t)(uintptr_t)n->copy);
-            if (ndead == cap_dead) {
-                cap_dead = cap_dead ? cap_dead * 2 : 1024;
-                dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
-            }
-            dead[ndead].p = p;
-            dead[ndead].after = after;
-            ndead++;
+            queue_dead_copy(p, after);
             *pn = n->next;
-            free(n);
+            rec_free_node(n);
             ncopies--;
         }
     }
     ReleaseSRWLockExclusive(&copy_lock);
+    put_dead_batch(ready, nready);
+    while (nready == DEAD_FLUSH_BATCH) {
+        AcquireSRWLockExclusive(&copy_lock);
+        nready = pop_dead_copies(ready, DEAD_FLUSH_BATCH);
+        ReleaseSRWLockExclusive(&copy_lock);
+        put_dead_batch(ready, nready);
+    }
 }
 /* Copies whose control memory the game reused for other data: the console driver's handle is a descriptor written in
    the 64 bytes of control memory a recording takes; a mark written there in its place (the copy's address, and a magic)
    that the game has overwritten means it reused that memory, and the handle is dead on the console too. Copies whose
    control memory was never added again (MKW frees and reallocates its control memory) were kept for good otherwise:
-   ~40 per 1000 recordings, ~100,000 after 20 minutes. Swept every 25,000 recordings. HOS_NVN_NO_SWEEP=1: not. */
+   ~40 per 1000 recordings, ~100,000 after 20 minutes. Swept incrementally (1024 buckets every 512 recordings) to avoid
+   long copy_lock stalls. HOS_NVN_NO_SWEEP=1: not. */
 #define COPY_MARK 0x4b52414d59504f43ull   /* "COPYMARK" */
-static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
+static void sweep_overwritten_copies(unsigned budget) {   /* (copy_lock held) */
     static int off = -1;
+    static unsigned cursor;
     if (off < 0) off = getenv("HOS_NVN_NO_SWEEP") != NULL;
     if (off || !rec_buckets) return;
-    free_dead_copies();
     const uint64_t after = rx_nvn_pushed() + held_count();
     size_t swept = 0;
-    for (unsigned b = 0; b < REC_BUCKETS; b++) {
+    const unsigned steps = budget && budget < REC_BUCKETS ? budget : REC_BUCKETS;
+    for (unsigned step = 0; step < steps; step++) {
+        const unsigned b = cursor;
+        cursor = (cursor + 1u) & (REC_BUCKETS - 1u);
         for (rec_node **pn = &rec_buckets[b]; *pn;) {
             rec_node *n = *pn;
             uint64_t mark[2];
@@ -1519,21 +1580,20 @@ static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
             copy_prefix *pre = (copy_prefix *)n->copy - 1;
             pre->magic = 0;
             live_handle_remove((uint64_t)(uintptr_t)n->copy);
-            if (ndead == cap_dead) {
-                cap_dead = cap_dead ? cap_dead * 2 : 1024;
-                dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
-            }
-            dead[ndead].p = pre;
-            dead[ndead].after = after;
-            ndead++;
+            queue_dead_copy(pre, after);
             *pn = n->next;
-            free(n);
+            rec_free_node(n);
             ncopies--;
             swept++;
         }
     }
+    static size_t total_swept;
     static int logged;
-    if (swept && logged++ < 12) hos_log("nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, ncopies);
+    total_swept += swept;
+    if (cursor == 0 && total_swept && logged++ < 12) {
+        hos_log("nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", total_swept, ncopies);
+        total_swept = 0;
+    }
 }
 NV(nvnCommandBufferAddControlMemory) {
     nvn_cmd *o = CB(P(0));
@@ -1605,16 +1665,19 @@ NV(nvnCommandBufferEndRecording) {
     /* the copy is tied to the control memory position the console driver's descriptor would take */
     const uint64_t at = o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     o->ctl_used += 64;
-    rec_node *n = (rec_node *)malloc(sizeof *n);
-    n->ctl = o->ctl ? at : ~0ull;
-    n->copy = copy;
-    n->marked = 0;
+    int marked = 0;
     if (o->ctl && o->ctl_used <= o->ctl_size) {   /* (the mark in the descriptor's place: see sweep_overwritten_copies) */
         const uint64_t mark[2] = {COPY_MARK, (uint64_t)(uintptr_t)copy};
         memcpy(gw(at, sizeof mark), mark, sizeof mark);
-        n->marked = 1;
+        marked = 1;
     }
+    copy_prefix *ready[DEAD_FLUSH_BATCH];
+    size_t nready = 0;
     AcquireSRWLockExclusive(&copy_lock);
+    rec_node *n = rec_alloc_node();
+    n->ctl = o->ctl ? at : ~0ull;
+    n->copy = copy;
+    n->marked = marked;
     if (!rec_buckets) {
         const char *e = getenv("HOS_NVN_REC_SHIFT");
         if (e && atoi(e) >= 12 && atoi(e) <= 24) rec_shift = (unsigned)atoi(e);
@@ -1626,12 +1689,16 @@ NV(nvnCommandBufferEndRecording) {
     ncopies++;
     live_handle_add((uint64_t)(uintptr_t)copy);
     static uint64_t made;
-    if (++made % 25000 == 0) sweep_overwritten_copies();
+    if ((++made & 511u) == 0) {
+        sweep_overwritten_copies(1024u);
+        nready = pop_dead_copies(ready, DEAD_FLUSH_BATCH);
+    }
     if (made % 50000 == 0)
         hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
                 "(%.1f MB)", (unsigned long long)made, ncopies, copy_bytes / 1048576.0, npins, (long long)seg_count,
                 seg_bytes / 1048576.0);
     ReleaseSRWLockExclusive(&copy_lock);
+    if (nready) put_dead_batch(ready, nready);
     if (watch_draw_cmd && watch_draw_cmd == (void *)o && nwatch_handles < 16) {
         watch_handles[nwatch_handles++] = (uint64_t)(uintptr_t)copy;
         watch_draw_cmd = NULL;
@@ -1641,41 +1708,71 @@ NV(nvnCommandBufferEndRecording) {
 }
 NV(nvnCommandBufferIsRecording) { RET(CB(P(0))->recording != 0); }
 static void check_handle(uint64_t h) {
-    AcquireSRWLockShared(&copy_lock);
-    const int live = live_handle_has(h);
-    ReleaseSRWLockShared(&copy_lock);
-    if (!live || ((const copy_prefix *)(uintptr_t)h - 1)->magic != COPY_MAGIC)
-        die("command handle %#llx is not a live recording", (unsigned long long)h);
+    live_shard *ls = &live_shards[live_shard_of(h)];
+    AcquireSRWLockShared(&ls->lock);
+    const int live = live_shard_has(ls, h);
+    const int ok = live && ((const copy_prefix *)(uintptr_t)h - 1)->magic == COPY_MAGIC;
+    ReleaseSRWLockShared(&ls->lock);
+    if (!ok) die("command handle %#llx is not a live recording", (unsigned long long)h);
+}
+static void check_handles(const uint64_t *h, int count) {
+    if (count <= 0) return;
+    if (count == 1) { check_handle(h[0]); return; }
+    unsigned mask = 0;
+    for (int i = 0; i < count; i++) mask |= 1u << live_shard_of(h[i]);
+    for (unsigned s = 0; s < LIVE_SHARDS; s++)
+        if (mask >> s & 1u) AcquireSRWLockShared(&live_shards[s].lock);
+    uint64_t bad = 0;
+    for (int i = 0; i < count; i++) {
+        const live_shard *ls = &live_shards[live_shard_of(h[i])];
+        if (!live_shard_has(ls, h[i]) || ((const copy_prefix *)(uintptr_t)h[i] - 1)->magic != COPY_MAGIC) {
+            bad = h[i];
+            break;
+        }
+    }
+    for (int s = (int)LIVE_SHARDS - 1; s >= 0; s--)
+        if (mask >> s & 1u) ReleaseSRWLockShared(&live_shards[s].lock);
+    if (bad) die("command handle %#llx is not a live recording", (unsigned long long)bad);
 }
 /* a called recording is copied into the caller at the call (it is complete now; the game may retire it before the
    caller is submitted) */
-static void inline_recording(nvn_cmd *o, uint64_t h) {
-    check_handle(h);
-    const copy_prefix *pre = (const copy_prefix *)(uintptr_t)h - 1;
-    const size_t total = (size_t)pre->bytes - sizeof *pre;   /* BEGIN, the records, END: the records in one copy */
-    if (total <= 16) return;
-    const size_t n = total - 16;
+static void inline_recordings(nvn_cmd *o, const uint64_t *h, int count) {
+    if (count <= 0) return;
+    check_handles(h, count);
+    size_t total_copy = 0;
+    for (int i = 0; i < count; i++) {
+        const copy_prefix *pre = (const copy_prefix *)(uintptr_t)h[i] - 1;
+        const size_t total = (size_t)pre->bytes - sizeof *pre;   /* BEGIN, the records, END: the records in one copy */
+        if (total > 16) total_copy += total - 16;
+    }
+    if (!total_copy) return;
     cmd_rec *r = cmd_host(o);
-    cmd_reserve_rec(r, n);
-    memcpy(r->cur, (const uint8_t *)(uintptr_t)h + 8, n);
-    r->cur += n;
-    o->cmd_used += n;
-    o->hw_used += n;
+    cmd_reserve_rec(r, total_copy);
+    for (int i = 0; i < count; i++) {
+        const copy_prefix *pre = (const copy_prefix *)(uintptr_t)h[i] - 1;
+        const size_t total = (size_t)pre->bytes - sizeof *pre;
+        if (total <= 16) continue;
+        const size_t n = total - 16;
+        memcpy(r->cur, (const uint8_t *)(uintptr_t)h[i] + 8, n);
+        r->cur += n;
+    }
+    o->cmd_used += total_copy;
+    o->hw_used += total_copy;
     o->last_rec = 0;
 }
 NV(nvnCommandBufferCallCommands) {
-    const uint64_t *h = (const uint64_t *)PN(2, 8ull * (uint32_t)I(1));
-    for (int i = 0; i < I(1); i++) {
-        if (nwatch_handles) watch_handle_called(c, h[i], "called");
-        inline_recording(CB(P(0)), h[i]);
-    }
+    const int count = I(1);
+    const uint64_t *h = (const uint64_t *)PN(2, 8ull * (uint32_t)count);
+    if (nwatch_handles)
+        for (int i = 0; i < count; i++) watch_handle_called(c, h[i], "called");
+    inline_recordings(CB(P(0)), h, count);
 }
 NV(nvnCommandBufferCopyCommands) {
-    const uint64_t *h = (const uint64_t *)PN(2, 8ull * (uint32_t)I(1));
-    for (int i = 0; i < I(1); i++) {
-        if (nwatch_handles) watch_handle_called(c, h[i], "copied");
-        inline_recording(CB(P(0)), h[i]);
-    }
+    const int count = I(1);
+    const uint64_t *h = (const uint64_t *)PN(2, 8ull * (uint32_t)count);
+    if (nwatch_handles)
+        for (int i = 0; i < count; i++) watch_handle_called(c, h[i], "copied");
+    inline_recordings(CB(P(0)), h, count);
 }
 
 /* records: payload after the header, zeroed */
@@ -2365,10 +2462,8 @@ NV(nvnQueueSubmitCommands) {
             hos_log("nvn: QueueSubmitCommands #%ld: queue %p (its #%llu), %d handles (lr %#llx)", (long)i, (void *)q,
                     (unsigned long long)q->submits, n, (unsigned long long)c->x[30]);
     }
-    for (int i = 0; i < n; i++) {
-        check_handle(h[i]);
-        resolve_deferred((uint8_t *)(uintptr_t)h[i]);
-    }
+    check_handles(h, n);
+    for (int i = 0; i < n; i++) resolve_deferred((uint8_t *)(uintptr_t)h[i]);
     held_init();
     if (!hold_on) {
         /* (the replay runs here, on this thread, for ~9 ms a frame (vk_replay.cpp submit_q, RX_VK_ASYNC off): the virtual

@@ -52,6 +52,11 @@ static int key(int vk) { return !rx_option(1, 0) && (GetAsyncKeyState(vk) & 0x80
 
 int hos_mouse_take(int32_t *dx, int32_t *dy);   /* display.c */
 
+/* (#245) Last time a gamepad button/stick or bound keyboard input was active, so display.c can hide the idle OS cursor right away */
+static volatile LONG64 player_input_ns;
+int64_t hos_player_input_ns(void) { return InterlockedCompareExchange64(&player_input_ns, 0, 0); }
+static void player_used(void) { InterlockedExchange64(&player_input_ns, hos_now_ns()); }
+
 /* The captured mouse's sensitivity (mouse_stick below): - and = change it, kept in <user>/mouse_sens.txt */
 double hos_mouse_sens = 0;   /* (display.c shows it in the title) */
 extern const char *hos_user_dir;
@@ -719,11 +724,14 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
         if (!after_menu) {
             *buttons |= pb;
             stick_max(stick, ps);
+            if (pb || ps[0] > 12000 || ps[0] < -12000 || ps[1] > 12000 || ps[1] < -12000 ||
+                ps[2] > 12000 || ps[2] < -12000 || ps[3] > 12000 || ps[3] < -12000)
+                player_used();
         }
     }
     binds_load();   /* (the keys: key_default's, or hookshot_options.ini's; the mouse's buttons once its capture is known) */
     for (int i = 0; i < HOS_SW_N; i++)
-        if (bound_down(i, 0)) *buttons |= 1ULL << i;
+        if (bound_down(i, 0)) *buttons |= 1ULL << i, player_used();
     int32_t mouse[4] = {0};
     /* the mouse's motion: the camera itself (mouse_native.c) with the menu's Mouse camera on Native, else the right
        stick; also the stick while the game does not give the camera free control (a menu, a lock-on, the pause menu,
@@ -759,6 +767,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
                              (bound_down(HOS_KEY_MOVE_UP, captured) - bound_down(HOS_KEY_MOVE_DOWN, captured)) * 32767,
                              cx * 32767, cy * 32767};
     stick_max(stick, keys);
+    if (keys[0] || keys[1] || keys[2] || keys[3]) player_used();
     /* (hookshot, mouse_native.c) the keys and the pads are the right stick too: while they turn the camera, its angles are
        the native mouse's new start, so the two do not undo each other */
     hos_mouse_native_stick(stick[2] != 0 || stick[3] != 0);
