@@ -166,6 +166,20 @@ rate, and occlusion culling (nothing popping or missing).
   already ranged 52–62 by area. Remaining suspect: handle tables (`RX_VK_HANDLE_TABLES=0`, costs one ~140 s shader
   re-preparation); the clean test is the same spot with the `*.bak_pre_longshot_ports` DLL.
 
+### Findings 2026-11-14 (later): the remaining stutters are RAM pressure
+
+- The memory-pressure log (`vk: memory pressure:` lines, every 30 frames when page faults spike or free RAM < 1.5 GB) shows
+  the PC's free RAM falling from 8.7 GB to ~1 GB over a session while the game's working set grows 14 -> 22.6 GB (private
+  commit 27 -> 40 GB; the PC's commit 54 of 80.5 GB). 32 GB PC.
+- Two kinds of stall follow from it: (1) **pool imports slow from 13-17 ms to ~58 ms each** (the driver pins pages and
+  Windows must evict first): a stream of new 4 MB GPU-written pools in NPC-heavy areas, one a frame, 113 in one session
+  (2.4 s); (2) game-thread stalls with an idle renderer next to page-fault spikes (Windows paging the game's memory back).
+- The A/B (pre-port vs current renderer) is inside this noise: A 54.6-56.7 fps, B 53.3 (B's runs were the first after a
+  switch, cold shader cache, and one had a costly diagnostic on). The ports are not the stutter source.
+- Next: a memory diet (measure the host-side consumers: program records in RAM (44k programs after the switches), captures,
+  shadows, staging, texture copies; cut what is cold), and keep imports off the frame when free RAM is low. Player side:
+  close heavy background apps.
+
 ---
 
 ## 5. Releases
