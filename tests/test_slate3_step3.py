@@ -49,7 +49,9 @@ def check_sources():
         raise SystemExit("gpu_buffer_bind lost locked re-validation before pool_of")
 
     for need in ("add_cand(def_t, 64);", "add_cand(def_t, 96);", "add_cand(std::max(2, def_t - 1), 96);",
-                 "RX_HEROS_SHADE_MIN_DRAWS", 'const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 2;', "if (ver == 2 && takes(&count, 4))"):
+                 "RX_HEROS_SHADE_MIN_DRAWS", 'const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 3;', "if (ver == 3 && takes(&count, 4))",
+                 # (MasterSword Temper 2026-11-14: v3, counts above the default up to par_threads_max)
+                 "par_threads_max_public()"):
         if need not in pack:
             raise SystemExit(f"vk_mempack.cpp missing Hero's Shade v2 piece: {need}")
 
