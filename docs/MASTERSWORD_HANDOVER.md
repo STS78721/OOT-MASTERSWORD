@@ -36,8 +36,9 @@ step with this file.
 | `longshot` | https://git.magicbean.dev/MagicBeanDev/Longshot | Upstream successor, read and port only (`longshot/main` = `514591a3` when fetched) |
 | `origin` | https://github.com/NotRexed/Hookshot | Dead upstream, history only |
 
-**Not pushed yet:** 7 local commits on `mastersword-fg` past `mastersword/mastersword-fg` (the Longshot ports in §4 and the
-small-reads restore). Push when ready: `git push mastersword mastersword-fg`. Never force-push `main`.
+**Pushed 2026-11-14:** `mastersword-fg` on GitHub is at `b8408cd2` (33 commits: the Longshot ports, the memory pack,
+Triforce Shader Delivery, Lens of Truth, the Sheikah Slate, the Owl Statue, Temper 1, and all the docs). Push later work the
+same way: `git push mastersword mastersword-fg` (fast-forward only; never force-push). `main` is still 0.1.9c (`45fb4761`).
 
 ---
 
@@ -421,8 +422,8 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
    (`RX_VK_HANDLE_TABLES=0`, one shader re-preparation).
 4. Test V-Sync Mailbox + `RX_VK_PRESENT_QUEUE=1` against V-Sync Off.
 5. Try `RX_VK_ASTC_BC7=1` for fidelity and watch VRAM.
-6. Push `mastersword-fg` (`git push mastersword mastersword-fg`), then prepare 0.1.9d (patch notes in the Pearl Abyss style;
-   the memory pack is the headline).
+6. Prepare 0.1.9d (`mastersword-fg` is pushed): merge into `main` (merge commit, no force), patch notes in the Pearl Abyss
+   style (headline: the memory pack and Triforce Shader Delivery, Lens of Truth, the Owl Statue), release zips, new backup.
 7. Visual bugs: duplicate items flickering, skybox and Link colour at Hyrule Castle.
 8. Keep watching Longshot (`git fetch longshot`, then `git log mastersword-fg..longshot/main`) for perf and fix commits.
 9. **Next investigation (after the import-ahead run): console-style data delivery** (playbook, last section). PS5 Kraken
