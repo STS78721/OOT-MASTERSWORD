@@ -933,8 +933,16 @@ void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
                     const size_t o = overlap(pic.head, sl.pictures[i].head);
                     if (o > best) best = o, best_i = i;
                 }
-                if (best_i != SIZE_MAX && best * 2 >= pic.head.size()) sl.pictures[best_i] = std::move(pic);
-                else {
+                if (best_i != SIZE_MAX && best * 2 >= pic.head.size()) {
+                    // (MasterSword 2026-11-14: the same area seen again keeps its head, the area's identity: Hero's Shade keys
+                    // what it learned by picture_sig(head), and a head retaken each visit (the first 48 programs vary a
+                    // little) gave the area a new key every session, so it re-ran its trials every session. Only what the
+                    // picture makes ready is refreshed)
+                    Picture& kept = sl.pictures[best_i];
+                    kept.all = std::move(pic.all);
+                    kept.seen = pic.seen;
+                    updated_sig = picture_sig(kept.head);
+                } else {
                     if (sl.pictures.size() >= 64) {
                         size_t old = 0;
                         for (size_t i = 1; i < sl.pictures.size(); i++)
