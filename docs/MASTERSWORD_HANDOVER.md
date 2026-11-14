@@ -541,6 +541,12 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
 - **A/B 2 (set up):** `RX_VK_READBACK_LATE=3980,1b580,9b040`, up to ~4.5 ms a frame off the game's threads (Town ~21.5 ->
   ~17 ms if it all comes off). Higher risk: `0x1b580` / `0x9b040` are unidentified; watch for popping at the edges, light or
   shadow flicker. The exposure meter's small ranges still wait. Logs: `AB_test/log_readback_late_3980_*.txt`.
+- **A/B 2 result (20:11, all three ranges late; user: "everything looked fine"):** their waits went to ~0, but a fourth range,
+  `0x44b040`, took the wait (160 ms -> 39 s): waiting 4.48 -> 2.71 ms a frame, **fps unchanged** (Town 47.5/42.7, Field
+  53-57). **Conclusion:** the game is paced by its own frame's GPU work finishing; whichever read comes first holds the
+  wait. That work finishes only after the renderer records and submits the frame, so Town's ~9 ms of replay sits inside
+  the game's wait. **Late reads are off** (no gain, a frame of staleness). **The lever for Town is the replay's speed.**
+  Logs: `AB_test/log_readback_late_three_*.txt`.
 
 ---
 

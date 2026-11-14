@@ -247,6 +247,17 @@ I/O priority, and lets the game continue. It drains on exit, falls back to flush
 each flush's time. The trade-off is stated plainly to the player, with a switch to turn it off. For other ports: **durable
 I/O belongs on a background thread unless the game truly needs the data on disk before it continues.**
 
+## 6c. A measured negative: reading GPU results a frame late (not adopted)
+
+A recompiled game reads results the GPU wrote (here ~26 reads a frame), and the port makes it wait until they're really in
+memory: ~4.5 ms a frame of game-thread waiting in a heavy area. Longshot's `RX_VK_READBACK_LATE` lets chosen ranges be read a
+frame late. Measured on MasterSword: making the biggest range late moved the wait to the next range written by the same GPU
+work; making three late moved it to a fourth. Waiting fell 4.48 -> 2.71 ms a frame, **frame rate unchanged.** The game is
+paced by its own frame's GPU work finishing, not by any one read. **The lesson for other ports: before removing a wait,
+check what it waits *for*; if it's the frame's GPU work, shorten the path to that work (the renderer's recording and
+submission), not the read.** (Never read an accumulator late: OoT's exposure meter read late double-counts, which is
+visible as white flashes.)
+
 ## 7. Method notes that made the difference
 
 - **The MasterSword Forge & Temper cycle (tick-tock).** Every new capability (Forge) is followed by a refinement pass on it
