@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--to", dest="hi", type=int, default=99999)
     ap.add_argument("--min-draws", type=int, default=2500)
     a = ap.parse_args()
-    groups, windows = {}, {}
+    groups, windows, run_windows = {}, {}, {}
     order = []
     for name in sorted(os.listdir(a.runs), key=lambda n: (len(n), n)):
         parts = name.split("_")
@@ -61,8 +61,17 @@ def main():
             order.append(what)
         groups[what].append(mean)
         windows[what] += list(zip(draws, ms))
+        run_windows.setdefault(what, []).append(list(zip(draws, ms)))
     if not order:
         return
+    # (medians: a stall of the PC, a scan or an update, moves one run's mean by seconds of frames; the median window does not)
+    print()
+    for what in order:
+        meds = [statistics.median(t for _, t in ws) for ws in run_windows[what]]
+        hitches = [sum(1 for _, t in ws if t > 2 * statistics.median(x for _, x in ws)) for ws in run_windows[what]]
+        print("%-10s median window per run: %s ms -> %.2f ms (%.1f fps); windows over twice the median: %s" % (
+            what, " ".join("%.2f" % m for m in meds), statistics.mean(meds), 1000.0 / statistics.mean(meds),
+            " ".join(str(h) for h in hitches)))
     base = statistics.mean(groups[order[0]])
     print()
     for what in order:

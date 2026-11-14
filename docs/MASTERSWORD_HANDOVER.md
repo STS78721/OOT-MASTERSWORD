@@ -675,6 +675,21 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   write-back (11% of the main thread's submit time; the white-flash fix).
 - **Bench baseline now V1 + copy split** (exe_old.exe = V1, dll_base.dll = copy split; exe_preforge.exe = before the Forge).
 - nx2/build.py: RX_HOT_FLAGS="<flags>" adds compiler flags to the hot pieces only (in their object key), for -hot-cold-split.
+- **PGO (in progress, 2026-11-15 night):** instrumented exe (RX_PGO=gen on the V1 split) = bench exe_pgogen.exe.
+  tools/handover/mastersword_pgo_profile.ps1 runs it with HOS_PGO + timed .reset/.dump. Profiles: bench_runs/pgo_town (market,
+  walking), pgo_field (meant as Field, but the Load menu's DOWN did not take: a second Town profile, the entrance and bridge),
+  pgo_field2 (Field reached by walking back out of the Town gate: LDOWN from the Town autosave). Unprofiled functions go cold
+  under PGO, so Field matters. Next: merge (llvm-profdata), build RX_PGO=<merged>, A/B against V1 + copy split.
+  Merged: work/pgo/biggoron_v1.profdata (2649 functions; top: the float helpers and recomp_load64). PGO exe = bench
+  exe_pgo.exe (406 MB). First A/B (pgo vs old, 2+2) was spoiled by an outside disturbance in one old run (2-3 s stalls, the
+  first 3000 presents at 41 fps; none of the night's other runs of that exe did this): with the clean baseline runs of the
+  copy-split batch (same binary), PGO ~-0.23 ms (-1%) at equal draws, inside the baseline's spread: not proven. Now a
+  three-way batch (tag "tri": hcs, pgo, old x2) with PGO + "-mllvm -hot-cold-split=true" (bench exe_hcs.exe; 4804 .cold
+  parts in its map). bench_compare.py now prints each run's median window too (robust to stalls).
+  **Result (tag "tri", 2 runs each, clean): no gain from either.** At equal draws: baseline (V1 + copy split) 21.41 ms,
+  PGO 21.59 ms (+0.18), PGO + hot-cold-split 21.37 ms (-0.04); raw medians: baseline 21.13, PGO 21.40, hcs 21.54. Neither
+  deployed. Read: the hot code is already -O2 with the float fast paths; what is left on the critical path (the job system's
+  chain and its waits) is not branch layout. The tools stay (RX_PGO, RX_HOT_FLAGS, mastersword_pgo_profile.ps1) for later.
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),
