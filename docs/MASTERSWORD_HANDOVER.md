@@ -547,6 +547,17 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   wait. That work finishes only after the renderer records and submits the frame, so Town's ~9 ms of replay sits inside
   the game's wait. **Late reads are off** (no gain, a frame of staleness). **The lever for Town is the replay's speed.**
   Logs: `AB_test/log_readback_late_three_*.txt`.
+- **Profile result (20:18, `RX_VK_PROF_FINE=1`):** on the replay thread itself only dispatches show (~0.6 ms a frame): every
+  draw is already in the parallel segments. The replay thread spends ~8 ms of Town's frame **waiting for its 4 workers**,
+  whose draws add up to ~15 ms (commands ~8.2 ms, descriptors ~3.7). Lock waits ~0.1 ms. So Town's recording is limited by
+  parallel throughput. Log: `AB_test/log_town_profile_*.txt`.
+- **Hero's Shade bug found:** its "+1 thread" candidate was clamped back to the default in `heros_shade_tune` and
+  `replay_handle`, so it never tried more than 4 workers.
+- **Fix deployed (commit `0b5303ac`, DLL only; backup `*.bak_pre_shade_ceiling`):** `par_threads_max()` = fast cores - 2, at
+  most 6 (`RX_VK_PARALLEL_MAX=<n>`); the pool starts that many workers (idle ones wait); Hero's Shade adds candidates 5 and
+  6 at the default segment and at 96, clamped to the ceiling. Its learned table is now v3, so every area re-learns once
+  (~6 s of trials the first time in each area). `tests/test_slate3_step3.py` updated (`b56d25bc`). **Not yet play-tested.**
+  Watch the log for `Hero's Shade (area ...): latched winner (threads N, seg M)` with N = 5 or 6 in Town.
 
 ### Town's recording time (from the 20:11 log) and the profiling run
 
@@ -556,6 +567,7 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
 - **Profiling run set up:** `RX_VK_PROF_FINE=1` in the env file (per-NVN-operation and per-draw-section timers; their own
   cost lowers fps a little, so that run's fps doesn't count). Goal: what the serial replay time is, then make the serial part
   smaller or parallel.
+  (Result: see the Hero's Shade ceiling entries under the readback A/B.)
 
 ---
 
