@@ -89,3 +89,32 @@ applies to MasterSword directly, mostly without ML:
 **Revised order:** measure Vulkan call types and the Gossip Stones match rate (both counters, one Temper run) →
 bindless descriptors → Gossip Stones → Din's Fire for the segments that don't match → Deku Scrub SIMD (profile first) →
 Rito copy engine → Navi / Stone of Agony.
+
+## 7. What the Town profile already said (2026-11-14, log_town_profile_2021) — the ranking changes
+
+The fine profile (`RX_VK_PROF_FINE=1`) already splits the draw work by section. Town's heaviest window, ms a frame summed
+over the threads (an undercount: the counters were shared by the workers, fixed below):
+
+| Group | Sections | ms |
+|---|---|---|
+| **Translating NVN state into descriptors** | textures 1.65, storage buffers 0.75, user uniform buffers 0.61, banks 0.20, c1 0.13 | **3.3** |
+| Commands | vertex+index binds 0.87, bind descriptors 1.03 (of it the push call 0.18), bind pipeline 0.48, hazards+pass 0.36, push constants 0.36, dynamic state 0.24, **the draw call itself 0.16** | 3.5 |
+| Per-draw bookkeeping | draw start 0.84, skin check and guards 0.59, the rest 0.2 | 1.6 |
+
+**The Vulkan driver calls themselves are cheap** (the push call 0.18 ms, vkCmdDraw 0.16 ms for ~3,000 draws). Most of the cost
+is MasterSword's own *translation* of the game's NVN state into Vulkan's, above all working out texture descriptors.
+
+What that does to the ideas:
+- **Din's Fire is demoted.** Device-generated commands remove driver calls, about 1-1.5 ms of the ~8.5 summed (~0.3 ms of
+  wall time over 4 workers). Not worth its size now.
+- **Gossip Stones is promoted to first.** It skips the translation as well as the calls, for whatever repeats.
+- **A translation cache** (a draw's texture descriptors kept by the fingerprint of what it binds) is the same recognition
+  idea at draw level, for work that doesn't repeat as a whole segment.
+- Bindless descriptors stay useful (cheaper descriptor writes), but they don't remove the translation.
+
+**The measuring run (Temper, counters only, 2026-11-14):** `RX_GOSSIP_STONES=count` fingerprints each segment (exactly, and
+with uniform data left out) and each draw's ops since the one before, and logs how many match the frame before's. The fine
+profile's counters are now one row per thread, so the workers' numbers are complete and add up to "in all". With
+`RX_VK_SLOW_LOG=20` for smoothness. **Revised order:** read that run → Gossip Stones (the reuse) or the translation cache,
+whichever the match rates favour → bindless descriptors → Deku Scrub SIMD → Rito copy engine → Navi / Stone of Agony
+(smoothness: as important as base, per the user) → Din's Fire last.

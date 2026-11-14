@@ -1981,8 +1981,116 @@ struct Segment {
     const NvnState* s;
     size_t ub, cond;
 };
+
+// (MasterSword Gossip Stones, count only, 2026-11-14) RX_GOSSIP_STONES=count: how much of each frame's parallel-replay work is
+// the same as the frame before's, before building anything that reuses it (docs/MASTERSWORD_HARDWARE_OFFLOAD_RESEARCH.md s6).
+// Each segment a worker records is fingerprinted twice: "exact", every byte of its ops; "shape", the same but for the data of
+// uniform updates and push constants (where they write and how much stay in). And each draw or dispatch by the ops since the one
+// before it. Every present the fingerprints are matched against the frame before's (as sets: a segment that moved still
+// matches). Logged with the frame lines: what a reuse of recorded segments (exact), of segments with their uniforms rewritten
+// (shape), or of a draw's translated state (draws) could skip at most. Off: nothing is fingerprinted
+namespace gossip {
+const bool on = [] {
+    const char* e = getenv("RX_GOSSIP_STONES");
+    const bool v = e && (!strcmp(e, "count") || !strcmp(e, "1"));
+    if (v) logf("vk: MasterSword Gossip Stones: counting how much of each frame's recorded work repeats the frame before");
+    return v;
+}();
+std::mutex mu;
+std::vector<uint64_t> cur_exact, cur_shape, cur_draw;   // (this frame's, appended by the workers under mu)
+std::vector<uint64_t> prev_exact, prev_shape, prev_draw;   // (the frame before's, sorted: the present's thread only)
+int64_t frames, segs, hit_exact, hit_shape, draws, hit_draw, ns_spent;
+std::atomic<int64_t> ns_fp{0};
+inline uint64_t mix(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h * 0xff51afd7ed558ccdull;
+}
+inline uint64_t bytes(uint64_t h, const uint8_t* p, size_t n) {
+    for (; n >= 8; p += 8, n -= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        h = mix(h, v);
+    }
+    if (n) {
+        uint64_t v = 0;
+        std::memcpy(&v, p, n);
+        h = mix(h, v ^ ((uint64_t)n << 56));
+    }
+    return h;
+}
+/// A segment's fingerprints (a worker, before it records it)
+void note_segment(const uint8_t* p, const uint8_t* end) {
+    const int64_t t0 = prof_now();
+    std::vector<uint64_t> d;
+    d.reserve(256);
+    uint64_t ex = 0x5e9a, sh = 0x5e9b, dr = 0x5e9c;
+    for (;;) {
+        if (p == end) break;
+        nvn_op_hdr h;
+        std::memcpy(&h, p, sizeof h);
+        if (h.op == NOP_END || h.size < sizeof h) break;
+        const uint8_t* a = p + sizeof h;
+        const size_t n = h.size - sizeof h;
+        ex = bytes(ex, p, h.size);
+        size_t keep = n;   // (the shape: an update's where and how much, not what)
+        if (h.op == NOP_UPDATE_UB) keep = std::min(n, sizeof(nvn_p_update_ub));
+        else if (h.op == NOP_PUSH_CONST) keep = std::min(n, sizeof(nvn_p_push_const));
+        sh = bytes(mix(sh, ((uint64_t)h.op << 32) | (keep == n ? h.size : 0)), a, keep);
+        dr = bytes(mix(dr, ((uint64_t)h.op << 32) | (keep == n ? h.size : 0)), a, keep);
+        if (op_is_work(h.op)) d.push_back(dr), dr = 0x5e9c;
+        p += h.size;
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    cur_exact.push_back(ex);
+    cur_shape.push_back(sh);
+    cur_draw.insert(cur_draw.end(), d.begin(), d.end());
+    ns_fp.fetch_add(prof_now() - t0, std::memory_order_relaxed);
+}
+/// How many of a (sorted) are in b (sorted), each of b's once
+int64_t matched(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    int64_t m = 0;
+    for (size_t i = 0, j = 0; i < a.size() && j < b.size();) {
+        if (a[i] < b[j]) i++;
+        else if (b[j] < a[i]) j++;
+        else m++, i++, j++;
+    }
+    return m;
+}
+/// Every present (its thread): this frame's fingerprints against the frame before's
+void frame_end() {
+    if (!on) return;
+    std::vector<uint64_t> ex, sh, dr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        ex.swap(cur_exact), sh.swap(cur_shape), dr.swap(cur_draw);
+    }
+    if (ex.empty()) return;   // (no parallel replay this frame: a loading screen, a short frame)
+    std::sort(ex.begin(), ex.end()), std::sort(sh.begin(), sh.end()), std::sort(dr.begin(), dr.end());
+    if (!prev_exact.empty()) {
+        frames++;
+        segs += (int64_t)ex.size(), draws += (int64_t)dr.size();
+        hit_exact += matched(ex, prev_exact), hit_shape += matched(sh, prev_shape), hit_draw += matched(dr, prev_draw);
+    }
+    prev_exact.swap(ex), prev_shape.swap(sh), prev_draw.swap(dr);
+}
+/// With the frame lines (every 120 presents)
+void report() {
+    if (!on) return;
+    static int64_t l_f, l_s, l_he, l_hs, l_d, l_hd, l_ns;
+    const int64_t f = frames - l_f, s = segs - l_s, d = draws - l_d, fp = ns_fp.load(std::memory_order_relaxed);
+    if (f > 0 && s > 0) {
+        logf("vk: MasterSword Gossip Stones (count): %.1f segments a frame, the same as one the frame before: %.1f%% exactly, "
+             "%.1f%% but for uniform data; %.0f draws and dispatches a frame, %.1f%% with the same ops since the one before as one "
+             "the frame before; fingerprints %.3f ms a frame (all threads)", (double)s / f, 100.0 * (hit_exact - l_he) / s,
+             100.0 * (hit_shape - l_hs) / s, (double)d / f, d ? 100.0 * (hit_draw - l_hd) / d : 0.0, (fp - l_ns) / (double)f / 1e6);
+    }
+    l_f = frames, l_s = segs, l_he = hit_exact, l_hs = hit_shape, l_d = draws, l_hd = hit_draw, l_ns = fp;
+}
+}   // namespace gossip
+
 /// One segment recorded into cmd from the state at its start (any thread: the replay thread's own included)
 void record_segment(VkCommandBuffer& cmd, const Segment& g) {
+    if (gossip::on) gossip::note_segment(g.p, g.end);
     rmode = Mode::Worker;
     NvnState s = *g.s;
     ub_limit = g.ub, cond_at = g.cond;
@@ -3487,6 +3595,7 @@ uint64_t made_ring[32];
 int64_t made_ring_present = 0;
 void log_frame_stats() {
     log_slow_frame();
+    gossip::frame_end();   // (MasterSword Gossip Stones, RX_GOSSIP_STONES=count)
     made_ring[presents % 32] = texture_made();
     made_ring_present = presents;
     {
@@ -3567,6 +3676,7 @@ void log_frame_stats() {
              (long long)tr, (long long)fl, texture_count(), (unsigned long long)(texture_bytes() >> 20));
         draw_skip_report(120.0);
         op_fine_report(120.0);   // (0.1.9c: RX_VK_PROF_FINE=1, the replay by op)
+        gossip::report();        // (MasterSword Gossip Stones, RX_GOSSIP_STONES=count)
         {   // (hookshot: the full barriers recorded and the ones left out as the second of two in a row, RX_VK_BARRIER_DEDUPE_OFF=1)
             static int64_t l_made, l_left;
             int64_t made = 0, left = 0;

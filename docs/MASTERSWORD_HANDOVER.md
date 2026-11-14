@@ -597,6 +597,14 @@ prize is **GPU-driven submission ("Din's Fire")** built on **bindless descriptor
 over most per-draw CPU recording; the NPU fits as an advisory predictor ("Nayru's Love"); Tensor cores help only GPU work.
 Order: measure Vulkan call types in Town -> bindless descriptors -> Din's Fire -> Nayru's Love. Not built yet.
 
+**Update (2026-11-14, evening):** Town's existing fine profile shows the Vulkan calls themselves are cheap (vkCmdDraw 0.16 ms,
+the descriptor push 0.18 ms a frame); the cost is MasterSword translating NVN state (texture descriptors 1.65 ms, ~3.3 ms of
+descriptor building of ~8.5 summed). Din's Fire demoted; **Gossip Stones** (reuse what repeats frame to frame) first. Counters
+built and deployed for one measuring run: `RX_GOSSIP_STONES=count` (vk_replay.cpp, `gossip::`; log line "Gossip Stones
+(count)"), the fine profile per thread (vk_draw.cpp `FineRow`, line now "ms (all threads, X in all)"), `RX_VK_SLOW_LOG=20`.
+All three are on in the smoke env; remove after the run. DLL backup: mastersword_vk.dll.bak_pre_gossip_count. The user: smoothness
+and base fps matter equally.
+
 ---
 
 ## 5. Releases

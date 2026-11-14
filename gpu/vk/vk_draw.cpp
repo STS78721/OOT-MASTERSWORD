@@ -135,7 +135,21 @@ const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "desc
                                       "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built"};
 static_assert(std::size(kFineT) == FT_COUNT && std::size(kFineC) == FC_COUNT, "every section and count is named");
 const bool g_fine = getenv("RX_VK_PROF_FINE") != nullptr;
-int64_t fine_ns[FT_COUNT], fine_n[FC_COUNT];
+// (MasterSword Temper 2026-11-14) a row of sums per thread: under parallel replay 4-6 workers added to one plain array at once,
+// losing some of the additions and moving its cache line between cores in what was timed. A thread takes the next row the first
+// time it counts (more threads than rows: the last row, shared); the report adds the rows up
+struct alignas(64) FineRow {
+    int64_t ns[FT_COUNT], n[FC_COUNT];
+};
+constexpr int kFineRows = 24;
+FineRow g_fine_rows[kFineRows];
+std::atomic<int> g_fine_next{0};
+inline FineRow& fine_row() {
+    thread_local FineRow* r = &g_fine_rows[std::min(g_fine_next.fetch_add(1, std::memory_order_relaxed), kFineRows - 1)];
+    return *r;
+}
+#define fine_ns (fine_row().ns)
+#define fine_n (fine_row().n)
 struct FineScope {
     int ph;
     int64_t t0;
@@ -151,8 +165,20 @@ struct FineScope {
 void fine_report(double frames) {
     if (!g_fine) return;
     static int64_t last_ns[FT_COUNT], last_n[FC_COUNT];
+    int64_t sum_ns[FT_COUNT] = {}, sum_n[FC_COUNT] = {};   // (every thread's row)
+    for (const FineRow& r : g_fine_rows) {
+        for (int i = 0; i < FT_COUNT; i++) sum_ns[i] += r.ns[i];
+        for (int i = 0; i < FC_COUNT; i++) sum_n[i] += r.n[i];
+    }
+#undef fine_ns
+#undef fine_n
+#define fine_ns sum_ns
+#define fine_n sum_n
     char line[1400];
-    int k = snprintf(line, sizeof line, "vk: a frame (fine): ms:");
+    int64_t total = 0;   // (the sections, the push call left out: it is inside "bind descriptors")
+    for (int i = 0; i < FT_COUNT; i++)
+        if (i != FT_PUSHCALL) total += fine_ns[i] - last_ns[i];
+    int k = snprintf(line, sizeof line, "vk: a frame (fine): ms (all threads, %.2f in all):", total / frames / 1e6);
     for (int i = 0; i < FT_COUNT; i++) {
         k += snprintf(line + k, sizeof line - k, " %s %.2f%s", kFineT[i], (fine_ns[i] - last_ns[i]) / frames / 1e6, i + 1 < FT_COUNT ? "," : "");
         last_ns[i] = fine_ns[i];
@@ -169,6 +195,10 @@ void fine_report(double frames) {
     }
     logf("%s", line);
     for (int i = 0; i < FC_COUNT; i++) last_n[i] = fine_n[i];
+#undef fine_ns
+#undef fine_n
+#define fine_ns (fine_row().ns)
+#define fine_n (fine_row().n)
 }
 
 bool no_a2c() {
