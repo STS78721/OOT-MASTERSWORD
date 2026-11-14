@@ -495,6 +495,23 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   convict the mirror fix. Then, if cleared: narrow texture-storage spans to the textures' own ranges instead of whole pools
   (no visual change), and measure the shadow copy's time on the game's thread.
 
+### Mirror A/B (19:32 vs 19:37) and a correction about "capture pages"
+
+- **Run 1, mirror fix on (19:32, Field <-> Town three times):** Field 58.8 -> 56.7 -> 55.8 fps across returns (90% / 46% /
+  35% of the time at 59+); Town 48.5 / 48.4 / 46.7. Mirror memory held at <= 2.0 GB; 464 mirrors (5.8 GB) given back and
+  made again over the session (turnover, not shown to cost).
+- **Run 2, old behaviour (`RX_VK_MIRROR_IDLE_BY_SYNC=1`, 19:37):** Field 53.5 on first load, last stretch 47.1; mirror
+  memory 1.6 -> 2.5 GB and still growing. **The fix stays**; the switch is commented out again. Logs kept:
+  `AB_test/log_mirrorfix_on_1933.txt`, `AB_test/log_mirrorfix_off_1938.txt`.
+- **Correction (to my 19:22 reading and Gemini's suspect B):** the `a capture taken ... N texture pages copied (MB)` number
+  is `shadow_n`, the pages **held** in the shadow store (capped at 65,536 = 256 MB), not pages copied per capture. It grows
+  because the store fills. The real cost is that line's `all` time: **~0.055 ms a capture, 6 a frame, ~0.3 ms a frame**
+  (max ~1.4 ms). Not a base-fps driver; not to be narrowed (whole-pool marking may protect texture correctness).
+- **Where base fps stands:** the return-to-Field regression is largely fixed (55.8-58.8 vs Gemini's 52). **Town is the
+  ceiling, ~47-48 fps:** Temper 3 (Gemini's log) puts it at ~24 ms a frame = renderer submit ~10.6 ms + game/host ~13.5 ms,
+  GPU only ~5 ms. Next: Town's per-draw cost (descriptors, commands, ParLock contention: 3,000+ draws) and what the game's
+  own threads spend there (Gemini's notes §5). Unverified suspect left: the 3,500-texture ceiling (suspect C).
+
 ---
 
 ## 5. Releases
