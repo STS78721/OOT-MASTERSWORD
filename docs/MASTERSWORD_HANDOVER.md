@@ -395,6 +395,43 @@ Forge of **Farore's Wind** (research doc §5 step 3), switch default off, A/B on
 - The Sensor itself worked: 5 area pictures taken, 2 matched ("15 of its first 24 programs", "20 of 24"), 976 and 966
   shaders made ready ahead.
 
+### STATE AT HANDOVER (2026-11-14 11:57): everything confirmed working
+
+The user: "working flawlessly". The confirming run (11:57, Sheikah Slate session 4):
+
+| | Value |
+|---|---|
+| Program cache | kept (47,866 programs, 7.4 GB); start-up shaders 5.7 s |
+| Song of Time | 3,677 shaders made ready at start-up in 1.2 s |
+| Sheikah Sensor | 1,386 programs drawn, 13,374 score events, 5 area bursts |
+| Area pictures | 4 taken, 4 replayed; a perfect match "24 of its first 24 programs", 929 shaders made ready ahead |
+| Owl Statue | a save's first flush 12.2 ms, on its own thread |
+| Imports (Lens of Truth) | 104, average 18.9 ms (41 ms before the Lens) |
+| Frame rate | 52.0 fps average in busy scenes, 33% of the time at 59-60; 18 frames over 50 ms, 4 over 100 ms |
+| Renderer CPU per frame | replay submit ~8.0 ms (draw 12.6 across threads, descriptors 4.4, commands 6.1) |
+
+**What's deployed in the smoke folder (B renderer + exe):** Longshot ports, the memory pack and MasterSword Triforce Shader
+Delivery (Power, Wisdom adaptive, Courage, Song of Time, Mirror Shield), Lens of Truth, the Sheikah Slate with the Sheikah
+Sensor (SLT2, fingerprint), the Owl Statue, Temper 1 and Temper 2. All on by default; every one has its off switch in
+`hookshot_env.txt`. Code and docs are committed on `mastersword-fg`; the commits after `b8408cd2` are local until pushed.
+
+**To resume:** read this file top to bottom, then `docs/MASTERSWORD_TECHNIQUES.md` and
+`docs/MASTERSWORD_SHEIKAH_SLATE_RESEARCH.md`. Work in the Forge & Temper cycle, name new tech with Zelda references
+(MasterSword / SteelTempleSaint), keep this file current, never resize the structs in the program cache's stamp.
+
+### Next: lifting base fps with what the Slate learns (proposed, not built)
+
+Base fps is CPU-bound (GPU-bound wait 0.0 ms): about 8 ms a frame is the renderer's replay, the rest of the ~19 ms frame
+is the game's own threads. The Slate's pictures mostly help area changes, not the steady rate, so the honest path is:
+1. **Measure first (Temper 3):** per frame, the game threads' busy time next to the replay's, per area picture, so we know
+   which side limits each area. The Sensor's draw counts name the hottest programs per area.
+2. **Forge: MasterSword Hero's Shade (per-area self-tuning).** Like the Hero's Shade teaching techniques, the Slate tries
+   the renderer's tunables per area (parallel replay threads and segment size, descriptor reuse, compaction timing), keeps
+   whichever measured fastest for that picture, and applies it when the area's picture matches. Switch default off, A/B.
+   Expected: a few percent where the replay limits, nothing where the game's own threads do.
+3. **Targeted Tempers** on the per-draw cost (descriptors ~4.4 ms, commands ~6 ms a frame), guided by the Sensor's hottest
+   programs, so effort goes where the draws actually are.
+
 ---
 
 ## 5. Releases
@@ -432,8 +469,7 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 
 ## 7. Open items, in priority order
 
-1. Play-test the Sheikah Slate over 2-3 sessions (above), then Lens of Truth and the Triforce upgrades: import times (the `vk: import` breakdown lines' `commit+properties`
-   should be ~0), the `Lens of Truth` counts, Song of Time's start-up line, Wisdom's budget changes, no Mirror Shield alarms.
+1. Lift base fps with the Slate: Temper 3 measurement, then the Hero's Shade Forge (see "Next: lifting base fps" above).
 2. If imports still hitch: the driver's pinning half (5-35 ms). Fewer, larger imports at quiet moments, or reusing pinned
    memory, without background pinning during play (that failed).
 2. If imports still hitch: find what makes them ~34 ms with RAM free (commit/`VirtualQuery` on write-watch memory, the
