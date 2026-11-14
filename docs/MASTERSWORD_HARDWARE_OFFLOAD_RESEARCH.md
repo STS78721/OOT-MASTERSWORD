@@ -66,3 +66,26 @@ playbook's ML section).
 5. #3, #5, #6 only if measurements later point at them.
 
 Before any of this: settle Hero's Shade (one run with `RX_HEROS_SHADE=0`; see the handover).
+
+## 6. Round 2: what the "security camera" pattern teaches (engineering level)
+
+**The rule that decides everything: latency vs. batching.** A camera's NPU works because it gets a steady stream of
+same-shaped inputs and can answer late (a few ms). A dispatch to the NPU costs ~0.1-1 ms round trip; to the GPU, a
+submit-and-wait costs ~0.05-0.2 ms plus a frame of pipelining. So offload fits work that is (a) batchable, (b) can be
+answered a frame or more late, or (c) can run ahead speculatively. It never fits a game function the CPU waits on mid-frame.
+
+The camera's real trick is **recognition**: noticing "this is the same thing I saw before" and skipping the work. That
+applies to MasterSword directly, mostly without ML:
+
+| Name | Idea | Hardware | Lifts base fps? | Notes |
+|---|---|---|---|---|
+| **Gossip Stones** — recognised command segments | Town's draw stream is nearly identical frame to frame. Fingerprint each parallel-replay segment (pipelines, descriptor contents, buffer ranges, dynamic state); when a segment's fingerprint matches last frame's, re-submit its already-recorded command buffer instead of recording it again. Only changing data (uniforms) is rewritten | CPU hashing; secondary command buffers (none used today); needs bindless/descriptor buffers so segments don't embed per-frame descriptors | **Yes, potentially the most**: a matched segment costs a hash instead of ~2.8 us/draw | Fingerprint must be cheaper than recording; guest addresses that move between frames break matches. Measure the match rate first (a counter in the Sheikah Sensor) |
+| **Rito copy engine** (dedicated transfer queue) | Mirror syncs and imports use CPU memcpy / the graphics queue today (no transfer queue in the tree). The GPU's DMA copy engines are idle and run in parallel with rendering | GPU copy engines | Some, on streaming-heavy frames and transitions | Needs queue-ownership transfers and semaphores; A/B on returns to Field |
+| **Deku Scrub SIMD** — the game's own matrix math | OoT computes limb/skeleton matrices and the matrix stack on the CPU. That is tensor-shaped work, but the right tensor unit at that latency is the CPU's own AVX2/AVX-VNNI. Profile the hottest guest functions; replace the matrix ones with vectorised host versions (the oot_patches.py site mechanism already exists) | P-core SIMD | **Yes**, on the game's ~12 ms side, which nothing else on this list touches | Bit-exact results required (game logic depends on them) |
+| **Navi** — "Hey, listen!" next-area prediction | A small model on the NPU watches Link's position, heading and the current area picture and predicts the next transition a few seconds early; MasterSword warms shaders, imports and the Slate picture before the loading zone | NPU | No; it targets the transition dips | Exactly the camera pattern: a steady stream, late answers are fine, a wrong guess costs only some background work |
+| **Stone of Agony** — hitch anomaly detection | An always-on classifier over the Sheikah Sensor's per-frame telemetry flags abnormal frames and labels the cause (shader build, import, save, lock wait, GPU), writing it to the Slate so the next session pre-empts it | NPU (or a CPU heuristic first) | Indirectly | Start with a rule-based version; use the NPU only if the rules miss |
+| **Twinrova iGPU** | The CPU's integrated Intel GPU is idle; it could take async work that tolerates cross-adapter copies (Slate/pack compression, offline texture re-encodes) | iGPU | No | Low priority; cross-adapter copies are slow |
+
+**Revised order:** measure Vulkan call types and the Gossip Stones match rate (both counters, one Temper run) →
+bindless descriptors → Gossip Stones → Din's Fire for the segments that don't match → Deku Scrub SIMD (profile first) →
+Rito copy engine → Navi / Stone of Agony.
