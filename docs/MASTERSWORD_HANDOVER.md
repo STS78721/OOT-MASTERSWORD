@@ -651,6 +651,12 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   RX_MAPS=work/sa/_pre_biggoron).
 - Temper run: Town ~1 min without the sampler (the fps comparison), then "Mask of Truth - sample 30 seconds.bat" (the profile
   comparison), then two other areas for correctness.
+- **Temper run 22:28 (AB_test/log_biggoron_2228.txt, mask_of_truth_town_2228_biggoron.txt):** clean (no faults, normal
+  exit; Town and lighter areas). **What it targeted, it did:** out-of-line float helpers 10.7% -> 1.1% of game-side running
+  time; the job workers' recompiler-helper share 3.9% -> 0.9%. **The frame rate is not proven:** sampler-off Town-like windows
+  45.6 -> 47.0 fps, but the runs stood in different spots (Town's area averaged 2186 draws before, 1830 after; per-area
+  game/host changes -6% to +13% on single samples), and the job workers were busy 22% -> 24% (the float work now inside the
+  functions; more actors where the second run stood?). Needs a same-scene A/B: a fixed spot, both exes, alternated.
 
 **Next phase, agreed plan (2026-11-14), in order:**
 1. Temper of Biggoron's Forge (Town + Mask of Truth sample + two other areas for correctness). Nothing stacks before it.
