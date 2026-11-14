@@ -432,6 +432,46 @@ is the game's own threads. The Slate's pictures mostly help area changes, not th
 3. **Targeted Tempers** on the per-draw cost (descriptors ~4.4 ms, commands ~6 ms a frame), guided by the Sensor's hottest
    programs, so effort goes where the draws actually are.
 
+### Gemini's session (2026-11-14 13:00-19:05), reviewed, and the fixes that followed
+
+**What Gemini did** (committed as-is in `c7ebc0f6`, kept apart from later work): the Insert menu, FPS counter and start-up
+screen drawn with Dear ImGui (ported from Longshot v3.0.0-rc.3; `third_party/imgui` MIT, Libertinus fonts OFL, the game's own
+menu font read from the player's files at run time), Menu size and Overlay size options; Sheikah Slate 3 with Temper 3
+per-area timing and **MasterSword Hero's Shade** (per-area parallel-replay tuning, `RX_HEROS_SHADE=1` in the env file);
+Longshot ports (prepare workers, `RX_VK_READBACK_LATE`, Intel compiler gate, segment-heap manifest). Tests 166/103/32.
+Its own notes, kept local (they hold a user path): `runs/_release_prep/HANDOVER_TO_CLAUDE_0.2.0.md`,
+`HEADLESS_BENCH_METHOD.md`.
+
+**The build-command bug (root cause of the missing logs and lost base fps):** Gemini built with
+`set RX_RELEASE=1 && set HOOKSHOT_FSR=1 && ...`. In cmd that leaves a trailing space ("1 "), so `nx2/build.py`'s `== "1"`
+checks failed: its later exes were **console** apps (subsystem 3: `hos_main.c` sees a stderr handle and never opens
+`hookshot_log.txt`; the launcher was not the cause), had **no start-up shader preparation** (`HOOKSHOT_RELEASE` undefined,
+`precompile_wanted()` off: pipelines compiled in play), and **no FSR 4**. Always build with quoted sets:
+`set "RX_RELEASE=1"`, `set "HOOKSHOT_FSR=1"` (as the scratchpad build scripts do). Check after a build: the exe's PE
+subsystem must be 2.
+
+**The program cache was rebuilt twice** in Gemini's session (start-up 54 s at 14:07): `vk_shader.cpp` is part of the
+cache stamp's *source* hash (`nx2/build.py`: eden/, sirit/, compat/, vk_shader.cpp, vk_state.h, vk_api.h), and Gemini edited
+it. `hookshot_programs.bin` was 302 MB after (7.4 GB before).
+
+**Gemini's mirror finding, confirmed and fixed** (commit `5144045d`): the parallel replay's pre-segment sync stamped every
+mirror's `synced_epoch` each submission, so `mirrors_give_back` never saw one idle; an area's mirrors stayed after leaving it
+(Field 113 / 1.5 GB at 60 fps -> after Town 163 / 2.0 GB, ~4,800 copies a frame, 52 fps). Pools now carry `bound_epoch`,
+stamped where they're bound for a draw; the idle test uses it. The pre-segment sync is unchanged (no copy in a parallel
+segment). `RX_VK_MIRROR_IDLE_BY_SYNC=1` restores the old test. Gemini's other two suspects (capture/texture-page growth, the
+3,500-texture ceiling) are **not yet verified**.
+
+**Deployed (exe + DLL, backups `*.bak_gemini_1905`):** windowed exe, start-up preparation on, FSR 4 in, the mirror fix.
+The cache stamp is unchanged from Gemini's last build, but with preparation back on, **the first start prepares every
+shader the 302 MB cache doesn't hold yet (likely about a minute, once)**; later starts ~5 s.
+
+**Every MasterSword system verified intact** in source and binaries, and running in the 17:00 log: the memory pack, Wisdom,
+Courage (warm-up), Song of Time, Mirror Shield, the Sheikah Slate and Sensor (9 area matches, 8 replayed, 10 bursts), Lens of
+Truth (exe export + renderer), the Owl Statue (10 saves), the resident floor, the census, and Gemini's Hero's Shade.
+
+**Next:** one Field -> Town -> Field run on this build for a real log (`hookshot_log.txt` is back), then verify Gemini's
+other two suspects and the base-fps plan in its notes (§5: ParLock contention, per-draw descriptor/ubo cost in Town).
+
 ---
 
 ## 5. Releases
