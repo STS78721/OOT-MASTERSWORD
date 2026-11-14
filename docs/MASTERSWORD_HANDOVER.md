@@ -527,6 +527,15 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   ranges wait on this PC; then a size rule for the non-exposure ones, A/B'd, watching for flashes or popping.
 - After that, the renderer side of Town (~9.5 ms submit for ~2,700 draws): per-draw descriptor and command cost.
 
+### Readback ranges measured (19:51) and the first late-read A/B
+
+- The logging run: **82.8 s of game-thread waiting on GPU results over 18,480 frames, ~4.5 ms a frame.** By range size:
+  `0x3980` pair 48.9%, `0x1b580` 36.2%, `0x9b040` 14.4%, everything else <1% (the small ranges, where an exposure-style
+  sum would be, barely wait). Baseline log: `AB_test/log_readback_wait_baseline_*.txt`.
+- **A/B now in the env file:** `RX_VK_READBACK_LATE=3980` (the Steam Deck research's documented rule; `readback_late.h`
+  parses it as hex), range logging still on so the log shows the `late` counts. Watch for white flashes, popping at the
+  screen's edges, flickering shadows. If clean and faster, the next step is `0x1b580` and `0x9b040`, one at a time.
+
 ---
 
 ## 5. Releases
