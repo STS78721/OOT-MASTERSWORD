@@ -73,6 +73,11 @@ struct Pool {
     uint64_t synced_epoch = 0;   // the submission that last brought it up to date
     uint64_t sync_seg = 0;       // (and the parallel replay's segment whose uploads did)
     uint64_t last_value = 0;     // (the newest submission that bound it: its mirror is in use until that one is done)
+    // (MasterSword 2026-11-14) the mirror epoch it was last bound in, for the idle check (mirrors_give_back). synced_epoch was
+    // used, but the parallel replay's pre-segment sync (memory_sync_mirrors_before_segments) brings every mirror up to date
+    // each submission, so no mirror ever looked idle: an area's mirrors were never given back after leaving it (Hyrule
+    // Field -> Town -> Field: 113 -> 163 mirrors, 1.5 -> 2.0 GB, ~4,800 copies a frame, 60 -> 52 fps). Found by Gemini
+    uint64_t bound_epoch = 0;
     uint64_t direct_write_epoch = 0;   // (the part that last wrote it in guest memory, before it had a mirror)
     uint64_t retired_value = 0;  // (retired: the submission that may still use it)
     bool was_mirrored = false;   // (its mirror was given back: its pages stay in the captures, for the next one)
@@ -3035,6 +3040,7 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     Pool* p = pool_of(guest, size);
     if (!p) return {};
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
+    p->bound_epoch = mirror_epoch;   // (MasterSword: bound now, for the mirror idle check)
     note_in_place_read();   // (the pool itself, read by the GPU where the caller's work runs)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
@@ -3237,6 +3243,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
+        p->bound_epoch = mirror_epoch;   // (MasterSword: bound now, for the mirror idle check)
         if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED) {
             note_in_place_read(!mirror_upload);
             return remember({p->buffer, off, size, 0});
@@ -3294,6 +3301,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     tl = {p, pools_gen.load(std::memory_order_relaxed)};
     (void)par;
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
+    p->bound_epoch = mirror_epoch;   // (MasterSword: bound now, for the mirror idle check)
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
         if (written) note_direct_write(*p, off, size);
@@ -3475,8 +3483,9 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     static int logged_frees = 0;
     const auto told = [](const Pool& p, const char* why) {
         if (logged_frees++ < 200)
-            logf("vk: mirror of pool %#llx (%llu MB) given back: %s, %llu submissions since its sync%s%s", (unsigned long long)p.lo,
-                 (unsigned long long)((p.hi - p.lo) >> 20), why, (unsigned long long)(mirror_epoch - p.synced_epoch),
+            logf("vk: mirror of pool %#llx (%llu MB) given back: %s, %llu submissions since it was last bound%s%s",
+                 (unsigned long long)p.lo, (unsigned long long)((p.hi - p.lo) >> 20), why,
+                 (unsigned long long)(mirror_epoch - (p.bound_epoch ? p.bound_epoch : p.synced_epoch)),
                  p.gpu_only ? ", GPU-only data" : "", p.gpu_written ? ", GPU-written" : "");
     };
     for (auto& nh : retired_pools) {
@@ -3490,14 +3499,17 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     }
     std::vector<Pool*> idle;
     uint64_t kept_bytes = 0;
+    // (MasterSword: idle since last bound, not since last synced; RX_VK_MIRROR_IDLE_BY_SYNC=1: by the sync, as before)
+    static const bool by_sync = getenv("RX_VK_MIRROR_IDLE_BY_SYNC") && atoi(getenv("RX_VK_MIRROR_IDLE_BY_SYNC")) != 0;
+    const auto used = [](const Pool& q) { return by_sync || !q.bound_epoch ? q.synced_epoch : q.bound_epoch; };
     for (auto& [lo, p] : imported)
-        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed) {
+        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - used(p) > kIdleEpochs && p.last_value <= mem_completed) {
             if (p.gpu_only || p.gpu_written) kept_bytes += p.hi - p.lo;
             else idle.push_back(&p);
         }
-    std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
+    std::sort(idle.begin(), idle.end(), [&](const Pool* a, const Pool* b) { return used(*a) < used(*b); });
     for (Pool* p : idle) {
-        const bool long_idle = mirror_epoch - p->synced_epoch > kLongIdle;
+        const bool long_idle = mirror_epoch - used(*p) > kLongIdle;
         if (long_idle || mirror_bytes + want_bytes > mirror_budget()) told(*p, long_idle ? "idle" : "idle, for room"), mirror_free(*p);
     }
     static int64_t logged_at;
