@@ -258,6 +258,15 @@ check what it waits *for*; if it's the frame's GPU work, shorten the path to tha
 submission), not the read.** (Never read an accumulator late: OoT's exposure meter read late double-counts, which is
 visible as white flashes.)
 
+## 6d. A measured negative: reusing last frame's recorded commands (Gossip Stones, segment level)
+
+The idea: fingerprint each block of ~160 draws and re-submit last frame's recording when it matches. Measured in OoT before
+building it (`RX_GOSSIP_STONES=count`): 0.0-0.1% of blocks repeat, even with uniform data ignored; 10-42% of single draws.
+A recompiled game's stream points into per-frame buffers, so it differs nearly everywhere. Lesson: count the match rate
+before building a cache; recognition pays at the granularity where things actually repeat (here: descriptor sets).
+Also from that run: shared profiling counters written by several threads undercounted by about half; give each thread its
+own row and add them up in the report.
+
 ## 7. Method notes that made the difference
 
 - **The MasterSword Forge & Temper cycle (tick-tock).** Every new capability (Forge) is followed by a refinement pass on it

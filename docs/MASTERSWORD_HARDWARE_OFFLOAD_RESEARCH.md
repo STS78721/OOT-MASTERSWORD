@@ -118,3 +118,41 @@ profile's counters are now one row per thread, so the workers' numbers are compl
 `RX_VK_SLOW_LOG=20` for smoothness. **Revised order:** read that run → Gossip Stones (the reuse) or the translation cache,
 whichever the match rates favour → bindless descriptors → Deku Scrub SIMD → Rito copy engine → Navi / Stone of Agony
 (smoothness: as important as base, per the user) → Din's Fire last.
+
+## 8. The measuring run's results (2026-11-14 21:19, smoke AB_test/log_gossip_count_2119.txt)
+
+**Gossip Stones, whole segments: dead as designed.** 0.0-0.1% of segments match one the frame before, even with uniform
+data left out. Single draws: 10-15% in Town and the heavy areas, 25-42% in lighter, still scenes. The game's stream changes
+almost everywhere from frame to frame (addresses into per-frame buffers are the likely reason: the counter doesn't yet say
+which ops differ). Reusing recorded command buffers would need every draw of a segment to match: not reachable. Kept as a
+counter (`RX_GOSSIP_STONES=count`, ~0.5 ms a frame over all threads when on, nothing when off).
+
+**The draw work, now counted completely (one row per thread):** 8-14 ms a frame in the heavy windows over all threads,
+14-20 ms in the heaviest (the shared counters had shown about half). Its split, averaged over 41 heavy windows:
+
+| Section | Share |
+|---|---|
+| textures (working out each texture descriptor) | **31%** (34% in the heaviest) |
+| draw start (stats, camera notes, types) | 15% |
+| vertex+index binds | 12% (21% in the heaviest) |
+| bind descriptors | 9% |
+| storage buffers / user uniform buffers | 7% / 7% |
+| everything else | ~19% |
+| of all that, the Vulkan calls themselves (push call + vkCmdDraw) | ~3% |
+
+Per draw: 0.47 descriptor builds (half the draws reuse the draw before's), ~9 descriptors; 0.29 sets a draw over the push
+limit with ~28 descriptors each (handle tables: OoT's clustered lights' shadow maps). The texture view lookup itself is
+already a flat per-slot cache, so the texture cost is the number of descriptors the big sets rebuild, not the lookup.
+
+**Smoothness:** the slow-frame log filled its 800 lines mostly with 20-25 ms frames (the heavy areas' base rate);
+about 20 hitches over 33 ms, at area loads (recording >12 ms with hundreds of uploads) and memory syncs. This build writes
+no per-frame trace, so a Stone of Agony needs one first.
+
+**What it means for the ranking:**
+- The recognition idea survives at the **descriptor** level, not the segment level: a big set whose ~28 descriptors equal a
+  set built earlier in the recording could be re-used instead of rebuilt (a *descriptor set cache*, "Gossip Stones v2").
+  Upper bound: the textures + bind-descriptors share, ~40% of draw work, ~1 ms of recording wall time in Town (4-6 workers).
+- **The largest unmeasured block is the game's own CPU work** (~7.5 ms of Town's frame, plus ~4.5 ms waiting). Nothing has
+  profiled which game functions it is. Proposed next measurement: **Mask of Truth**, a sampling profiler of the game's
+  threads (a low-priority thread samples their instruction pointers and maps them to recompiled functions), so Deku Scrub
+  SIMD and game-side patches can aim at what's really there.

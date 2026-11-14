@@ -605,6 +605,13 @@ built and deployed for one measuring run: `RX_GOSSIP_STONES=count` (vk_replay.cp
 All three are on in the smoke env; remove after the run. DLL backup: mastersword_vk.dll.bak_pre_gossip_count. The user: smoothness
 and base fps matter equally.
 
+**Measuring run done (21:19, AB_test/log_gossip_count_2119.txt; switches off again):** whole-segment reuse is dead (0.0-0.1% of
+segments repeat; draws 10-42%). The draw work is 8-14 ms a frame over all threads (the old shared counters showed half):
+textures 31%, draw start 15%, vertex binds 12%, Vulkan calls ~3%. Big sets (0.29 a draw, ~28 descriptors: the clustered
+lights' handle tables) are the texture cost; the view lookup is already cached. Next candidates: a descriptor set cache
+("Gossip Stones v2", at most ~1 ms of Town's recording) or **Mask of Truth**, a sampling profiler of the game's own threads
+(~7.5 ms of Town's frame never profiled). See the research doc s8.
+
 ---
 
 ## 5. Releases
