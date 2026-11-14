@@ -306,7 +306,11 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
         extern int rx_guest_imported(uint64_t lo, uint64_t hi);
         if (hi > lo && rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
 #if defined(_WIN32)
-        else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
+        else if (hi > lo) {
+            extern void hos_commit_forget(uint64_t lo, uint64_t size);   /* (mkw_glue.c: the commit bitmap) */
+            hos_commit_forget(lo, hi - lo);
+            VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
+        }
 #else
         else if (hi > lo) {   /* (linux: kept mapped, the pages read as zero; MADV_REMOVE on the memfd window) */
             extern int hos_posix_guest_discard(void *p, size_t n);

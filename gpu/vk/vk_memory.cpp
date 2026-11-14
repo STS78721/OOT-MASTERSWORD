@@ -380,7 +380,28 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     // (pages the game has not touched yet may be only reserved: committed now, as the pool's memory is usable; a range
     // committed already is left alone: the call took milliseconds in the game's huge reservation)
     // (#3043) one query first: when the whole import is already one committed region, skip the heap walk
-    {
+    // (MasterSword Lens of Truth, 2026-11-14) and before that the host's commit bitmap (mkw_glue.c hos_guest_committed, exported by the game's
+    // exe): VirtualQuery in the 512 GB write-watched reservation was 6-28 ms an import (half its time), the bitmap microseconds.
+    // An exe without it (an older build), or a range it can't vouch for: VirtualQuery, as before. RX_VK_COMMIT_BITMAP=0: never
+#ifdef _WIN32
+    using CommittedFn = int (*)(uint64_t, uint64_t);
+    static const CommittedFn committed = [] {
+        if (getenv("RX_VK_COMMIT_BITMAP") && atoi(getenv("RX_VK_COMMIT_BITMAP")) == 0) return (CommittedFn) nullptr;
+        const auto fn = reinterpret_cast<CommittedFn>(GetProcAddress(GetModuleHandleA(nullptr), "hos_guest_committed"));
+        logf("vk: MasterSword Lens of Truth: imports read the game's commit bitmap instead of asking Windows: %s",
+             fn ? "on" : "off (an exe without it: VirtualQuery, as before)");
+        return fn;
+    }();
+    static std::atomic<int64_t> bitmap_yes{0}, bitmap_no{0};
+    const bool known_committed = committed && committed(lo, hi) == 1;
+    (known_committed ? bitmap_yes : bitmap_no)++;
+    if ((bitmap_yes + bitmap_no) % 64 == 0)
+        logf("vk: Lens of Truth: %lld imports answered by the commit bitmap, %lld asked Windows", (long long)bitmap_yes.load(),
+             (long long)bitmap_no.load());
+#else
+    const bool known_committed = false;
+#endif
+    if (!known_committed) {
         MEMORY_BASIC_INFORMATION first{};
         if (VirtualQuery(ptr, &first, sizeof first) == sizeof first && first.State == MEM_COMMIT &&
             (uint8_t*)first.BaseAddress + first.RegionSize >= ptr + bytes) {

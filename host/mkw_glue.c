@@ -47,6 +47,32 @@ static void commit_refused(uint64_t lo, uint64_t size, DWORD err) {
     }
 }
 
+/* (MasterSword Lens of Truth, 2026-11-14) Which 64 KB blocks of the guest window are committed, one bit each (1 MB for the 512 GB window).
+   The renderer's import of game memory asked Windows (VirtualQuery) first, and in this huge write-watched reservation that
+   took 6-28 ms an import: Windows walks the page tables to the end of the region's run of like pages. The renderer asks this
+   instead (hos_guest_committed, exported, found by GetProcAddress: no change to the renderer's interface). A bit is set only
+   for a block committed whole (hos_commit's and the touch handler's are 64 KB-aligned), and cleared for any decommit that
+   touches it: a clear bit only sends the renderer to VirtualQuery, as before. NULL with large pages: not tracked. */
+static volatile LONG64 *commit_bits;
+static void commit_bits_set(uint64_t lo, uint64_t hi) {   /* (64 KB-aligned) */
+    if (!commit_bits) return;
+    for (uint64_t b = lo >> 16; b < hi >> 16 && b < (HOS_GUEST_SPACE >> 16); b++)
+        InterlockedOr64(&commit_bits[b >> 6], (LONG64)(1ULL << (b & 63)));
+}
+void hos_commit_forget(uint64_t lo, uint64_t size) {   /* (hos_mem.c, hos_svc.c: the pages decommitted) */
+    if (!commit_bits || !size) return;
+    for (uint64_t b = lo >> 16; b <= (lo + size - 1) >> 16 && b < (HOS_GUEST_SPACE >> 16); b++)
+        InterlockedAnd64(&commit_bits[b >> 6], (LONG64)~(1ULL << (b & 63)));
+}
+/* 1: [lo, hi) is committed; 0: some of it may not be (ask Windows); -1: not tracked here */
+__declspec(dllexport) int hos_guest_committed(uint64_t lo, uint64_t hi) {
+    if (!commit_bits) return -1;
+    if (hi <= lo || hi > HOS_GUEST_SPACE) return 0;
+    for (uint64_t b = lo >> 16; b <= (hi - 1) >> 16; b++)
+        if (!(commit_bits[b >> 6] >> (b & 63) & 1)) return 0;
+    return 1;
+}
+
 void hos_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
     if (!hos_guest_range(addr, size)) {   /* (hookshot: guest pages only; the posix layer's commit changes any page's protection) */
@@ -56,9 +82,14 @@ void hos_commit(uint64_t addr, uint64_t size) {
     const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
     if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
         const DWORD err = GetLastError();
-        if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))) return;
+        if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))) {
+            commit_bits_set(lo, hi);
+            return;
+        }
         commit_refused(lo, hi - lo, err);
+        return;
     }
+    commit_bits_set(lo, hi);
 }
 
 DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
@@ -84,10 +115,16 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     static volatile LONG touched;
     if (InterlockedIncrement(&touched) <= 16)
         hos_log("mem: %#llx committed on first touch (nothing handed it out)", (unsigned long long)guest);
-    if (VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (VirtualAlloc(GP(guest & ~0xFFFFULL), 0x10000, MEM_COMMIT, PAGE_READWRITE)) {
+        commit_bits_set(guest & ~0xFFFFULL, (guest & ~0xFFFFULL) + 0x10000);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     /* (hookshot: at the commit limit the touch waits for the renderer to give commit back, as hos_commit does) */
     const DWORD err = GetLastError();
-    if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(guest & ~0xFFFFULL), 0x10000)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(guest & ~0xFFFFULL), 0x10000)) {
+        commit_bits_set(guest & ~0xFFFFULL, (guest & ~0xFFFFULL) + 0x10000);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     commit_refused(guest & ~0xFFFFULL, 0x10000, err);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -228,6 +265,9 @@ static LONG CALLBACK report_fatal(EXCEPTION_POINTERS *info) {
 }
 
 void hos_commit_init(void) {
+    /* (the commit bitmap above: 1 MB) */
+    commit_bits = (volatile LONG64 *)VirtualAlloc(NULL, (SIZE_T)(HOS_GUEST_SPACE >> 16 >> 3), MEM_RESERVE | MEM_COMMIT,
+                                                 PAGE_READWRITE);
     AddVectoredExceptionHandler(1, commit_on_touch);
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
