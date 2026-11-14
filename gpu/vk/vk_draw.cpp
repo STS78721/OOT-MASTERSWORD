@@ -8320,3 +8320,17 @@ void pipeline_cache_save(bool force) {
 }
 
 } // namespace mkwvk
+
+namespace mkwvk {
+/// (hookshot) n bytes copied into the recording's stream, as a buffer binding (vk_memory.cpp gpu_buffer_bind: a read whose pool is
+/// still being imported in the background); empty when there is no recording or no room. (0.1.9c: upstream's, lost in this tree)
+BufferRef stream_copy(const void* src, uint64_t n) {
+    if (!cur || !n) return {};
+    const uint64_t align = std::max<uint64_t>({256, dev.props.limits.minUniformBufferOffsetAlignment,
+                                               dev.props.limits.minStorageBufferOffsetAlignment});
+    const uint64_t at = stream_alloc(n, align);
+    if (at == UINT64_MAX) return {};
+    std::memcpy(cur->mapped + at, src, n);
+    return {cur->stream, at, n, 0};
+}
+} // namespace mkwvk

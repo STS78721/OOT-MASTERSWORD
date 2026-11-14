@@ -2119,6 +2119,61 @@ void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
     bg_cv.notify_one();
 }
 
+/// (hookshot, smoothness) A read binding in a chunk not imported yet: its import goes to the background thread and the binding is
+/// served from a copy in the recording's stream, rather than the replay waiting for the import. Imports on the replay thread were
+/// the main hitch left in play (54-61 a run of the verification walks, 5-380 ms each, 2026-11-09). True: an import of the range is
+/// under way (sent now or before) and nothing covers it yet; false: the synchronous path as before (covered, outside the game's
+/// pools, or next to an import that would have to grow). (pools_mu held)
+/// (0.1.9c: upstream's, lost in this tree; on by default on NVIDIA, where a 64-byte compute binding inside one of the game's big
+/// pools imported the pool whole on the replay thread, ~1 ms a MB, 39 ms each, the last sharp hitches on an RTX 5070 Ti. Off on
+/// other vendors, where background imports slowed AMD's replay before. RX_VK_ASYNC_IMPORT=0 / 1: off / on anywhere)
+int64_t st_async_sent, st_async_copies;
+uint64_t import_chunk(void);   // (below; "(void)": the import-chunk test finds the definition by its text)
+bool async_import_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_ASYNC_IMPORT");
+        const bool v = e ? atoi(e) != 0 : dev.props.vendorID == 0x10de;
+        logf("vk: small read bindings of pools not imported yet: %s (RX_VK_ASYNC_IMPORT)",
+             v ? "served from a copy while the pool imports in the background" : "the replay imports the pool");
+        return v;
+    }();
+    return on;
+}
+bool import_in_background(uint64_t guest, uint64_t size) {
+    if (guest_pools.empty() || !size || !dev.external_memory_host) return false;
+    bg_drain();
+    auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), guest, [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == guest_pools.begin()) return false;
+    --it;
+    if (guest < it->lo || guest >= it->hi || size > it->hi - guest) return false;
+    const uint64_t chunk = import_chunk();
+    if (!chunk || guest + size > UINT64_MAX - chunk) return false;
+    if (auto c = imported.upper_bound(guest); c != imported.begin() && std::prev(c)->second.lo <= guest &&
+                                              std::prev(c)->second.hi >= guest + size)
+        return false;   // (covered)
+    const uint64_t lo = guest / chunk * chunk, hi = (guest + size + chunk - 1) / chunk * chunk;
+    for (auto o = imported.lower_bound(hi); o != imported.begin();) {   // (an import there: the synchronous path grows it)
+        --o;
+        if (o->second.hi <= lo) {
+            if (o->second.hi + (1ull << 30) < lo) break;
+            continue;
+        }
+        return false;
+    }
+    std::lock_guard lk(bg_mu);
+    for (const uint64_t x : bg_inflight)
+        if (x >= lo && x < hi) return true;   // (under way)
+    if (bg_inflight.size() >= 16) return false;
+    bg_start();
+    bg_inflight.push_back(lo);
+    bg_queue.push_back({lo, hi});
+    bg_cv.notify_one();
+    if (st_async_sent++ % 32 == 0)
+        logf("vk: imports in the background: %lld sent, %lld bindings served from a copy meanwhile", (long long)st_async_sent,
+             (long long)st_async_copies);
+    return true;
+}
+
 /// (imports by chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as their number grew,
 /// and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
 /// (hookshot) 4 MB, not 16, where the pools have VRAM mirrors: a mirror covers its import's whole range, and with 16 MB chunks
@@ -2274,8 +2329,8 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
                 static int n, logged;
                 total_ms += ms, n++;
                 if ((ms >= 2.0 && logged++ < 200) || n % 256 == 0)
-                    logf("vk: pool %#llx+%#llx imported in %.1f ms (%d imports, %.0f ms in all)", (unsigned long long)range.lo,
-                         (unsigned long long)(range.hi - range.lo), ms, n, total_ms);
+                    logf("vk: pool %#llx+%#llx imported in %.1f ms as %.1f MB (%d imports, %.0f ms in all)", (unsigned long long)range.lo,
+                         (unsigned long long)(range.hi - range.lo), ms, (hi - lo) / 1048576.0, n, total_ms);   // (0.1.9c: the import's own size: what the cost follows)
             }
         }
         if (!ok) {
@@ -3064,7 +3119,28 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     }
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
+    {   // (hookshot, smoothness: import_in_background above. Reads up to 4 MB; not in a parallel replay's segment)
+        if (async_import_on() && !written && !par && size <= (4u << 20) && guest < (1ull << 40) &&
+            !(last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) && import_in_background(guest, size)) {
+            uint64_t avail = 0;
+            const uint8_t* src = host->gpu_ptr(gpu, &avail);
+            if (src && avail >= size)
+                if (const BufferRef r = stream_copy(src, size)) {
+                    st_async_copies++;
+                    return r;
+                }
+        }
+    }
+    const auto lookup_t0 = std::chrono::steady_clock::now();
     Pool* p = pool_of(guest, size);
+    {   // (0.1.9c) a lookup that held the replay up (an import on this thread): what bound it, 60 lines. The ones a background
+        // import cannot take: written bindings, bindings in a parallel segment, over 4 MB
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lookup_t0).count();
+        static int told;
+        if (ms >= 10.0 && told++ < 60)
+            logf("vk: a binding waited %.1f ms for its pool's import: %#llx +%#llx, %s%s", ms, (unsigned long long)guest,
+                 (unsigned long long)size, written ? "written by the GPU" : "read only", par ? ", in a parallel segment" : "");
+    }
     if (!p) return {};
     tl = {p, pools_gen.load(std::memory_order_relaxed)};
     (void)par;

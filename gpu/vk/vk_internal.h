@@ -117,6 +117,7 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool hold
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
+BufferRef stream_copy(const void* src, uint64_t n);   // vk_draw.cpp: bytes in the recording's stream, as a binding (0.1.9c, upstream's)
 /// Changes when a read binding remembered earlier must be looked up again (a pool left, a mirror was made, a new submission)
 uint64_t gpu_bind_stamp();
 /// Around each submission's recording: mirrors wanted since the last one are made (begin), what the GPU wrote into
