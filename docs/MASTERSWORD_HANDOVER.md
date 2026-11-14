@@ -535,6 +535,12 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
 - **A/B now in the env file:** `RX_VK_READBACK_LATE=3980` (the Steam Deck research's documented rule; `readback_late.h`
   parses it as hex), range logging still on so the log shows the `late` counts. Watch for white flashes, popping at the
   screen's edges, flickering shadows. If clean and faster, the next step is `0x1b580` and `0x9b040`, one at a time.
+- **A/B 1 result (20:01, `RX_VK_READBACK_LATE=3980`):** the pair's wait fell 2.19 -> 0.01 ms a frame (8,422 reads late), but
+  the wait **moved** to the same frame's next reads (`0x9b040` 0.65 -> 2.67 ms, `0x1b580` 1.62 -> 1.90): total 4.48 -> 4.61 ms
+  a frame, fps unchanged (Town 44-46, Field 52-54). The three ranges come from one batch of GPU work a frame.
+- **A/B 2 (set up):** `RX_VK_READBACK_LATE=3980,1b580,9b040`, up to ~4.5 ms a frame off the game's threads (Town ~21.5 ->
+  ~17 ms if it all comes off). Higher risk: `0x1b580` / `0x9b040` are unidentified; watch for popping at the edges, light or
+  shadow flicker. The exposure meter's small ranges still wait. Logs: `AB_test/log_readback_late_3980_*.txt`.
 
 ---
 
