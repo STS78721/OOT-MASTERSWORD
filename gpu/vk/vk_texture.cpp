@@ -4477,6 +4477,8 @@ void texture_frame(uint64_t completed) {
         }
         spare_staging_tend();
         if (frame_no % 30 == 0) {   // (MasterSword: the PC's memory pressure, the multi-second stalls with an idle renderer)
+            void mempack_tick(uint64_t frame_no);   // (vk_mempack.cpp: the resident floor, the memory census)
+            mempack_tick(frame_no);
             static uint64_t last_faults = 0, last_frame = 0;
             PROCESS_MEMORY_COUNTERS pc{};
             pc.cb = sizeof pc;

@@ -70,6 +70,7 @@ extern thread_local bool g_nvn2_miss_log_this;
 extern thread_local bool g_all_global_this;
 }
 namespace mkwvk {
+extern std::atomic<int64_t> g_module_bytes, g_modules;   // (vk_mempack.cpp: the memory census)
 struct NvnState;
 uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout_end);   // (vk_bank.cpp)
 bool seed_cs_buffer_word(uint32_t offset);   // (vk_bank.cpp)
@@ -693,6 +694,9 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     ci.pCode = spirv.data();
     VkShaderModule m = VK_NULL_HANDLE;
     vkCreateShaderModule(dev.device, &ci, nullptr, &m);
+    if (m) {   // (MasterSword: the memory census's count of the game's shader code the driver holds)
+        g_module_bytes += (int64_t)ci.codeSize, g_modules++;
+    }
     return m;
 }
 
