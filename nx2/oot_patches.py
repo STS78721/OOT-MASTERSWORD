@@ -226,6 +226,22 @@ WHOLE_SITES = (
      "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@"
      "    recomp_store32(c,c->x[19] + 60,c->x[8]);@",
      "c->x[19] + 60"),
+    # (Longshot 08771847: Scarecrow's Song note timing above 60 fps; the recording's note lengths were cut to 0)
+    ("void f_832b32b0(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,0,3,c->fpcr,&c->fpsr);@",
+     "c->x[19] + 0x265fc"),
+    # (the unsigned cut with the x10 addition: the other recording mode uses the same cut followed by an x12 addition)
+    ("void f_832b6840(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,0,3,c->fpcr,&c->fpsr);@"
+     "    { uint64_t _a=c->x[10],_b=((uint64_t)(uint32_t)(((uint32_t)(c->x[8])) << 0)),_r=_a+_b; _r&=0xFFFFFFFFULL; c->x[8]=_r; }@",
+     "c->x[9]"),
+    ("void f_832b2690(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[8]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,0,3,c->fpcr,&c->fpsr);@",
+     "c->x[19] + 0x265fc"),
+    # (Longshot 9f64464b: the Deku Tree floor web's simulation steps; each web keeps its fraction before the 0..3 clamp)
+    ("void f_80652cb0(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[22]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@",
+     "c->x[19] + 2296"),
 )
 WHOLE_SITES = tuple((h.replace("@", "\n"), o.replace("@", "\n"), k) for h, o, k in WHOLE_SITES)
 WHOLE_MARK = "/* (the step's whole frames: nx2/oot_patches.py) */"
