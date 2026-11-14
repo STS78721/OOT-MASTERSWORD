@@ -702,6 +702,8 @@ static void owl_drain(void) {   /* (at exit: what is queued reaches the drive be
         Sleep(10);
     }
 }
+/* (MasterSword: the renderer's Sheikah Slate and census hold their own disk writes while a save is being flushed) */
+__declspec(dllexport) int hos_owl_busy(void) { return owl_started && (owl_count > 0 || owl_busy > 0); }
 static int owl_flush(HANDLE file) {   /* 1: handed to the Owl Statue; 0: do it here */
     if (!owl_on()) return 0;
     static volatile LONG ready;

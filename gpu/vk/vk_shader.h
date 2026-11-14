@@ -50,6 +50,10 @@ struct StageCode {
 /// si's code: st.module, or st's SPIR-V read back from the pack into holder and chained inline (after pin_subgroup, which
 /// sets si.pNext). false: the pack could not be read
 bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder);
+struct Program;
+/// (vk_mempack.cpp) MasterSword Sheikah Sensor: a draw of p (one relaxed increment; the Slate is told only at a power of two
+/// of its draws, or at its first draw since an area began streaming in)
+void sheikah_sensor(Program& p);
 
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
 /// recompiler) run over the stage's constant banks and storage buffers as the draw has them. element is the descriptor
@@ -65,6 +69,8 @@ struct Program {
     uint64_t key = 0;
     bool compute = false, failed = false;
     std::atomic<bool> ready{false};   // translated (graphics programs are translated on a worker: vk_jobs.h)
+    // (MasterSword Sheikah Sensor, vk_mempack.cpp: its draws this session, and the last area burst it was drawn in)
+    std::atomic<uint32_t> sensor_draws{0}, sensor_burst{0};
     std::vector<Stage> stages;
     std::array<uint32_t, 3> workgroup{1, 1, 1};
     uint32_t shared_memory = 0;

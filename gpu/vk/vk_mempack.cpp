@@ -71,7 +71,6 @@ Pack& pack() {
 
 void triforce_warm();   // (below: Courage)
 void song_of_time_play();   // (below: the Sheikah Slate's boot replay)
-void slate_note_use(uint64_t at);   // (below: the Sheikah Slate learns from every use)
 void slate_load();
 
 uint64_t code_hash(const std::vector<uint32_t>& w) {
@@ -323,10 +322,7 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
                 hit = true;
             }
         }
-        if (hit) {
-            slate_note_use(key);   // (the Sheikah Slate learns from it)
-            return true;
-        }
+        if (hit) return true;
     }
     if (!pack_read(st.code_at, st.code_words, holder.words)) return false;
     if (hot_budget()) {   // (made here, outside the lock: the driver parses it once for the builds that follow)
@@ -351,7 +347,6 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
                 hot_evict_locked();
             }
             std::vector<uint32_t>().swap(holder.words);
-            slate_note_use(key);   // (the Sheikah Slate learns from it)
             return true;
         }
     }
@@ -376,8 +371,10 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
 // RX_TRIFORCE_SONG=0: no replay at a start; RX_SLATE_PICTURES=0: no pictures.
 namespace {
 struct Picture {
-    std::vector<uint64_t> head, all;   // (head: the first 48 codes of the area's burst; all: the burst's codes in first-use order)
-    uint64_t seen = 0;                 // (the session counter when last taken or matched)
+    // (SLT2: head, the first 48 programs (their keys: stable across runs) drawn after the area began streaming in; all, the
+    // shader codes of every program drawn then, in first-draw order: what a match makes ready)
+    std::vector<uint64_t> head, all;
+    uint64_t seen = 0;   // (the session counter when last taken or matched)
 };
 struct Slate {
     std::mutex mu;
@@ -388,9 +385,13 @@ struct Slate {
     // (the picture being taken)
     bool taking = false, matched = false;
     uint64_t taking_until = 0;
-    std::vector<uint64_t> taken;
+    std::vector<uint64_t> taken;            // (shader codes)
+    std::vector<uint64_t> taken_programs;   // (program keys)
     std::unordered_set<uint64_t> taken_seen;
     std::atomic<int64_t> replays{0}, pictures_taken{0};
+    // (the Sensor's this session: programs drawn, score events, area bursts)
+    std::atomic<int64_t> programs_drawn{0}, score_events{0}, bursts{0};
+    std::string fingerprint, last_fingerprint;   // (the GPU and driver: this run's, and the one the Slate last learned on)
 };
 Slate& slate() {
     static Slate s;
@@ -463,19 +464,37 @@ size_t overlap(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
     return n;
 }
 
-void slate_note_use(uint64_t at) {
+// ---- MasterSword Sheikah Sensor (Temper 2): the Slate's eyes on play ----
+// The research of 2026-11-14: the start-up builds nearly every pipeline, so a Slate that learned from builds learned the
+// start-up, and its area pictures never formed (0 in 12 area streams). Now it learns from draws: every draw bumps its
+// program's counter (one relaxed increment, no lock), and the Slate is told only when the count reaches a power of two
+// (1, 2, 4, 8 ...: a score that grows with the log of the draws) or at the program's first draw since an area began
+// streaming in (the picture). Programs are known by their keys, stable across runs.
+std::atomic<uint32_t> g_burst{0};          // (bumped as an area begins streaming in)
+std::atomic<bool> g_taking{false};         // (a picture being taken: worth telling the Slate about first draws)
+
+void slate_note_draw(const Program& p, bool score, bool first_in_burst) {
+    uint64_t ats[8];
+    int n = 0;
+    for (const Stage& st : p.stages)
+        if (st.code_words && n < 8) ats[n++] = st.code_at;
     Slate& sl = slate();
     std::vector<uint64_t> replay;
     {
         std::lock_guard lk(sl.mu);
-        sl.uses[at]++;
-        if (!sl.taking || sl.taken.size() >= 4096 || !sl.taken_seen.insert(at).second) return;
-        sl.taken.push_back(at);
-        if (sl.matched || sl.taken.size() != 24) return;
-        sl.matched = true;   // (the area's first 24 codes: which picture is it?)
+        if (score) {
+            sl.score_events++;
+            for (int i = 0; i < n; i++) sl.uses[ats[i]]++;
+        }
+        if (!first_in_burst || !sl.taking || sl.taken_programs.size() >= 4096) return;
+        sl.taken_programs.push_back(p.key);
+        for (int i = 0; i < n; i++)
+            if (sl.taken_seen.insert(ats[i]).second) sl.taken.push_back(ats[i]);
+        if (sl.matched || sl.taken_programs.size() != 24) return;
+        sl.matched = true;   // (the area's first 24 programs: which picture is it?)
         size_t best = 0, best_i = SIZE_MAX;
         for (size_t i = 0; i < sl.pictures.size(); i++) {
-            const size_t o = overlap(sl.taken, sl.pictures[i].head);
+            const size_t o = overlap(sl.taken_programs, sl.pictures[i].head);
             if (o > best) best = o, best_i = i;
         }
         if (best_i == SIZE_MAX || best < 12) return;
@@ -486,12 +505,30 @@ void slate_note_use(uint64_t at) {
         sl.replays++;
         static int told = 0;
         if (told++ < 20)
-            logf("vk: MasterSword Sheikah Slate: an area streams in; it matches a picture (%zu of its first 24 codes): %zu more "
+            logf("vk: MasterSword Sheikah Slate: an area streams in; it matches a picture (%zu of its first 24 programs): %zu more "
                  "of its shaders made ready ahead", best, replay.size());
     }
     make_ready(std::move(replay), 1.0, "Sheikah Slate, an area's picture");
 }
+} // namespace
 
+void sheikah_sensor(Program& p) {
+    // (a plain load and store, not a locked add: the recording threads draw the same programs at once, and an increment lost
+    // now and then changes nothing on a log scale; the draw path pays no locked instruction)
+    const uint32_t n = p.sensor_draws.load(std::memory_order_relaxed) + 1;
+    p.sensor_draws.store(n, std::memory_order_relaxed);
+    bool first_in_burst = false;
+    if (g_taking.load(std::memory_order_relaxed)) {
+        const uint32_t b = g_burst.load(std::memory_order_relaxed);
+        if (p.sensor_burst.load(std::memory_order_relaxed) != b) p.sensor_burst.store(b, std::memory_order_relaxed), first_in_burst = true;
+    }
+    const bool score = (n & (n - 1)) == 0;
+    if (!score && !first_in_burst) return;
+    if (n == 1) slate().programs_drawn++;
+    slate_note_draw(p, score, first_in_burst);
+}
+
+namespace {
 /// Each frame (vk_texture.cpp texture_frame): textures made so far; more than 8 in a frame: an area streams in
 void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
     static uint64_t prev = 0;
@@ -505,9 +542,9 @@ void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
     std::lock_guard lk(sl.mu);
     if (sl.taking && frame_no > sl.taking_until) {   // (the picture is taken)
         sl.taking = false;
-        if (sl.taken.size() >= 32) {
+        if (sl.taken_programs.size() >= 16) {
             Picture pic;
-            pic.head.assign(sl.taken.begin(), sl.taken.begin() + std::min<size_t>(48, sl.taken.size()));
+            pic.head.assign(sl.taken_programs.begin(), sl.taken_programs.begin() + std::min<size_t>(48, sl.taken_programs.size()));
             pic.all = sl.taken;
             pic.seen = sl.sessions;
             size_t best = 0, best_i = SIZE_MAX;   // (the same area seen again: its picture is replaced)
@@ -531,9 +568,12 @@ void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
     if (burst && !sl.taking) {   // (an area streams in: a picture is begun)
         sl.taking = true, sl.matched = false;
         sl.taking_until = frame_no + 900;
-        sl.taken.clear(), sl.taken_seen.clear();
+        sl.taken.clear(), sl.taken_programs.clear(), sl.taken_seen.clear();
+        sl.bursts++;
+        g_burst.fetch_add(1, std::memory_order_relaxed);
     }
     busy.store(sl.taking, std::memory_order_relaxed);
+    g_taking.store(sl.taking, std::memory_order_relaxed);
 }
 
 std::string slate_path() { return pack().dir + "mastersword_slate.bin"; }
@@ -552,7 +592,7 @@ void slate_save() {
         std::unordered_map<uint64_t, float> sc = sl.score;
         for (auto& [at, v] : sc) v *= 0.75f;
         for (const auto& [at, n] : sl.uses) sc[at] += (float)n;
-        const uint32_t head[2] = {0x31544C53u /* "SLT1" */, 1};
+        const uint32_t head[2] = {0x32544C53u /* "SLT2" */, 2};
         put(head, sizeof head);
         const uint64_t budget = hot_budget_auto.load(), sessions = sl.sessions;
         put(&budget, 8), put(&sessions, 8);
@@ -571,6 +611,9 @@ void slate_save() {
             put(&nh, 8), put(&na, 8), put(&pic.seen, 8);
             put(pic.head.data(), nh * 8), put(pic.all.data(), na * 8);
         }
+        // (SLT2's optional sections, each a tag and a length: a reader skips the ones it doesn't know)
+        const uint32_t fp_tag = 0x54525046u /* "FPRT" */, fp_len = (uint32_t)sl.fingerprint.size();
+        put(&fp_tag, 4), put(&fp_len, 4), put(sl.fingerprint.data(), fp_len);
     }
     const std::string path = slate_path(), tmp = path + ".tmp";
     const HANDLE f = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -584,6 +627,13 @@ void slate_save() {
 
 void slate_load() {
     Slate& sl = slate();
+    {   // (this run's GPU and driver: the Sheikah Slate's fingerprint, SLT2)
+        char fp[320];
+        snprintf(fp, sizeof fp, "%s, driver %u.%u (%#x)", dev.props.deviceName, dev.props.driverVersion >> 22,
+                 (dev.props.driverVersion >> 14) & 0xff, dev.props.driverVersion);
+        std::lock_guard lk(sl.mu);
+        sl.fingerprint = fp;
+    }
     const HANDLE f = CreateFileA(slate_path().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                  FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
@@ -605,8 +655,10 @@ void slate_load() {
     };
     uint32_t head[2]{};
     uint64_t budget = 0, sessions = 0, n = 0, np = 0;
-    if (!take(head, sizeof head) || head[0] != 0x31544C53u || head[1] != 1 || !take(&budget, 8) || !take(&sessions, 8) ||
-        !take(&n, 8) || n > (1u << 20)) {
+    // (SLT1 still read: its scores and budget kept; its pictures were of codes, not programs, and are dropped)
+    if (!take(head, sizeof head) ||
+        !((head[0] == 0x31544C53u && head[1] == 1) || (head[0] == 0x32544C53u && head[1] == 2)) || !take(&budget, 8) ||
+        !take(&sessions, 8) || !take(&n, 8) || n > (1u << 20)) {
         logf("vk: MasterSword Sheikah Slate: not readable: it starts learning again");
         return;
     }
@@ -627,10 +679,18 @@ void slate_load() {
             pic.head.resize(nh), pic.all.resize(na);
             if (!take(pic.head.data(), nh * 8) || !take(pic.all.data(), na * 8)) break;
             std::erase_if(pic.all, [&](uint64_t a) { return !known(a); });
-            sl.pictures.push_back(std::move(pic));
+            if (head[1] == 2) sl.pictures.push_back(std::move(pic));
         }
+    // (SLT2's sections: the fingerprint; unknown tags skipped by their length)
+    for (uint32_t tag = 0, len = 0; head[1] == 2 && take(&tag, 4) && take(&len, 4) && at + len <= in.size(); at += len) {
+        if (tag == 0x54525046u /* "FPRT" */) sl.last_fingerprint.assign((const char*)in.data() + at, len);
+    }
     sl.sessions = sessions + 1;
     if (budget && hot_budget_fixed() < 0) hot_budget_auto.store(budget);
+    if (!sl.last_fingerprint.empty() && sl.last_fingerprint != sl.fingerprint)
+        logf("vk: MasterSword Sheikah Slate: the GPU or its driver changed since it last learned (%s -> %s): a longer start-up "
+             "this time is the driver's caches being made again, not MasterSword", sl.last_fingerprint.c_str(),
+             sl.fingerprint.c_str());
     logf("vk: MasterSword Sheikah Slate: session %llu; %zu shaders it knows the worth of, %zu area pictures; Wisdom starts at "
          "%llu MB, as it settled last time", (unsigned long long)sl.sessions, sl.score.size(), sl.pictures.size(),
          (unsigned long long)(hot_budget() >> 20));
@@ -821,11 +881,13 @@ void census_run() {
         if (p.on) {
             std::lock_guard lk(hot_mu);
             logf("vk: Triforce hot cache: %zu modules (%llu MB of %llu), %lld builds served from it, %lld made, %lld evicted; "
-                 "Sheikah Slate made %lld ready (%lld area pictures replayed, %lld taken); Mirror Shield checked %lld codes",
+                 "Sheikah Slate made %lld ready (%lld area pictures replayed, %lld taken); Mirror Shield checked %lld codes; "
+                 "Sheikah Sensor: %lld programs drawn, %lld score events, %lld area bursts",
                  hot.size(), (unsigned long long)(hot_bytes >> 20), (unsigned long long)(hot_budget() >> 20),
                  (long long)hot_hits.load(), (long long)hot_made.load(), (long long)hot_evicted.load(),
                  (long long)song_played.load(), (long long)slate().replays.load(), (long long)slate().pictures_taken.load(),
-                 (long long)p.shield_checked.load());
+                 (long long)p.shield_checked.load(), (long long)slate().programs_drawn.load(),
+                 (long long)slate().score_events.load(), (long long)slate().bursts.load());
         }
     }
     for (const auto& a : allocs)
@@ -847,9 +909,15 @@ void mempack_tick(uint64_t frame_no) {
     const bool due = every > 0 && frame_no >= 600 &&
                      (!last_census || frame_no - last_census >= (uint64_t)std::max(every, 600) ||
                       (census_wanted.exchange(false) && frame_no - last_census >= 3600));
-    if (due) last_census = frame_no, jobs_push([] { census_run(); });
+    // (Temper 2, Owl Statue awareness: no census and no Slate save while a game save is being flushed; next tick instead)
+    using OwlBusyFn = int (*)(void);
+    static const OwlBusyFn owl_busy = reinterpret_cast<OwlBusyFn>(GetProcAddress(GetModuleHandleA(nullptr), "hos_owl_busy"));
+    const bool saving = owl_busy && owl_busy();
+    if (due && !saving) last_census = frame_no, jobs_push([] { census_run(); });
     if (frame_no % 300 < 30) wisdom_adapt();   // (Wisdom, adaptive: the hot cache's budget by the PC's free RAM)
-    if (frame_no >= 1800 && frame_no % 1800 < 30) jobs_push([] { slate_save(); });   // (the Sheikah Slate, kept)
+    static uint64_t last_slate_save = 0;
+    if (frame_no >= 1800 && frame_no - last_slate_save >= 1800 && !saving)   // (the Sheikah Slate, kept)
+        last_slate_save = frame_no, jobs_push([] { slate_save(); });
 }
 
 } // namespace mkwvk

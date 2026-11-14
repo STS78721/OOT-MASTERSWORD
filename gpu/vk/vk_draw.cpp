@@ -6509,6 +6509,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     const VkPipeline pl = pe->pipeline;
     if (!pl) SKIP_HERE();
     cur_program = &p;
+    sheikah_sensor(p);   // (MasterSword Sheikah Sensor: what play really draws, vk_mempack.cpp)
     const int64_t fine_skin_t0 = g_fine ? prof_now() : 0;
     temporal_skin_check(s, p, d, at);
     // (after OoT's tree-shadow pass has drawn its mask: the mask evened out over frames, at this draw's end: mask_stabilize)
