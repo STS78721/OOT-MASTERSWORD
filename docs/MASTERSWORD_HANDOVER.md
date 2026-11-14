@@ -377,6 +377,24 @@ Forge of **Farore's Wind** (research doc §5 step 3), switch default off, A/B on
   its stretch was the longest and included area changes. To settle it: the same route per mode. Image quality (ghosting)
   is best with DLSS SR + DLSS MFG (see the ghosting finding above).
 
+### Run 11:51 (Temper 2's first run): the program cache was rebuilt, a one-time cost (lesson recorded)
+
+- The user saw base fps drop and stay low after the last area change (22-26 fps). Cause: **Temper 2 added two counters to
+  `Program` (`vk_shader.h`), and `sizeof(Program)` is part of the program cache's stamp (`disk_stamp`, the ABI words).**
+  The 7.4 GB `hookshot_programs.bin` was treated as invalid: `0 program keys kept`, start-up 52.1 s (4.5 s before),
+  46,666 shaders translated again, 404 s of translation CPU in total, much of it in play. RAM fell (Wisdom shrank to
+  512 MB) and the hot cache thrashed (59,849 made, 54,973 evicted).
+- **One-time:** the cache was rebuilt and saved under the new stamp; the next start should be back to ~4.5 s. Not reverted,
+  since a revert would cost the same rebuild again.
+- **Rule from now on:** don't change `Program`, `Stage`, `Shader::Info` or anything else whose size is in `disk_stamp`
+  unless a full re-translation is acceptable. New per-program state goes in a side table, not the struct. Say so before
+  deploying if a change does touch the stamp.
+- Frame generation is not the cause and not to be moved: base fps is the game's own (CPU-bound, GPU-bound wait 0.0 ms),
+  FG only adds frames after it; interpolating before the upscale would upscale every generated frame (more GPU work), and
+  NVIDIA's NGX frame generation takes final-resolution frames.
+- The Sensor itself worked: 5 area pictures taken, 2 matched ("15 of its first 24 programs", "20 of 24"), 976 and 966
+  shaders made ready ahead.
+
 ---
 
 ## 5. Releases
