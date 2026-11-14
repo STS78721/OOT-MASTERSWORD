@@ -353,6 +353,27 @@ fingerprint and Owl Statue awareness (research doc §5, step 1). Owl Statue: che
   (>= 5 ms) are logged for the next Temper. Trade-off, told to the user: only a power cut or Windows crash within about a
   second of a save could cost the newest save. `HOS_OWL_STATUE=0` restores the old behaviour. **Not yet play-tested.**
 
+### Results 2026-11-14 11:34-11:36: the Owl Statue, Sheikah Slate session 2, frame-generation experiments
+
+- **Owl Statue works.** Each save flushes several files: **the first flush takes 12-14 ms**, the rest 0.7-1.0 ms. That
+  12-14 ms used to land on the game's thread at every save (the hitch the user felt); now it runs on the Owl Statue's thread.
+  Frames around saves stayed at their usual 20-29 ms. No save write or rename reached 5 ms, so the flush was the only slow
+  step. Keep it on.
+- **Sheikah Slate, session 2:** `19504 shaders it knows the worth of, 0 area pictures; Wisdom starts at 1024 MB`. Song of
+  Time made **6,286 shaders ready in 1.4 s** at start-up, on an E-core thread. Area pictures still 0, as the research doc
+  explains (start-up builds nearly everything).
+- **Frame generation (11:34 run; the user switched modes in play; different areas per mode, so indicative only):**
+
+  | Generator | Game fps | FG gaps > 25 ms per sample | Present gaps > 40 ms per sample |
+  |---|---|---|---|
+  | DLSS MFG (NGX) 3x | 53.8 | 1.9 | 2.7 |
+  | FSR 3.1 FG 2x | 53.6 | n/a (FSR paces its own frames) | 1.0 |
+  | Apex FG (Fast) 3x (stand-in) | 52.8 | 0.3 | 0.9 |
+
+  The game's own frame rate doesn't depend on the generator (CPU-bound). DLSS MFG had the most pacing gaps in this run, but
+  its stretch was the longest and included area changes. To settle it: the same route per mode. Image quality (ghosting)
+  is best with DLSS SR + DLSS MFG (see the ghosting finding above).
+
 ---
 
 ## 5. Releases
