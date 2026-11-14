@@ -180,6 +180,57 @@ rate, and occlusion culling (nothing popping or missing).
   shadows, staging, texture copies; cut what is cold), and keep imports off the frame when free RAM is low. Player side:
   close heavy background apps.
 
+### The memory work, 2026-11-14 (new to MasterSword: Hookshot and Longshot keep every shader module)
+
+**Why:** the remaining streaming stutters were RAM pressure (above). The census showed where the RAM went.
+
+1. **Memory census** (`gpu/vk/vk_mempack.cpp`, `RX_MEM_CENSUS`, default every 3600 frames on a worker, 0 off):
+   `vk: memory census` lines split the working set into the guest window (the game's own memory), host private (renderer,
+   driver, translator), mapped files and code, list the 10 largest host allocations, and count the SPIR-V handed to the
+   driver. Plus `vk: memory pressure` lines (every 30 frames when page faults > 150k or free RAM < 1.5 GB) and free RAM /
+   commit / page faults on the `vk: memory: working set` line (`vk_texture.cpp`).
+   First census: working set 22.3 GB = guest 9.2 GB + host private **12.8 GB**; **194,425 shader modules, 13.5 GB of SPIR-V**
+   kept by the driver for the session.
+2. **Resident floor** (`RX_MEM_RESIDENT_MB`, default 55% of RAM, max 18 GB; 0 off): `SetProcessWorkingSetSizeEx` with a
+   *soft* minimum (`QUOTA_LIMITS_HARDWS_MIN_DISABLE`), so Windows trims other programs before the game. Soft: it can't
+   starve the PC.
+3. **The memory pack** (`RX_MEM_PACK`, on where the device has the graphics pipeline library; 0 = modules as before):
+   - A stage's SPIR-V goes to `mastersword_spirv.pack` (+ `.idx`: 16-byte records, hash and place/size) in the game folder,
+     content-addressed: the 194,425 stages were **50,812 distinct codes, 3.6 GB on disk**. It stays between runs, so a warm
+     start writes nothing new.
+   - No `VkShaderModule` is kept. `Stage` holds `code_at`/`code_words` (`vk_shader.h`); `stage_set_code()` writes it,
+     `stage_bind()` reads it back with a positional `ReadFile` and chains a `VkShaderModuleCreateInfo` on the stage's
+     `pNext`, after `pin_subgroup`. Used at every program pipeline build: `build_graphics`, the program compute stages,
+     `warm_compute`, the prepare's compute builds, the dispatch build and its `info` lambda (the caller owns the
+     `StageCode`, so the code outlives each create).
+   - Reads go through Windows' file cache: free RAM keeps the hot code, and Windows drops it at once under pressure (clean
+     file pages, nothing to the pagefile). A failed write falls back to a module (`make_module_counted`).
+   - Result: shader code held by the driver 13.5 GB -> **0**; host private 12.8 -> 8.0 GB; working set 22.3 -> 17.4-17.8 GB;
+     free RAM late in a run ~1.2 GB -> **~5 GB**; the 2-second stall bursts **gone** (0 in the warm run); 0 read failures.
+4. **Import ahead in play** (`RX_VK_BG_IMPORT=play`, on in the smoke env; `RX_VK_BG_IMPORT_FROM` frames, default 1800):
+   the hitches left after the pack are ~110 imports a session at ~34 ms (slow even with RAM free), nearly all a new
+   pool's first 4 MB bound by the next frame's draws. In play only, `memory_pool_created` queues that first chunk on the
+   import thread (at most 16), which now runs below normal priority on the E-cores. `RX_VK_BG_IMPORT=1` (every whole pool
+   from the start) is still the start-up hang; don't use it. **Not yet play-tested.**
+
+**A/B kit** (`smoke\AB_test\`): `Use A - before ports.bat` / `Use B - current.bat` swap the renderer DLL (game closed);
+`Done - file the last log.bat` files the last run's log as `log_<A|B>_<time>.txt`. B is the current build. A run right
+after a switch re-prepares shaders: compare warm runs only. Backups of each B are `B_current.dll.bak_*`.
+
+**NVIDIA settings (user tests):** Resizable BAR is active (nvidia-smi BAR1 16384 MiB); the renderer's per-frame streams
+already land in VRAM through it (VMA host-visible sequential-write). NVPI's ReBAR profile flags are a DirectX whitelist:
+no effect expected on Vulkan. "Present Method (Vulkan/OpenGL) = Layered on DXGI Swapchain" gave a small fps gain. Shader
+Cache 100 GB / Pre-compile High: fine. PrimoCache would not help (a disk block cache; its RAM cache takes RAM).
+
+### If this work stops halfway (how to pick it up)
+
+- Read this file, then `git log --oneline -25` on `mastersword-fg` in the active worktree: every step is its own commit
+  with the why in the message.
+- The newest smoke log is `hookshot_log.txt`; the lines that matter are `memory census`, `memory pack:`, `memory pressure`,
+  `imported in`, `a binding waited`, `slow frame`, and the `presents, ... fps` lines.
+- Every switch named here goes in the smoke folder's `hookshot_env.txt`; the file says what each line was for and its result.
+- Build/deploy recipe: §2. The memory file `mastersword-build-workflow.md` (Claude's memory) has the same.
+
 ---
 
 ## 5. Releases
@@ -217,12 +268,15 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 
 ## 7. Open items, in priority order
 
-1. Play-test the 2026-11-14 build (§4 checklist).
-2. Test V-Sync Mailbox + `RX_VK_PRESENT_QUEUE=1` and compare with V-Sync Off. If it holds, consider making it the default when
-   V-Sync is on.
-3. Attack the remaining pool-import hitches (§3).
-4. Try `RX_VK_ASTC_BC7=1` for fidelity and watch VRAM.
-5. Push `mastersword-fg`, then prepare 0.1.9d.
-6. Run the frame-rate A/B (§4) and keep or turn off whichever port costs fps.
+1. Play-test `RX_VK_BG_IMPORT=play` (§4, the memory work): fewer `a binding waited` lines and no new slowdown or hang.
+   If it hangs or slows down, comment it out.
+2. If imports still hitch: find what makes them ~34 ms with RAM free (commit/`VirtualQuery` on write-watch memory, the
+   driver's page pinning) and make it cheaper, or import further ahead.
+3. Frame rate: warm A vs warm B (A/B kit) to settle whether the Longshot ports cost ~3 fps; suspect the handle tables
+   (`RX_VK_HANDLE_TABLES=0`, one shader re-preparation).
+4. Test V-Sync Mailbox + `RX_VK_PRESENT_QUEUE=1` against V-Sync Off.
+5. Try `RX_VK_ASTC_BC7=1` for fidelity and watch VRAM.
+6. Push `mastersword-fg` (`git push mastersword mastersword-fg`), then prepare 0.1.9d (patch notes in the Pearl Abyss style;
+   the memory pack is the headline).
 7. Visual bugs: duplicate items flickering, skybox and Link colour at Hyrule Castle.
 8. Keep watching Longshot (`git fetch longshot`, then `git log mastersword-fg..longshot/main`) for perf and fix commits.
