@@ -608,6 +608,16 @@ HLE(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE) {
     G64(ARG(0)) = (uint64_t)sz.QuadPart;
     RET(0);
 }
+/* (MasterSword Owl Statue: a writable file's write or rename that takes 5 ms or more is logged, 20 times: what of a save
+   besides its flush stops the game, for the next Temper) */
+static void owl_slow(const char *what, LARGE_INTEGER a, uint64_t bytes) {
+    LARGE_INTEGER f, b;
+    QueryPerformanceFrequency(&f), QueryPerformanceCounter(&b);
+    const double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+    static volatile LONG told;
+    if (ms >= 5.0 && InterlockedIncrement(&told) <= 20)
+        hos_log("save: Owl Statue saw a slow %s: %.1f ms (%llu bytes), on the game's thread", what, ms, (unsigned long long)bytes);
+}
 /* WriteFile(FileHandle, long offset, void const* buf, unsigned long size, WriteOption const&) */
 HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     Handle *fh = get_handle(c, ARG(0));
@@ -617,7 +627,10 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
     /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+    owl_slow("write", t0, ARG(3));
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
 HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
@@ -629,7 +642,101 @@ HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
     SetEndOfFile(fh->h);
     RET(0);
 }
-HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) { FlushFileBuffers(get_handle(c, ARG(0))->h); RET(0); }
+/* ---- MasterSword Owl Statue: a save that doesn't stop the journey (2026-11-14) ----
+   The player saw the game stop for a moment at every save. A save's FlushFileBuffers waits until the drive has the data, on
+   the game's own thread (a P-core, mid-frame). The data is in Windows' file cache from the moment WriteFile returns, so the
+   flush only guards against a power cut or a Windows crash, not a game crash. The Owl Statue hands the flush to a thread of
+   its own: on the E-cores, at background I/O and memory priority, with a duplicate of the file's handle (the game may close
+   its own at once). The game goes on; the log says how long each flush took (what the game used to stand still for).
+   Pending flushes are drained when the game exits. HOS_OWL_STATUE=0: flushed on the game's thread, as before. Windows only. */
+#ifdef _WIN32
+static CRITICAL_SECTION owl_cs;
+static CONDITION_VARIABLE owl_cv;
+static HANDLE owl_queue[64];
+static int owl_head, owl_count;
+static volatile LONG owl_started, owl_busy;
+static int owl_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("HOS_OWL_STATUE") || atoi(getenv("HOS_OWL_STATUE")) != 0;
+    return on;
+}
+static DWORD WINAPI owl_main(LPVOID unused) {
+    (void)unused;
+    SetThreadDescription(GetCurrentThread(), L"MasterSword Owl Statue");
+    {   /* (the E-cores: off the P-cores the game and the replay use; nothing on a CPU of one kind) */
+        extern uint64_t hos_fast_cpus(void);
+        DWORD_PTR proc = 0, sys = 0;
+        const uint64_t fast = hos_fast_cpus();
+        if (fast && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && (proc & ~(DWORD_PTR)fast))
+            SetThreadAffinityMask(GetCurrentThread(), proc & ~(DWORD_PTR)fast);
+    }
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);   /* (low I/O and memory priority) */
+    static LONG told;
+    for (;;) {
+        EnterCriticalSection(&owl_cs);
+        while (!owl_count) SleepConditionVariableCS(&owl_cv, &owl_cs, INFINITE);
+        const HANDLE h = owl_queue[owl_head];
+        owl_head = (owl_head + 1) % 64, owl_count--;
+        InterlockedIncrement(&owl_busy);
+        LeaveCriticalSection(&owl_cs);
+        LARGE_INTEGER f, a, b;
+        QueryPerformanceFrequency(&f), QueryPerformanceCounter(&a);
+        FlushFileBuffers(h);
+        QueryPerformanceCounter(&b);
+        CloseHandle(h);
+        InterlockedDecrement(&owl_busy);
+        const double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+        if (InterlockedIncrement(&told) <= 24 || ms >= 20.0)
+            hos_log("save: MasterSword Owl Statue: a save's flush took %.1f ms on its own thread (the game would have stood "
+                    "still that long)", ms);
+    }
+    return 0;
+}
+static void owl_drain(void) {   /* (at exit: what is queued reaches the drive before the process goes, 5 s at most) */
+    if (!owl_started) return;
+    for (int i = 0; i < 500; i++) {
+        EnterCriticalSection(&owl_cs);
+        const int pending = owl_count + (int)owl_busy;
+        LeaveCriticalSection(&owl_cs);
+        if (!pending) return;
+        Sleep(10);
+    }
+}
+static int owl_flush(HANDLE file) {   /* 1: handed to the Owl Statue; 0: do it here */
+    if (!owl_on()) return 0;
+    static volatile LONG ready;
+    if (InterlockedCompareExchange(&owl_started, 1, 0) == 0) {
+        InitializeCriticalSection(&owl_cs);
+        InitializeConditionVariable(&owl_cv);
+        atexit(owl_drain);
+        CloseHandle(CreateThread(NULL, 0, owl_main, NULL, 0, NULL));
+        hos_log("save: MasterSword Owl Statue: saves are flushed to the drive on a thread of their own (E-cores, background "
+                "priority); HOS_OWL_STATUE=0: on the game's thread, as before");
+        InterlockedExchange(&ready, 1);
+    }
+    if (!ready) return 0;   /* (another thread is starting it this moment: this flush here, as before) */
+    HANDLE dup = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) return 0;
+    EnterCriticalSection(&owl_cs);
+    if (owl_count == 64) {   /* (full: 64 flushes waiting is a stuck drive; this one waits as before) */
+        LeaveCriticalSection(&owl_cs);
+        CloseHandle(dup);
+        return 0;
+    }
+    owl_queue[(owl_head + owl_count) % 64] = dup;
+    owl_count++;
+    LeaveCriticalSection(&owl_cs);
+    WakeConditionVariable(&owl_cv);
+    return 1;
+}
+#else
+static int owl_flush(HANDLE file) { (void)file; return 0; }
+#endif
+HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) {
+    const HANDLE h = get_handle(c, ARG(0))->h;
+    if (!owl_flush(h)) FlushFileBuffers(h);
+    RET(0);
+}
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *fh = get_handle(c, ARG(0));
     if (fh->ro_slot > 0) ro_cache_release(fh->ro_slot);
@@ -709,7 +816,11 @@ HLE(_ZN2nn2fs10RenameFileEPKcS2_) {
     if (!host_path(gstr(ARG(0)), a, sizeof a, &w1) || !host_path(gstr(ARG(1)), b, sizeof b, &w2) || !w1 || !w2) { RET(R_PATH_NOT_FOUND); return; }
     ro_cache_invalidate(a, 0);
     ro_cache_invalidate(b, 0);
-    RET(MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING) ? 0 : R_PATH_NOT_FOUND);
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
+    const BOOL moved = MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING);
+    owl_slow("rename", t0, 0);
+    RET(moved ? 0 : R_PATH_NOT_FOUND);
 }
 /* a RomFS folder that only mods have: rom:/x -> some mod entry lies under x */
 static void count_extra(void *arg, const char *name, int is_dir, uint64_t size) { (void)name, (void)is_dir, (void)size; ++*(int *)arg; }
