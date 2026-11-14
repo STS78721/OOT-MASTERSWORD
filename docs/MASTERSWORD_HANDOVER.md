@@ -270,6 +270,33 @@ Cache 100 GB / Pre-compile High: fine. PrimoCache would not help (a disk block c
   - Still open: imports avg 41 ms (max 103) remain the main hitch source; free RAM ended at 2.5 GB (the hot cache's 1 GB
     and more areas visited), so if pressure returns, try `RX_TRIFORCE_HOT_MB=512`.
 
+### Naming golden rule (the user's)
+
+Everything MasterSword designs is named with a Zelda reference, under the MasterSword / SteelTempleSaint banner (the code
+comments, log lines, switches' docs and these documents). Upstream Hookshot/Longshot work keeps its own names and credit.
+
+### MasterSword Lens of Truth, and the Triforce upgrades (2026-11-14, latest; not yet play-tested)
+
+- **Where an import's time went** (the `vk: import N ms: commit+properties A, buffer 0, allocate B, bind 0` lines): about half
+  was `VirtualQuery` in the 512 GB write-watched reservation (6-28 ms: Windows walks the page tables to the end of the
+  region's run), the other half the driver pinning the pages (`allocate`, 5-35 ms).
+- **MasterSword Lens of Truth** (commit 50e7f42b, **exe and DLL**): the host keeps a bitmap, one bit per committed 64 KB
+  block of the guest window (`host/mkw_glue.c`: set in `hos_commit` and the first-touch handler, cleared by
+  `hos_commit_forget` before the two decommits in `hos_mem.c` and `hos_svc.c`). It exports `hos_guest_committed(lo, hi)`;
+  the renderer's `import_pool` finds it with `GetProcAddress` and skips `VirtualQuery` when it answers 1. There's no
+  interface change: an older exe or renderer just falls back. Log: `MasterSword Lens of Truth: ... on`, and every 64 imports
+  `Lens of Truth: N imports answered by the commit bitmap, M asked Windows`. Off: `RX_VK_COMMIT_BITMAP=0`. Expected: the
+  `commit+properties` half gone; the driver's pinning half remains.
+- **Triforce upgrades** (commit 123351be):
+  - **Wisdom, adaptive:** the hot-cache budget follows free RAM every 300 frames (2 GB with > 8 GB free, 1 GB > 4,
+    512 MB > 2, else 256 MB), evicting at once when it shrinks. `RX_TRIFORCE_HOT_MB` fixes it.
+  - **Song of Time:** the hot set is saved newest-first to `mastersword_spirv.song` every 1800 frames, and replayed at
+    the next start by an E-core thread (up to 90% of the budget). `RX_TRIFORCE_SONG=0` off.
+  - **Mirror Shield:** each pack record is hash-checked the first time it's read in a session. A mismatch is never handed
+    to the driver; it writes `mastersword_spirv.damaged`, and the next start deletes the pack, index and song and rebuilds.
+  - The census line now ends with `Song of Time made N ready; Mirror Shield checked M codes`.
+- **The pack's 3.6 GB isn't a limit:** it's every distinct shader the game has. RAM use is governed by the hot cache.
+
 ---
 
 ## 5. Releases
@@ -307,9 +334,10 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 
 ## 7. Open items, in priority order
 
-1. Triforce Shader Delivery is confirmed (above). Next: the import cost itself (avg ~41 ms): find what makes an import slow
-   with RAM free (commit/`VirtualQuery` on write-watch memory, the driver's page pinning) and make it cheaper, without
-   background pinning (that failed).
+1. Play-test Lens of Truth and the Triforce upgrades: import times (the `vk: import` breakdown lines' `commit+properties`
+   should be ~0), the `Lens of Truth` counts, Song of Time's start-up line, Wisdom's budget changes, no Mirror Shield alarms.
+2. If imports still hitch: the driver's pinning half (5-35 ms). Fewer, larger imports at quiet moments, or reusing pinned
+   memory, without background pinning during play (that failed).
 2. If imports still hitch: find what makes them ~34 ms with RAM free (commit/`VirtualQuery` on write-watch memory, the
    driver's page pinning) and make it cheaper, or import further ahead.
 3. Frame rate: warm A vs warm B (A/B kit) to settle whether the Longshot ports cost ~3 fps; suspect the handle tables

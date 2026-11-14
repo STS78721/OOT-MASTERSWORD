@@ -16,6 +16,8 @@ What came from where:
 | The memory pack (shader code on NVMe, handed to the driver inline) | **MasterSword** (2026-11-14). Hookshot and its successor Longshot keep every shader module for the session |
 | MasterSword Triforce Shader Delivery (the pack + a hot module cache + a warm-up) | **MasterSword** (2026-11-14) |
 | Import ahead in play | **MasterSword** experiment, measured worse and switched off |
+| MasterSword Lens of Truth (a commit bitmap instead of VirtualQuery) | **MasterSword** (2026-11-14) |
+| Triforce upgrades: Wisdom adaptive, Song of Time, Mirror Shield | **MasterSword** (2026-11-14) |
 | Reserved core for the replay thread | Hookshot (upstream), restored in MasterSword |
 | X3D cache-CCD placement | Hookshot (upstream) |
 
@@ -160,6 +162,31 @@ the driver, and stream the cold set in big sequential reads before it's needed.*
 **What didn't work: importing memory ahead in the background.** Mapping new game memory for the GPU on a background thread
 before the first draw asked for it (§6) made imports slower, because the driver's page pinning contended with the game's.
 Loads got longer. It's switched off, and kept here as a measured negative result.
+
+### 4c. The Triforce, refined: Wisdom adaptive, Song of Time, Mirror Shield
+
+| Name | What | Switch |
+|---|---|---|
+| **Wisdom, adaptive** | The hot cache's budget follows the PC's free RAM: 2 GB with over 8 GB free, 1 GB over 4, 512 MB over 2, else 256 MB. It shrinks at once when RAM gets tight, and grows back when RAM frees up | `RX_TRIFORCE_HOT_MB=<MB>` fixes it |
+| **Song of Time** | Remembers the hot set: the shaders in the hot cache are saved newest-first, and at the next start a background thread on the E-cores rebuilds them before the first areas ask | `RX_TRIFORCE_SONG=0` |
+| **Mirror Shield** | Integrity: each record's code is checked against its hash the first time it's read in a session. Damaged code is never given to the driver; the pack is marked and rebuilt from nothing at the next start | always on |
+
+For other projects: **a persistent cache needs a budget that follows the machine, a memory of what was hot, and a
+self-check that turns corruption into a rebuild, not a crash.**
+
+## 4d. MasterSword Lens of Truth: know your own memory instead of asking the OS
+
+A recompiled game reserves one huge address window (512 GB here) with write-watch, and commits pages as the game uses them.
+Before the GPU can import a range, the code made sure it was committed by asking Windows (`VirtualQuery`). In a huge
+write-watched reservation that query walks the page tables to the end of the region's run of like pages, and it cost
+6-28 ms, half of every import.
+
+The host already commits every page itself, so it can simply remember: **one bit per 64 KB block** (1 MB for 512 GB), set
+when a block is committed whole and cleared *before* any decommit touches it. A clear bit only means "ask Windows", so the
+bitmap can never make the answer wrong, only faster. The host exports `hos_guest_committed(lo, hi)`, and the renderer finds
+it with `GetProcAddress`, so neither side's interface changes and older builds keep working.
+
+The general lesson: **when you own the allocator, keep your own ledger; don't query the OS on a hot path.**
 
 ## 5. The resident floor: protect the game's RAM, softly
 
