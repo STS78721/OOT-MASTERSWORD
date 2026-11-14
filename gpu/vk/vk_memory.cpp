@@ -402,6 +402,10 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     const bool known_committed = false;
 #endif
     if (!known_committed) {
+        // (MasterSword Forge & Temper, Temper 1: why the Lens missed. "gap": Windows says all of it was committed, so the
+        // bitmap lacked blocks a commit path did not mark; "reserved": some of it really was not committed yet. The next
+        // Temper closes the gaps; the first few are logged with what the bitmap said)
+        bool reserved_seen = false;
         MEMORY_BASIC_INFORMATION first{};
         if (VirtualQuery(ptr, &first, sizeof first) == sizeof first && first.State == MEM_COMMIT &&
             (uint8_t*)first.BaseAddress + first.RegionSize >= ptr + bytes) {
@@ -411,10 +415,27 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
                 MEMORY_BASIC_INFORMATION mi{};
                 if (VirtualQuery(q, &mi, sizeof mi) != sizeof mi) break;
                 uint8_t* end = std::min((uint8_t*)mi.BaseAddress + mi.RegionSize, ptr + bytes);
-                if (mi.State == MEM_RESERVE) VirtualAlloc(q, (size_t)(end - q), MEM_COMMIT, PAGE_READWRITE);
+                if (mi.State == MEM_RESERVE) VirtualAlloc(q, (size_t)(end - q), MEM_COMMIT, PAGE_READWRITE), reserved_seen = true;
                 q = end;
             }
         }
+#ifdef _WIN32
+        if (committed) {
+            static std::atomic<int64_t> gaps{0}, reserved{0};
+            const int64_t n = reserved_seen ? ++reserved : ++gaps;
+            if (!reserved_seen && n <= 6) {
+                // (the first block the bitmap lacks, and how far into the import it is)
+                uint64_t miss = lo & ~0xFFFFull;
+                while (miss < hi && committed(miss, miss + 0x10000) == 1) miss += 0x10000;
+                logf("vk: Lens of Truth gap %lld: %#llx..%#llx (%llu KB) all committed, the bitmap lacked the block at +%#llx",
+                     (long long)n, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)((hi - lo) >> 10),
+                     (unsigned long long)(miss - lo));
+            }
+            if ((gaps + reserved) % 32 == 0)
+                logf("vk: Lens of Truth misses: %lld gaps in the bitmap, %lld not committed yet", (long long)gaps.load(),
+                     (long long)reserved.load());
+        }
+#endif
     }
 #ifdef __linux__
     if (import_dma_buf(lo, hi, p)) {

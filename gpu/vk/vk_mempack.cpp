@@ -499,6 +499,9 @@ void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
     prev = made;
     if (!pictures_on()) return;
     Slate& sl = slate();
+    // (Temper 1: no lock on a frame with no burst and no picture being taken: nearly every frame)
+    static std::atomic<bool> busy{false};
+    if (!burst && !busy.load(std::memory_order_relaxed)) return;
     std::lock_guard lk(sl.mu);
     if (sl.taking && frame_no > sl.taking_until) {   // (the picture is taken)
         sl.taking = false;
@@ -530,6 +533,7 @@ void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
         sl.taking_until = frame_no + 900;
         sl.taken.clear(), sl.taken_seen.clear();
     }
+    busy.store(sl.taking, std::memory_order_relaxed);
 }
 
 std::string slate_path() { return pack().dir + "mastersword_slate.bin"; }
@@ -693,6 +697,10 @@ void triforce_warm() {
 }
 } // namespace
 
+// (vk_texture.cpp's memory-pressure line asks for a census soon after: mempack_pressure_seen)
+std::atomic<bool> census_wanted{false};
+void mempack_pressure_seen() { census_wanted = true; }
+
 // (vk_shader.cpp make_module: the game programs' SPIR-V handed to the driver, which keeps a copy in its own heap; made, not
 // counted down at destruction: an upper bound of what the driver may hold)
 std::atomic<int64_t> g_module_bytes{0}, g_modules{0};
@@ -750,22 +758,26 @@ void census_run() {
         if (GetLastError() != ERROR_BAD_LENGTH || buf.size() > (64u << 20)) return;
         buf.resize(std::max<size_t>(buf.size() * 2, (size_t)ws->NumberOfEntries + 4096));
     }
-    const auto* ws = reinterpret_cast<const PSAPI_WORKING_SET_INFORMATION*>(buf.data());
-    std::vector<uintptr_t> pages((size_t)ws->NumberOfEntries);
+    // (Temper 1: the pages' addresses written over the query's own entries and sorted there: no second list of them,
+    // ~45 MB less at a census on a 22 GB working set)
+    const size_t np = (size_t)reinterpret_cast<const PSAPI_WORKING_SET_INFORMATION*>(buf.data())->NumberOfEntries;
+    uintptr_t* const pg = reinterpret_cast<uintptr_t*>(buf.data() + 1);
     uint64_t shared = 0;
-    for (size_t i = 0; i < pages.size(); i++) {
-        pages[i] = (uintptr_t)ws->WorkingSetInfo[i].VirtualPage << 12;
-        shared += ws->WorkingSetInfo[i].Shared;
+    for (size_t i = 0; i < np; i++) {
+        PSAPI_WORKING_SET_BLOCK b;
+        std::memcpy(&b, &pg[i], sizeof b);
+        shared += b.Shared;
+        pg[i] = (uintptr_t)b.VirtualPage << 12;
     }
-    std::vector<ULONG_PTR>().swap(buf);
-    std::sort(pages.begin(), pages.end());
+    std::sort(pg, pg + np);
     const uintptr_t gbase = (uintptr_t)host->guest_base(), gend = gbase + (uintptr_t)host->guest_size();
     Census c;
     c.shared = shared;
     std::vector<Census::Alloc> allocs;
     MEMORY_BASIC_INFORMATION mbi{};
     uintptr_t region_end = 0;
-    for (const uintptr_t p : pages) {
+    for (size_t pi = 0; pi < np; pi++) {
+        const uintptr_t p = pg[pi];
         if (p >= gbase && p < gend) {
             c.guest++;
             continue;
@@ -794,7 +806,7 @@ void census_run() {
     const auto mb = [](uint64_t pages_) { return (unsigned long long)(pages_ >> 8); };
     logf("vk: memory census (%llu ms): working set %llu MB: guest window (the game's memory) %llu MB, host private (renderer, "
          "driver, translator) %llu MB, mapped files %llu MB, code %llu MB; %llu MB shared",
-         (unsigned long long)(GetTickCount64() - t0), mb(pages.size()), mb(c.guest), mb(c.priv), mb(c.mapped), mb(c.image),
+         (unsigned long long)(GetTickCount64() - t0), mb(np), mb(c.guest), mb(c.priv), mb(c.mapped), mb(c.image),
          mb(c.shared));
     logf("vk: memory census: %lld shader modules made, %lld MB of SPIR-V handed to the driver", (long long)g_modules.load(),
          (long long)(g_module_bytes.load() >> 20));
@@ -827,8 +839,15 @@ void census_run() {
 void mempack_tick(uint64_t frame_no) {
     static bool floor_done = false;
     if (!floor_done) floor_done = true, resident_floor();
-    static const int every = env_int("RX_MEM_CENSUS", 3600);
-    if (every > 0 && frame_no >= 600 && frame_no % (uint64_t)std::max(every, 30) < 30) jobs_push([] { census_run(); });
+    // (Temper 1: a census cost 360-375 ms of a worker and ~90 MB for a moment, every minute: now once at 600 frames, then
+    // every RX_MEM_CENSUS frames (18000: 5 minutes at 60 fps), and once more after a memory-pressure line, at most a minute
+    // after the last)
+    static const int every = env_int("RX_MEM_CENSUS", 18000);
+    static uint64_t last_census = 0;
+    const bool due = every > 0 && frame_no >= 600 &&
+                     (!last_census || frame_no - last_census >= (uint64_t)std::max(every, 600) ||
+                      (census_wanted.exchange(false) && frame_no - last_census >= 3600));
+    if (due) last_census = frame_no, jobs_push([] { census_run(); });
     if (frame_no % 300 < 30) wisdom_adapt();   // (Wisdom, adaptive: the hot cache's budget by the PC's free RAM)
     if (frame_no >= 1800 && frame_no % 1800 < 30) jobs_push([] { slate_save(); });   // (the Sheikah Slate, kept)
 }

@@ -4495,6 +4495,10 @@ void texture_frame(uint64_t completed) {
                 // free RAM under 1.5 GB, is Windows trimming and paging the game's memory)
                 if (last_frame && (faults > 150000 || avail < 1536)) {
                     static int told = 0;
+                    {   // (Temper 1: a census soon after, to see what filled the RAM)
+                        void mempack_pressure_seen();
+                        mempack_pressure_seen();
+                    }
                     if (told++ < 40)
                         logf("vk: memory pressure: %llu page faults in the last %llu frames, %llu MB of RAM free of %llu, working set %llu MB",
                              (unsigned long long)faults, (unsigned long long)(frame_no - last_frame), (unsigned long long)avail,
