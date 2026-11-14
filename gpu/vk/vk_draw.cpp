@@ -6263,15 +6263,38 @@ void mask_stabilize(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t 
 }
 
 /// Skinned draw into the scene for temporal/NGX actor motion (vk_temporal.cpp).
+/// (MasterSword, RX_VK_ACTOR_LOG=1) A draw into the scene with a bone palette that actor motion turned away, once for each kind
+/// (why, vertex formats, program): the characters DLSS Frame Generation then moves with the camera only, the ghost clones
+static void skin_rejected(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at, const char* why) {
+    static const bool on = getenv("RX_VK_ACTOR_LOG") && atoi(getenv("RX_VK_ACTOR_LOG")) != 0;
+    if (!on) return;
+    const nvn_p_bind_buf& bones = s.ubo[0][3];
+    if (!at.n || !at.color[0] || !at.depth || !temporal_scene_size(at.width, at.height) || !bones.addr || bones.size % 48)
+        return;   // (not a character into the scene)
+    uint32_t f[8]{};
+    for (int i = 0; i < 8 && i < s.nvattr; i++) f[i] = reinterpret_cast<const nvn_va_st*>(&s.vattr[i])->fmt;
+    uint64_t key = p.key ^ (uint64_t)(uintptr_t)why;
+    for (int i = 0; i < 8; i++) key = key * 0x100000001b3ull ^ f[i];
+    static std::mutex mu;
+    static std::unordered_set<uint64_t> seen;
+    std::lock_guard lk(mu);
+    if (seen.size() >= 64 || !seen.insert(key).second) return;
+    logf("vk: actor motion left out a draw (%s): program %016llx, target fmt %d, %s%s%s%d instances, %d attrs, fmts "
+         "%#x %#x %#x %#x | w %#x %#x | j %#x %#x, %u bones",
+         why, (unsigned long long)p.key, (int)at.color_format[0], d.indexed ? "indexed " : "", d.indirect ? "indirect " : "",
+         d.mesh ? "mesh " : "", d.instances, s.nvattr, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], bones.size / 48);
+}
+
 static void temporal_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     if (!temporal_wanted() && !(dlss_fg_runs() && opts.framegen >= 2)) return;
-    if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth ||
-        !at.width || !at.height || !temporal_scene_size(at.width, at.height) ||
-        at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7)
-        return;
+    if (d.mesh || !d.indexed || d.indirect || d.instances != 1) return skin_rejected(s, p, d, at, "draw kind");
+    if (!at.n || !at.color[0] || !at.depth || !at.width || !at.height || !temporal_scene_size(at.width, at.height)) return;
+    if (at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return skin_rejected(s, p, d, at, "target format");
+    if (s.nvattr < 7) return skin_rejected(s, p, d, at, "few attributes");
     const auto attr = [&](int i) { return *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]); };
     const nvn_va_st pos = attr(0);
-    if ((pos.fmt != NVN_FORMAT_RGB32F && pos.fmt != NVN_FORMAT_RGBA16F) || pos.stream != 0) return;
+    if ((pos.fmt != NVN_FORMAT_RGB32F && pos.fmt != NVN_FORMAT_RGBA16F) || pos.stream != 0)
+        return skin_rejected(s, p, d, at, "position format");
     const nvn_p_bind_buf& bones = s.ubo[0][3];
     if (!bones.addr || bones.size < 48 || bones.size % 48) return;
     SkinnedDraw k;
@@ -6306,7 +6329,8 @@ static void temporal_skin_check(const NvnState& s, const Program& p, const DrawA
         k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
     }
     const uint32_t stride = s.vstream[0].stride;
-    if (!k.sets || !stride || stride % 4 || pos.offset % 4 || !s.vbuf[0].address) return;
+    if (!k.sets) return skin_rejected(s, p, d, at, "weight/joint formats");
+    if (!stride || stride % 4 || pos.offset % 4 || !s.vbuf[0].address) return skin_rejected(s, p, d, at, "vertex layout");
     k.depth = at.depth, k.vbuf = s.vbuf[0].address, k.vsize = s.vbuf[0].size, k.stride = stride, k.pos = pos.offset;
     k.ibuf = d.ibuf, k.itype = d.itype, k.count = d.count, k.base_vertex = d.base_vertex;
     k.bones = bones.addr, k.bones_size = bones.size, k.object = s.ubo[0][1].addr, k.object_size = s.ubo[0][1].size;
