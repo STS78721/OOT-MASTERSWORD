@@ -24,6 +24,7 @@
 #include <thread>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vk_internal.h"
@@ -56,8 +57,11 @@ struct Pack {
         uint32_t words;
     };
     std::unordered_map<uint64_t, Rec> recs;
-    bool on = false;
-    std::atomic<int64_t> reads{0}, read_bytes{0}, new_bytes{0}, shared_hits{0}, failed{0};
+    std::unordered_map<uint64_t, uint64_t> hash_at;   // (a record's place -> its hash: the Mirror Shield's check)
+    std::unordered_set<uint64_t> verified;             // (places checked this session: each once)
+    std::string dir;
+    bool on = false, damaged = false;
+    std::atomic<int64_t> reads{0}, read_bytes{0}, new_bytes{0}, shared_hits{0}, failed{0}, shield_checked{0};
 };
 Pack& pack() {
     static Pack p;
@@ -65,6 +69,7 @@ Pack& pack() {
 }
 
 void triforce_warm();   // (below: Courage)
+void song_of_time_play();   // (below: Wisdom remembered)
 
 uint64_t code_hash(const std::vector<uint32_t>& w) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)w.size();
@@ -89,6 +94,15 @@ void pack_open() {
     std::string dir(exe, n);
     dir = dir.substr(0, dir.find_last_of("\\/") + 1);
     const std::string pack_path = dir + "mastersword_spirv.pack", idx_path = dir + "mastersword_spirv.idx";
+    p.dir = dir;
+    // (MasterSword Mirror Shield: a pack found damaged last run (a code whose hash was not its record's) is rebuilt from nothing:
+    // the shaders are translated again and written anew, never handed to the driver as they were read)
+    const std::string marker = dir + "mastersword_spirv.damaged";
+    if (GetFileAttributesA(marker.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileA(pack_path.c_str()), DeleteFileA(idx_path.c_str()), DeleteFileA((dir + "mastersword_spirv.song").c_str());
+        DeleteFileA(marker.c_str());
+        logf("vk: MasterSword Mirror Shield: the shader pack was found damaged last run: rebuilt from nothing");
+    }
     p.file = CreateFileA(pack_path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
                          FILE_ATTRIBUTE_NORMAL, nullptr);
     p.idx = CreateFileA(idx_path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
@@ -115,6 +129,7 @@ void pack_open() {
         const uint64_t at = raw[i + 1] & ((1ull << 40) - 1), words = raw[i + 1] >> 40;
         if (!words || at + words * 4 > p.end) break;
         p.recs[raw[i]] = {at, (uint32_t)words};
+        p.hash_at[at] = raw[i];
         valid_end = std::max(valid_end, at + words * 4);
         kept = i + 2;
     }
@@ -130,6 +145,7 @@ void pack_open() {
          "hot ones (RX_TRIFORCE_HOT_MB, default 1024), the rest are read back from the pack (RX_MEM_PACK=0: all as modules, as "
          "before)", pack_path.c_str(), p.recs.size(), (unsigned long long)(p.end >> 20));
     triforce_warm();
+    song_of_time_play();
 }
 bool pack_on() {
     static std::once_flag once;
@@ -164,6 +180,8 @@ bool stage_set_code(Stage& st, const std::vector<uint32_t>& spirv) {
     p.end = at + bytes;
     p.new_bytes += bytes;
     p.recs[h] = {at, (uint32_t)spirv.size()};
+    p.hash_at[at] = h;
+    p.verified.insert(at);   // (made here from the code itself: nothing to check)
     st.code_at = at, st.code_words = (uint32_t)spirv.size();
     return true;
 }
@@ -187,12 +205,19 @@ std::unordered_map<uint64_t, Hot> hot;   // (by the code's place in the pack)
 std::list<uint64_t> hot_lru;              // (front: the least recently used of those not in use)
 uint64_t hot_bytes = 0;
 std::atomic<int64_t> hot_hits{0}, hot_made{0}, hot_evicted{0};
-uint64_t hot_budget() {
-    static const uint64_t b = [] {
+// (Wisdom, adaptive: the budget follows the PC's free RAM, measured every 300 frames (wisdom_adapt): 2 GB with over 8 GB free,
+// 1 GB over 4, 512 MB over 2, 256 MB below. RX_TRIFORCE_HOT_MB=<MB> fixes it; 0: no hot cache)
+std::atomic<uint64_t> hot_budget_auto{1024ull << 20};
+int64_t hot_budget_fixed() {
+    static const int64_t f = [] {
         const char* e = getenv("RX_TRIFORCE_HOT_MB");
-        return (e && *e ? (uint64_t)std::max(0, atoi(e)) : 1024ull) << 20;
+        return e && *e ? (int64_t)std::max(0, atoi(e)) << 20 : (int64_t)-1;
     }();
-    return b;
+    return f;
+}
+uint64_t hot_budget() {
+    const int64_t f = hot_budget_fixed();
+    return f >= 0 ? (uint64_t)f : hot_budget_auto.load(std::memory_order_relaxed);
 }
 void hot_evict_locked() {   // (hot_mu held)
     while (hot_bytes > hot_budget() && !hot_lru.empty()) {
@@ -220,7 +245,52 @@ bool pack_read(uint64_t at, uint32_t words, std::vector<uint32_t>& out) {
         return false;
     }
     p.reads++, p.read_bytes += bytes;
+    // (MasterSword Mirror Shield: each record's code checked against its hash the first time it is read this session)
+    bool check;
+    {
+        std::lock_guard lk(p.mu);
+        check = !p.verified.count(at);
+    }
+    if (check) {
+        const uint64_t h = code_hash(out);
+        std::lock_guard lk(p.mu);
+        const auto it = p.hash_at.find(at);
+        const auto rec = it == p.hash_at.end() ? p.recs.end() : p.recs.find(it->second);
+        if (it == p.hash_at.end() || it->second != h || rec == p.recs.end() || rec->second.words != words) {
+            p.failed++;
+            static int told = 0;
+            if (told++ < 8)
+                logf("vk: MasterSword Mirror Shield: a shader's code in the pack is not what was written (at %llu): not handed to "
+                     "the driver; the pack is rebuilt at the next start", (unsigned long long)at);
+            if (!p.damaged) {
+                p.damaged = true;
+                const HANDLE m = CreateFileA((p.dir + "mastersword_spirv.damaged").c_str(), GENERIC_WRITE, 0, nullptr,
+                                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (m != INVALID_HANDLE_VALUE) CloseHandle(m);
+            }
+            return false;
+        }
+        p.verified.insert(at);
+        p.shield_checked++;
+    }
     return true;
+}
+
+// (Wisdom, adaptive: see hot_budget) every 300 frames from mempack_tick
+void wisdom_adapt() {
+    if (hot_budget_fixed() >= 0) return;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    const uint64_t free_mb = ms.ullAvailPhys >> 20;
+    const uint64_t want = (free_mb > 8192 ? 2048ull : free_mb > 4096 ? 1024ull : free_mb > 2048 ? 512ull : 256ull) << 20;
+    const uint64_t was = hot_budget_auto.exchange(want);
+    if (want != was) {
+        logf("vk: MasterSword Triforce, Wisdom: the hot cache's budget %llu -> %llu MB (%llu MB of RAM free)",
+             (unsigned long long)(was >> 20), (unsigned long long)(want >> 20), (unsigned long long)free_mb);
+        std::lock_guard lk(hot_mu);
+        hot_evict_locked();
+    }
 }
 } // namespace
 
@@ -276,6 +346,94 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
     si.pNext = &holder.ci;
     return true;
 }
+
+// MasterSword Song of Time: Wisdom remembered. Now and then (with the census) the hot cache's working set, newest first, is
+// written to mastersword_spirv.song; at the next start a thread on the E-cores reads those codes back (each checked by the
+// Mirror Shield) and makes their modules into the hot cache, up to most of its budget, before the first areas ask for them.
+// RX_TRIFORCE_SONG=0: neither.
+namespace {
+bool song_on() {
+    static const bool on = !getenv("RX_TRIFORCE_SONG") || atoi(getenv("RX_TRIFORCE_SONG")) != 0;
+    return on;
+}
+std::atomic<int64_t> song_played{0};
+void song_of_time_save() {
+    Pack& p = pack();
+    if (!p.on || !song_on() || !hot_budget()) return;
+    std::vector<std::pair<uint64_t, uint32_t>> list;   // (place, words), newest first
+    {
+        std::lock_guard lk(hot_mu);
+        for (const auto& [key, h] : hot)
+            if (h.refs > 0) list.push_back({key, h.words});
+        for (auto it = hot_lru.rbegin(); it != hot_lru.rend(); ++it)
+            if (auto h = hot.find(*it); h != hot.end()) list.push_back({*it, h->second.words});
+    }
+    const std::string path = p.dir + "mastersword_spirv.song", tmp = path + ".tmp";
+    const HANDLE f = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD put = 0;
+    const bool ok = list.empty() || WriteFile(f, list.data(), (DWORD)(list.size() * sizeof list[0]), &put, nullptr);
+    CloseHandle(f);
+    if (ok) MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileA(tmp.c_str());
+}
+void song_of_time_play() {
+    Pack& p = pack();
+    if (!p.on || !song_on() || !hot_budget()) return;
+    const std::string path = p.dir + "mastersword_spirv.song";
+    const HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    GetFileSizeEx(f, &size);
+    std::vector<std::pair<uint64_t, uint32_t>> list((size_t)(size.QuadPart / sizeof(std::pair<uint64_t, uint32_t>)));
+    DWORD got = 0;
+    if (!list.empty()) ReadFile(f, list.data(), (DWORD)(list.size() * sizeof list[0]), &got, nullptr);
+    CloseHandle(f);
+    list.resize(got / sizeof list[0]);
+    if (list.empty()) return;
+    std::thread([list = std::move(list)] {
+        SetThreadDescription(GetCurrentThread(), L"mkw_vk Song of Time");
+        jobs_worker_placement();
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const auto t0 = GetTickCount64();
+        std::vector<uint32_t> words;
+        int64_t made = 0;
+        // (the oldest of the list first, so the newest end up the most recently used in the LRU)
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {
+            const auto [at, n] = *it;
+            {
+                std::lock_guard lk(hot_mu);
+                if (hot_bytes + (uint64_t)n * 4 > hot_budget() * 9 / 10) continue;
+                if (hot.count(at)) continue;
+            }
+            {
+                Pack& pk = pack();
+                std::lock_guard lk(pk.mu);
+                if (!pk.hash_at.count(at)) continue;   // (not a record of this pack)
+            }
+            if (!pack_read(at, n, words)) continue;
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = words.size() * 4;
+            ci.pCode = words.data();
+            VkShaderModule m = VK_NULL_HANDLE;
+            if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) != VK_SUCCESS || !m) continue;
+            std::lock_guard lk(hot_mu);
+            auto [h, fresh] = hot.try_emplace(at);
+            if (!fresh) {
+                vkDestroyShaderModule(dev.device, m, nullptr);
+                continue;
+            }
+            h->second.module = m, h->second.words = n, h->second.refs = 0;
+            h->second.lru = hot_lru.insert(hot_lru.end(), at);
+            hot_bytes += ci.codeSize;
+            made++;
+        }
+        song_played += made;
+        logf("vk: MasterSword Song of Time: %lld shaders from the last session made ready in the hot cache in %llu ms",
+             (long long)made, (unsigned long long)(GetTickCount64() - t0));
+    }).detach();
+}
+} // namespace
 
 // Courage: the pack read ahead of need. At start, a thread at background priority (its disk reads and the pages they bring in
 // both lowest: Windows takes those pages first) reads the pack front to back in 8 MB reads, so the first build of a shader in
@@ -435,9 +593,11 @@ void census_run() {
                  (long long)p.failed.load());
         if (p.on) {
             std::lock_guard lk(hot_mu);
-            logf("vk: Triforce hot cache: %zu modules (%llu MB of %llu), %lld builds served from it, %lld made, %lld evicted",
+            logf("vk: Triforce hot cache: %zu modules (%llu MB of %llu), %lld builds served from it, %lld made, %lld evicted; "
+                 "Song of Time made %lld ready; Mirror Shield checked %lld codes",
                  hot.size(), (unsigned long long)(hot_bytes >> 20), (unsigned long long)(hot_budget() >> 20),
-                 (long long)hot_hits.load(), (long long)hot_made.load(), (long long)hot_evicted.load());
+                 (long long)hot_hits.load(), (long long)hot_made.load(), (long long)hot_evicted.load(),
+                 (long long)song_played.load(), (long long)p.shield_checked.load());
         }
     }
     for (const auto& a : allocs)
@@ -453,6 +613,8 @@ void mempack_tick(uint64_t frame_no) {
     if (!floor_done) floor_done = true, resident_floor();
     static const int every = env_int("RX_MEM_CENSUS", 3600);
     if (every > 0 && frame_no >= 600 && frame_no % (uint64_t)std::max(every, 30) < 30) jobs_push([] { census_run(); });
+    if (frame_no % 300 < 30) wisdom_adapt();   // (Wisdom, adaptive: the hot cache's budget by the PC's free RAM)
+    if (frame_no >= 1800 && frame_no % 1800 < 30) jobs_push([] { song_of_time_save(); });   // (Song of Time: the hot set kept)
 }
 
 } // namespace mkwvk
