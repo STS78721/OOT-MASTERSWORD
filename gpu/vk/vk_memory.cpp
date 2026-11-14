@@ -29,6 +29,7 @@
 #include "vk_internal.h"
 #include "hookshot_env.h"
 #include "vk_texture.h"   // (upload_command_buffer)
+#include "vk_draw.h"      // (jobs_worker_placement: the import thread on the E-cores)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
 #include "mirror_trim.h"
@@ -2015,6 +2016,9 @@ void bg_start() {   // (bg_mu held)
 
 void bg_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk imports");
+    // (MasterSword: a background worker's place, off the P-cores the game and the replay use, below them)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    jobs_worker_placement();
     for (;;) {
         std::pair<uint64_t, uint64_t> r;
         {
@@ -2944,10 +2948,27 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
 void memory_pool_created(uint64_t gpu, uint64_t size) {
     // (RX_VK_BG_IMPORT=1 only: imported eagerly, every pool the game made, most never used by the GPU, the thread's
     // page locking stalled the game's threads (3-7 fps); chunked imports at first use are the default)
-    static const bool on = getenv("RX_VK_BG_IMPORT") != nullptr;
-    if (!on || !size || gpu >= (1ull << 40) || !dev.external_memory_host) return;   // (virtual pools are not imported)
-    const uint64_t lo = gpu & ~(align - 1), hi = (gpu + size + align - 1) & ~(align - 1);
+    // (MasterSword 2026-11-14, RX_VK_BG_IMPORT=play: in play only, after the start-up and the shader preparation, and only a new
+    // pool's first chunk, at most 16 queued. The warm run with the memory pack: no stall bursts left, but 110 imports a session
+    // at 34 ms each, nearly all a new pool's first chunk (+0x40) bound by the next frame's draws, in NPC-heavy streaming)
+    static const char* const mode = getenv("RX_VK_BG_IMPORT");
+    static const bool play = mode && !strcmp(mode, "play");
+    static const bool on = mode && !play && atoi(mode) != 0;
+    if ((!on && !play) || !size || gpu >= (1ull << 40) || !dev.external_memory_host) return;   // (virtual pools are not imported)
+    static const uint64_t play_from = [] {
+        const char* e = getenv("RX_VK_BG_IMPORT_FROM");
+        return e ? (uint64_t)std::max(0, atoi(e)) : 1800ull;
+    }();
+    if (play && texture_frame_no() < play_from) return;
+    const uint64_t lo = gpu & ~(align - 1);
+    uint64_t hi = (gpu + size + align - 1) & ~(align - 1);
+    if (play) hi = std::min(hi, (lo + (import_chunk() << 20) + align - 1) & ~(align - 1));
     std::lock_guard lk(bg_mu);
+    if (play && bg_queue.size() >= 16) return;
+    {
+        static bool told = false;
+        if (play && !told) told = true, logf("vk: new pools' first chunks imported ahead in play (RX_VK_BG_IMPORT=play)");
+    }
     bg_start();
     if (std::find(bg_inflight.begin(), bg_inflight.end(), lo) != bg_inflight.end()) return;
     bg_inflight.push_back(lo);
