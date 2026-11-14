@@ -59,6 +59,10 @@ Ranked by expected payoff. "Observe" means counters and log lines only; "Act" me
 
 ## 5. Recommended order
 
+**Status:** step 1 and the observing half of step 2 are done in Temper 2 (commit ee15b931): the Slate learns from draws,
+pictures are keyed by program keys, SLT2 with the fingerprint, Owl Statue awareness. Waiting on play data.
+
+
 1. **Temper 2 (Slate):** score only **in-play** uses (after the start-up preparation ends), so the scores mean "what you
    play", not "what start-up built". Add sense **E** (fingerprint) and **D** (Owl awareness): small and safe.
 2. **Forge: Sheikah Sensor (A + C, observe only):** per-pipeline draw counts and program-key area signatures, saved in

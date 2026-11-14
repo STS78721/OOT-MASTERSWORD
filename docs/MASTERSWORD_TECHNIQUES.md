@@ -193,6 +193,13 @@ The Sheikah Slate is a small file of learned state, saved every 30 s and on exit
 For other projects: **persist the learned state, not just the data; score with decay; and key snapshots by behaviour (what
 gets drawn) when you can't see the game's state.**
 
+**Temper 2, the Sheikah Sensor:** the first version learned from shader *builds*, but this game builds nearly everything at
+start-up, so the Slate learned the start-up, not play. The Sensor watches *draws* instead: one relaxed counter bump per draw
+(no locked instruction, no lock), and the Slate is told only at a power-of-two draw count (a score on the log of use) or at a
+program's first draw after an area starts streaming. Snapshots are keyed by program keys, which are hashes of shader code
+and so stable across runs. The lesson: **learn from the signal that reflects the player, and make the hot-path cost a
+plain store.**
+
 ## 4d. MasterSword Lens of Truth: know your own memory instead of asking the OS
 
 A recompiled game reserves one huge address window (512 GB here) with write-watch, and commits pages as the game uses them.

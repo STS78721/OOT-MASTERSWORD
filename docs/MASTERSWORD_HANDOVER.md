@@ -335,8 +335,10 @@ with the measurements in the message, and an entry here.
 |---|---|---|
 | **1** (commit 19317f46) | Census 360-375 ms of a worker + ~90 MB every minute; Lens of Truth missed 45 of 128 imports; the Slate locked once per frame; the Mirror Shield's checks cheap | Census at 600 frames, then every 5 min (`RX_MEM_CENSUS`, default 18000 frames) and once after memory pressure (at most a minute apart), its page list sorted in place (~45 MB less). The Slate takes no lock on idle frames. Lens misses are now split into "gaps in the bitmap" vs "not committed yet", and the first 6 gaps are logged with the first missing block (`Lens of Truth gap N: ...`, `Lens of Truth misses: G gaps, R not committed yet`). Mirror Shield: no change |
 
-**Temper 2 (next):** Lens gaps: none to close (measured). The Slate: score only in-play uses, and add the driver
-fingerprint and Owl Statue awareness (research doc §5, step 1). Owl Statue: check its flush times and the slow-write lines.
+| **2** (commit ee15b931, exe + DLL) | Slate scores learned from start-up builds; 0 area pictures in 12 streams; Lens: 0 gaps (nothing to close); Owl Statue: first flush per save 12-14 ms, kept | **The Sheikah Sensor**: each draw bumps its program's counter (relaxed load+store, no locked add, no lock); the Slate is told only at a power-of-two draw count (score = log of draws) or at a program's first draw since an area began streaming. Builds no longer score. Pictures keyed by **program keys** (stable across runs), 16 programs make one, 24 are matched. **SLT2** file with tagged sections (SLT1 still read; its pictures dropped). **Fingerprint** (GPU + driver; a log line when it changed). **Owl Statue awareness**: host exports `hos_owl_busy`; census and Slate saves wait while a save is flushed. Census line adds `Sheikah Sensor: P programs drawn, S score events, B area bursts`. **Not yet play-tested** |
+
+**Temper 3 (next):** from the Sensor's data: are pictures forming and matching, and what do the matches make ready? Then the
+Forge of **Farore's Wind** (research doc §5 step 3), switch default off, A/B on a warm and a cold boot.
 
 ### Results 2026-11-14 11:08-11:20, the MasterSword Owl Statue, and the Slate research
 
