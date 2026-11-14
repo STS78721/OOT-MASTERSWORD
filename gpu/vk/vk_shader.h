@@ -33,10 +33,19 @@ struct Stage {
 /// before. false: neither could be made
 bool stage_set_code(Stage& st, const std::vector<uint32_t>& spirv);
 inline bool stage_has_code(const Stage& st) { return st.module != VK_NULL_HANDLE || st.code_words != 0; }
-/// What stage_bind reads into: kept alive until the pipeline is created
+/// (vk_mempack.cpp) A hot-cache module's use is over (Triforce Shader Delivery: it may be evicted from now on)
+void triforce_release(uint64_t key);
+/// What stage_bind reads into, or the hot-cache module it holds: kept alive until the pipeline is created
 struct StageCode {
     std::vector<uint32_t> words;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    uint64_t hot_key = ~0ull;   // (the hot cache's module in use: released when this goes)
+    StageCode() = default;
+    StageCode(const StageCode&) = delete;
+    StageCode& operator=(const StageCode&) = delete;
+    ~StageCode() {
+        if (hot_key != ~0ull) triforce_release(hot_key);
+    }
 };
 /// si's code: st.module, or st's SPIR-V read back from the pack into holder and chained inline (after pin_subgroup, which
 /// sets si.pNext). false: the pack could not be read

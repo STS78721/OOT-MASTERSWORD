@@ -19,13 +19,16 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <list>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "vk_internal.h"
 #include "vk_jobs.h"
+#include "vk_draw.h"   // (jobs_worker_placement)
 #include "vk_paths.h"
 #include "vk_shader.h"
 
@@ -46,6 +49,7 @@ namespace {
 struct Pack {
     std::mutex mu;
     HANDLE file = INVALID_HANDLE_VALUE, idx = INVALID_HANDLE_VALUE;
+    std::string path;   // (the warm-up opens its own handle: reads on one synchronous handle go one at a time)
     uint64_t end = 0;
     struct Rec {
         uint64_t at;
@@ -59,6 +63,8 @@ Pack& pack() {
     static Pack p;
     return p;
 }
+
+void triforce_warm();   // (below: Courage)
 
 uint64_t code_hash(const std::vector<uint32_t>& w) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)w.size();
@@ -119,9 +125,11 @@ void pack_open() {
     to.QuadPart = (LONGLONG)p.end;
     SetFilePointerEx(p.file, to, nullptr, FILE_BEGIN), SetEndOfFile(p.file);
     p.on = true;
-    logf("vk: memory pack %s: %zu shader codes kept (%llu MB); the game's shader code is read from it at each pipeline "
-         "build instead of being held by the driver (RX_MEM_PACK=0: as before)",
-         pack_path.c_str(), p.recs.size(), (unsigned long long)(p.end >> 20));
+    p.path = pack_path;
+    logf("vk: MasterSword Triforce Shader Delivery: the pack %s holds %zu shader codes (%llu MB); the driver keeps only the "
+         "hot ones (RX_TRIFORCE_HOT_MB, default 1024), the rest are read back from the pack (RX_MEM_PACK=0: all as modules, as "
+         "before)", pack_path.c_str(), p.recs.size(), (unsigned long long)(p.end >> 20));
+    triforce_warm();
 }
 bool pack_on() {
     static std::once_flag once;
@@ -160,28 +168,157 @@ bool stage_set_code(Stage& st, const std::vector<uint32_t>& spirv) {
     return true;
 }
 
-bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder) {
-    si.module = st.module;
-    if (st.module || !st.code_words) return st.module != VK_NULL_HANDLE;
+// ---- MasterSword Triforce Shader Delivery ----
+// Power: the pack above (every distinct shader once, on the NVMe). Wisdom: the hot cache below. Courage: the warm-up below.
+// Why Wisdom: with the pack alone every pipeline build read its code back and the driver parsed it again: 53,000 reads,
+// 3.4 GB a session, and the area changes' pipeline time doubled (417 -> 924 ms in their slowest frames). The hot cache keeps
+// the modules of the code used lately, up to RX_TRIFORCE_HOT_MB (default 1024; 0: none, every build reads the pack), so an
+// area's builds reuse a parsed module, and evicts the least recently used one in no build's hands (a module may be destroyed
+// once the pipelines made from it exist). The RAM the driver holds stays bounded, where it held 13.5 GB before the pack.
+namespace {
+struct Hot {
+    VkShaderModule module = VK_NULL_HANDLE;
+    uint32_t words = 0;
+    int refs = 0;
+    std::list<uint64_t>::iterator lru;   // (in hot_lru while refs == 0: the eviction order)
+};
+std::mutex hot_mu;
+std::unordered_map<uint64_t, Hot> hot;   // (by the code's place in the pack)
+std::list<uint64_t> hot_lru;              // (front: the least recently used of those not in use)
+uint64_t hot_bytes = 0;
+std::atomic<int64_t> hot_hits{0}, hot_made{0}, hot_evicted{0};
+uint64_t hot_budget() {
+    static const uint64_t b = [] {
+        const char* e = getenv("RX_TRIFORCE_HOT_MB");
+        return (e && *e ? (uint64_t)std::max(0, atoi(e)) : 1024ull) << 20;
+    }();
+    return b;
+}
+void hot_evict_locked() {   // (hot_mu held)
+    while (hot_bytes > hot_budget() && !hot_lru.empty()) {
+        const uint64_t key = hot_lru.front();
+        hot_lru.pop_front();
+        auto it = hot.find(key);
+        if (it == hot.end()) continue;
+        vkDestroyShaderModule(dev.device, it->second.module, nullptr);
+        hot_bytes -= (uint64_t)it->second.words * 4;
+        hot.erase(it);
+        hot_evicted++;
+    }
+}
+bool pack_read(uint64_t at, uint32_t words, std::vector<uint32_t>& out) {
     Pack& p = pack();
-    holder.words.resize(st.code_words);
+    out.resize(words);
     OVERLAPPED ov{};
-    ov.Offset = (DWORD)st.code_at, ov.OffsetHigh = (DWORD)(st.code_at >> 32);
+    ov.Offset = (DWORD)at, ov.OffsetHigh = (DWORD)(at >> 32);
     DWORD got = 0;
-    const DWORD bytes = st.code_words * 4;
-    if (!ReadFile(p.file, holder.words.data(), bytes, &got, &ov) || got != bytes) {
+    const DWORD bytes = words * 4;
+    if (!ReadFile(p.file, out.data(), bytes, &got, &ov) || got != bytes) {
         static std::atomic<int> told{0};
         if (told++ < 10) logf("vk: memory pack: a shader's code could not be read back (error %lu)", GetLastError());
         p.failed++;
         return false;
     }
     p.reads++, p.read_bytes += bytes;
-    holder.ci.codeSize = bytes;
+    return true;
+}
+} // namespace
+
+void triforce_release(uint64_t key) {
+    std::lock_guard lk(hot_mu);
+    auto it = hot.find(key);
+    if (it == hot.end() || --it->second.refs > 0) return;
+    it->second.lru = hot_lru.insert(hot_lru.end(), key);
+    hot_evict_locked();
+}
+
+bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder) {
+    si.module = st.module;
+    if (st.module || !st.code_words) return st.module != VK_NULL_HANDLE;
+    const uint64_t key = st.code_at;
+    if (hot_budget()) {   // (Wisdom: a module made lately for this code)
+        std::lock_guard lk(hot_mu);
+        if (auto it = hot.find(key); it != hot.end()) {
+            if (it->second.refs++ == 0) hot_lru.erase(it->second.lru);
+            holder.hot_key = key;
+            si.module = it->second.module;
+            hot_hits++;
+            return true;
+        }
+    }
+    if (!pack_read(st.code_at, st.code_words, holder.words)) return false;
+    if (hot_budget()) {   // (made here, outside the lock: the driver parses it once for the builds that follow)
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = holder.words.size() * 4;
+        ci.pCode = holder.words.data();
+        VkShaderModule m = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) == VK_SUCCESS && m) {
+            std::lock_guard lk(hot_mu);
+            auto [it, fresh] = hot.try_emplace(key);
+            if (!fresh) {   // (another thread made it meanwhile: theirs)
+                vkDestroyShaderModule(dev.device, m, nullptr);
+                if (it->second.refs++ == 0) hot_lru.erase(it->second.lru);
+            } else {
+                it->second.module = m, it->second.words = (uint32_t)holder.words.size(), it->second.refs = 1;
+                hot_bytes += ci.codeSize;
+                hot_made++;
+            }
+            holder.hot_key = key;
+            si.module = it->second.module;
+            std::vector<uint32_t>().swap(holder.words);
+            hot_evict_locked();
+            return true;
+        }
+    }
+    holder.ci.codeSize = holder.words.size() * 4;   // (no hot cache, or no module: inline, as the pack alone did)
     holder.ci.pCode = holder.words.data();
     holder.ci.pNext = si.pNext;
     si.pNext = &holder.ci;
     return true;
 }
+
+// Courage: the pack read ahead of need. At start, a thread at background priority (its disk reads and the pages they bring in
+// both lowest: Windows takes those pages first) reads the pack front to back in 8 MB reads, so the first build of a shader in
+// an area finds its code in the file cache, not on the disk: the NVMe's sequential speed instead of one small read at a time.
+// Only when the PC has the pack's size free twice over (RX_TRIFORCE_WARM=0: never).
+namespace {
+void triforce_warm() {
+    const char* e = getenv("RX_TRIFORCE_WARM");
+    if (e && *e == '0') return;
+    Pack& p = pack();
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!p.on || !p.end || !GlobalMemoryStatusEx(&ms) || ms.ullAvailPhys < 2 * p.end) {
+        if (p.on && p.end) logf("vk: Triforce Shader Delivery: no warm-up (%llu MB free, the pack %llu MB)",
+                                (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(p.end >> 20));
+        return;
+    }
+    const uint64_t size = p.end;
+    const HANDLE h = CreateFileA(p.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    std::thread([size, h] {
+        SetThreadDescription(GetCurrentThread(), L"mkw_vk Triforce warm-up");
+        jobs_worker_placement();
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        const auto t0 = GetTickCount64();
+        std::vector<uint8_t> buf(8u << 20);
+        uint64_t done = 0;
+        while (done < size) {
+            const DWORD n = (DWORD)std::min<uint64_t>(buf.size(), size - done);
+            OVERLAPPED ov{};
+            ov.Offset = (DWORD)done, ov.OffsetHigh = (DWORD)(done >> 32);
+            DWORD got = 0;
+            if (!ReadFile(h, buf.data(), n, &got, &ov) || !got) break;
+            done += got;
+        }
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        CloseHandle(h);
+        logf("vk: Triforce Shader Delivery: warm-up read %llu MB of the pack in %llu ms (background priority)",
+             (unsigned long long)(done >> 20), (unsigned long long)(GetTickCount64() - t0));
+    }).detach();
+}
+} // namespace
 
 // (vk_shader.cpp make_module: the game programs' SPIR-V handed to the driver, which keeps a copy in its own heap; made, not
 // counted down at destruction: an upper bound of what the driver may hold)
@@ -296,6 +433,12 @@ void census_run() {
                  p.recs.size(), (unsigned long long)(p.end >> 20), (unsigned long long)(p.new_bytes.load() >> 20),
                  (long long)p.shared_hits.load(), (long long)p.reads.load(), (long long)(p.read_bytes.load() >> 20),
                  (long long)p.failed.load());
+        if (p.on) {
+            std::lock_guard lk(hot_mu);
+            logf("vk: Triforce hot cache: %zu modules (%llu MB of %llu), %lld builds served from it, %lld made, %lld evicted",
+                 hot.size(), (unsigned long long)(hot_bytes >> 20), (unsigned long long)(hot_budget() >> 20),
+                 (long long)hot_hits.load(), (long long)hot_made.load(), (long long)hot_evicted.load());
+        }
     }
     for (const auto& a : allocs)
         logf("vk:   host allocation %#llx: %llu MB resident of %llu MB", (unsigned long long)a.base, mb(a.resident),
