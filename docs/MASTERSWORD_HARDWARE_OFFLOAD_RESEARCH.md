@@ -164,3 +164,38 @@ The sampler existed upstream (`HOS_SAMPLE_ALL`); MasterSword adds the reading of
 decides: how much of the main thread's time is the game's own code, the recompiler's helpers (`a64_*`: the float helpers
 are the first suspect), SDK services or waiting; which `f_` functions are the hot ones (for Deku Scrub SIMD or a patch);
 and what runs while the main thread waits (the frame's critical path).
+
+## 10. Mask of Truth's first sample: Town, 2026-11-14 21:53 (2 x 30 s, 103 threads, every ~4 ms)
+
+**The game's frame is mostly waiting, not computing.**
+- `sead::MainThread` runs **22%** of the time. About **59%** it waits for the game's own job system: `WaitLightEvent`
+  in `f_8007fe60` (41% of its time) plus that same wait's 20 us sleep-poll (`SleepThread` via `f_800998a0`, 18%). It
+  waits on the renderer's recording only ~5%. (The host's short sleeps yield until their time on a 24-thread CPU:
+  no oversleep there; upstream measured that path.)
+- The six job workers (`BaseProcExecutor0-5`) are each busy ~22% (1.3 cores together). That job phase is the critical path.
+- Of the game-side running time: **10.7% in the out-of-line float helpers** (`a64_fpx_mul32_fma32` and friends: a call per
+  float op for exact Arm semantics; the inlined fast path `a64_fpx_hot_*` exists).
+- **The hot split misses what is hot.** It was chosen statically (call counts, float-op density). Measured: **89.6%** of the
+  float-helper time comes from functions *not* in it, and **19 of the 20 hottest functions** by own code are cold (-O1,
+  helpers called). The single hottest, `f_801102e0` (7% of all game-side running time), is cold.
+- Second lead: the main thread's own running time includes the renderer's capture copies (`take_capture`, memcpy, ~20% of
+  its running samples): roughly 1 ms a frame on the critical path.
+
+**Proposed Forge: Biggoron's Forge**, the hot split re-forged from measured heat: `make_hot_split.py` takes Mask of
+Truth's profile and puts the measured hot functions (own time, float-helper callers) into the -O2 hot chunks with the
+helpers inlined. Same exact semantics (the inlined guards are the same checks); a rebuild of the touched chunks of the exe.
+Then a Temper: sample Town again, compare the job phase and fps.
+
+Tools: `scripts/mask_of_truth.py` (with `--thread "BaseProcExecutor*"` for a group), `scripts/mask_of_truth_hot.py`.
+
+## 11. Gemini's AI bench (D:\MS_AI, 2026-11-14): verdict
+
+Good, isolated work (a sandbox outside the project, validated numbers). What it shows and what it means here:
+- **NPU:** round trip 0.21-0.37 ms; the same tiny models run in 0.07-0.13 ms on a CPU core (its own takeaway). With 16 E-cores
+  idle, an E-core is the cheaper home for any small predictor; "0% CPU" is not quite true (a thread submits and waits).
+- **Hitches (13-97 ms)** come from area loads (uploads, imports) and memory syncs: known events. A predictor can move work
+  earlier (the Slate already does for shaders) but can't remove it; no model is needed to know a load is coming.
+- **Neural texture compression:** 31-33 dB PSNR on a synthetic texture is visibly lossy (fails fidelity-first); VRAM is not
+  MasterSword's constraint; it would mean rewriting every recompiled shader's texture sampling. Not for MasterSword.
+- **Cooperative vectors 12.96x:** real, and good to know, but nothing in MasterSword's frame is an MLP and the GPU has room.
+- Its bottom line's first point agrees with the measurements: Town's base rate is CPU-side work.

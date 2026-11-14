@@ -623,6 +623,13 @@ after the run). Read it with: `python -I scripts/mask_of_truth.py "<smoke>/mask_
 thread list when the .go file appears, so start it in play, not at boot. Rule from Gemini's notes: no automated headless runs
 unless the user asks.
 
+**Mask of Truth's first Town sample (21:53, smoke mask_of_truth_samples.txt, 433 MB):** the main thread runs 22% of the time
+and waits ~59% for the game's job workers (BaseProcExecutor0-5, ~22% busy each): the job phase is the critical path. 10.7% of
+game-side time is in out-of-line float helpers, and the hot split (static guess, 11-12) misses 89.6% of their callers and 19 of
+the 20 hottest functions (f_801102e0 alone 7%). Proposed next: **Biggoron's Forge**, the hot split from measured heat
+(research doc s10). Gemini's D:\MS_AI AI bench reviewed (s11): nothing in it for MasterSword's base rate. HOS_SAMPLE_ALL left
+on in the smoke env (free until the .bat runs) for the Temper sample after the Forge.
+
 ---
 
 ## 5. Releases

@@ -115,8 +115,11 @@ def main():
 
     # ---- read: thread -> [(ms, frames named)] ----
     by_thread = collections.defaultdict(list)
-    ticks = collections.defaultdict(dict)   # ms -> thread -> index into by_thread[thread]
-    lo, hi = None, None
+    ticks = collections.defaultdict(list)   # instant -> [(thread, index into by_thread[thread])]
+    # (each start of the sampler counts from 0 ms again: a file several sessions appended to is read as one timeline, each
+    # session after the one before. --from/--to are in a session's own ms)
+    sessions, offset, last_ms, first_ms, sampled_ms = 1, 0, -1, None, 0
+    frame_cache = {}
     with open(a.path, encoding="utf-8", errors="replace") as f:
         for line in f:
             head, _, stack = line.rstrip("\n").partition("|")
@@ -124,22 +127,31 @@ def main():
             if not stack or not ms.isdigit():
                 continue
             ms = int(ms)
+            if ms + 1000 < last_ms:   # (a new session)
+                sampled_ms += last_ms - (first_ms or 0)
+                sessions, offset, first_ms = sessions + 1, offset + last_ms + 1000, None
+            last_ms = ms
             if (a.t0 is not None and ms < a.t0) or (a.t1 is not None and ms >= a.t1):
                 continue
-            frames = [name(x) for x in stack.split(";") if x]
+            if first_ms is None:
+                first_ms = ms
+            frames = frame_cache.get(stack)
+            if frames is None:
+                frames = tuple(name(x) for x in stack.split(";") if x)
+                if len(frame_cache) < 400000:
+                    frame_cache[stack] = frames
             if not frames:
                 continue
-            lo = ms if lo is None else min(lo, ms)
-            hi = ms if hi is None else max(hi, ms)
-            ticks[ms][thread] = len(by_thread[thread])
+            ticks[offset + ms].append((thread, len(by_thread[thread])))
             by_thread[thread].append(frames)
+    sampled_ms += max(0, last_ms - (first_ms or 0))
     if not by_thread:
         print("no samples in %s (is it the HOS_SAMPLE_ALL file, and was its .go file there while the game ran?)" % a.path)
         return 1
-    secs = max(0.001, (hi - lo) / 1000.0)
+    secs = max(0.001, sampled_ms / 1000.0)
     print("MasterSword Mask of Truth: %s" % a.path)
-    print("%d instants over %.1f s (%.1f ms apart), %d threads" % (len(ticks), secs, 1000.0 * secs / max(1, len(ticks) - 1),
-                                                                  len(by_thread)))
+    print("%d instants over %.1f s in %d session(s) (%.1f ms apart), %d thread names" % (
+        len(ticks), secs, sessions, 1000.0 * secs / max(1, len(ticks) - sessions), len(by_thread)))
 
     def is_game(th):
         return not th.startswith("mkw_vk")
@@ -148,15 +160,18 @@ def main():
         return kind_of(*frames[0])
 
     # ---- every thread's running share ----
-    print("\n-- running share by thread (its leaf in the game, the renderer or the driver)")
+    print("\n-- running by thread, in cores (its leaf in the game, the renderer or the driver)")
+    # (a name several threads share, as the six mkw_vk_worker: their sum; how many from its samples an instant)
+    copies = {th: max(1, round(len(samples) / max(1, len(ticks)))) for th, samples in by_thread.items()}
     rows = []
     for th, samples in by_thread.items():
         run = sum(1 for fr in samples if leaf_kind(fr)[1])
-        rows.append((run / len(samples), run * secs / len(samples), th, len(samples)))
-    for share, cpu, th, n in sorted(rows, reverse=True)[:32]:
+        rows.append((copies[th] * run / len(samples), 0, th, len(samples)))
+    for share, _, th, n in sorted(rows, reverse=True)[:32]:
         if share < 0.005:
             break
-        print("  %5.1f%%  %-34s (%d samples)" % (100.0 * share, th, n))
+        many = ", %d threads" % copies[th] if copies[th] > 1 else ""
+        print("  %5.2f  %-34s (%d samples%s)" % (share, th, n, many))
     busy_game = sum(share for share, _, th, _ in rows if is_game(th))
     busy_vk = sum(share for share, _, th, _ in rows if not is_game(th))
     print("  in all: the game's threads %.2f cores busy, the renderer's own threads %.2f" % (busy_game, busy_vk))
@@ -218,6 +233,12 @@ def main():
                 print("  %5.1f%%  %s" % (100.0 * v / w, k))
 
     for th in SERIAL + ((a.thread,) if a.thread else ()):
+        if th == a.thread and th not in by_thread:   # (--thread NAME*: every thread whose name starts with NAME)
+            names = sorted(n for n in by_thread if n.startswith(th.rstrip("*")))
+            if names:
+                breakdown("%s (%d threads: %s)" % (th, len(names), ", ".join(names[:8])),
+                          [fr for n in names for fr in by_thread[n]])
+                continue
         if th in by_thread:
             breakdown(th, by_thread[th])
         else:
@@ -228,7 +249,9 @@ def main():
     # ---- the critical path: what runs while the main thread waits ----
     main_th = SERIAL[0]
     if main_th in by_thread:
-        blocked = [t for t in ticks.values() if main_th in t and not leaf_kind(by_thread[main_th][t[main_th]])[1]]
+        def main_at(t):
+            return next((i for th, i in t if th == main_th), None)
+        blocked = [t for t in ticks.values() if main_at(t) is not None and not leaf_kind(by_thread[main_th][main_at(t)])[1]]
         n = len(ticks)
         print("\n== the critical path: the main thread is not running in %.1f%% of instants" % (100.0 * len(blocked) / max(1, n)))
         if blocked:
@@ -236,10 +259,9 @@ def main():
             none = 0
             for t in blocked:
                 any_run = False
-                for th, i in t.items():
-                    if th != main_th and leaf_kind(by_thread[th][i])[1]:
-                        who[th] += 1
-                        any_run = True
+                for th in {th for th, i in t if th != main_th and leaf_kind(by_thread[th][i])[1]}:
+                    who[th] += 1
+                    any_run = True
                 none += not any_run
             print("-- threads running then (share of those instants)")
             for th, c in who.most_common(12):
