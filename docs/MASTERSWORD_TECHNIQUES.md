@@ -148,6 +148,11 @@ that cost, in three parts:
 | **Wisdom** | A hot module cache | Modules of shaders used recently are kept, up to a RAM budget (1 GB), and the least recently used one that no build holds is destroyed. A pipeline build takes a reference and gives it back when its create call has returned, so a module is never destroyed under a build. An area's builds reuse one parse | `RX_TRIFORCE_HOT_MB=<MB>`, 0 none |
 | **Courage** | A warm-up ahead of need | At start-up, a thread at background priority (low I/O and memory priority, on the E-cores, its own sequential-scan handle) reads the pack front to back in 8 MB reads, so first reads in an area come from Windows' file cache at the drive's sequential speed. Only when free RAM is twice the pack's size; those pages are the first Windows evicts | `RX_TRIFORCE_WARM=0` |
 
+**Measured (same PC, many area changes):** time at 59-60 fps 13% (pack alone) -> 34%; average fps 50.5 -> 53.5; shader
+reads from the pack halved (3.4 -> 1.7 GB a session); area-change pipeline time in the slowest frames 924 -> 620 ms; the
+hot cache served 28,774 builds; the warm-up read the 3.6 GB pack in 2 s at background priority. The player's verdict:
+"that made a huge difference".
+
 The idea in one line, for other projects: **store all shaders once on fast storage, keep only a bounded hot set parsed in
 the driver, and stream the cold set in big sequential reads before it's needed.** That's the console data-delivery idea
 (below) applied to shaders with the PC's own pieces: an NVMe, the OS file cache, and a bounded cache.

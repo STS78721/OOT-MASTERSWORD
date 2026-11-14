@@ -254,8 +254,21 @@ Cache 100 GB / Pre-compile High: fine. PrimoCache would not help (a disk block c
     own `FILE_FLAG_SEQUENTIAL_SCAN` handle) reads the pack front to back in 8 MB reads into Windows' file cache, only when
     free RAM is at least twice the pack's size (`RX_TRIFORCE_WARM=0` never).
   - Census lines to check: `Triforce hot cache: N modules (X MB of 1024), H builds served from it, M made, E evicted`, and
-    `Triforce Shader Delivery: warm-up read ...`. **Not yet play-tested.** Compare area-change frames against the 10:21 log
-    (pipelines 924 ms) and the pre-pack A log (417 ms).
+    `Triforce Shader Delivery: warm-up read ...`.
+  - **Play-tested 2026-11-14 10:52, many area changes back and forth. The user: "that made a huge difference".**
+
+    | | Before the pack (A) | Pack only (10:21) | Import-ahead (10:38) | Triforce (10:52) |
+    |---|---|---|---|---|
+    | Avg fps, busy scenes | 54.6 | 50.5 | 46.6 | 53.5 |
+    | Time at 59-60 fps | 17% | 13% | 2% | **34%** |
+    | Area-change spike frames | 3 (pipelines 417 ms) | 4 (924 ms) | 18 (1024 ms) | 3 (620 ms), over more changes |
+    | Frames over 100 ms | 2 | 3 | 26 | 5 |
+    | Pack reads | n/a | 53,300 (3.4 GB) | similar | 24,580 (1.7 GB) |
+
+    Hot cache: 28,774 builds served, 19,834 modules made, 4,992 evicted, holding 14,842 modules (1,023 of 1,024 MB). The
+    warm-up read the 3.6 GB pack in 2.06 s at background priority. 0 read failures, no missing objects reported.
+  - Still open: imports avg 41 ms (max 103) remain the main hitch source; free RAM ended at 2.5 GB (the hot cache's 1 GB
+    and more areas visited), so if pressure returns, try `RX_TRIFORCE_HOT_MB=512`.
 
 ---
 
@@ -294,8 +307,9 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 
 ## 7. Open items, in priority order
 
-1. Play-test Triforce Shader Delivery: area changes as fast as before the pack or faster, no missing objects, the hot cache
-   hit rate in the census line. If loads get slower, try `RX_TRIFORCE_WARM=0`, then `RX_TRIFORCE_HOT_MB=0`.
+1. Triforce Shader Delivery is confirmed (above). Next: the import cost itself (avg ~41 ms): find what makes an import slow
+   with RAM free (commit/`VirtualQuery` on write-watch memory, the driver's page pinning) and make it cheaper, without
+   background pinning (that failed).
 2. If imports still hitch: find what makes them ~34 ms with RAM free (commit/`VirtualQuery` on write-watch memory, the
    driver's page pinning) and make it cheaper, or import further ahead.
 3. Frame rate: warm A vs warm B (A/B kit) to settle whether the Longshot ports cost ~3 fps; suspect the handle tables
