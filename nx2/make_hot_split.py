@@ -5,6 +5,15 @@ functions from work/sa/gen/code_*.c into code_hot_0.c .. code_hot_7.c (compiled 
 with inlined a64_fpx_hot_* fast paths and call-graph co-location via split_hot.py), and
 writes work/hot_order.txt so lld-link packs hot game + host symbols contiguously at the
 start of .text for L1i / iTLB locality.
+
+(MasterSword Biggoron's Forge, 2026-11-14) With work/measured_heat.txt (scripts/mask_of_truth_hot.py --write, from a
+Mask of Truth sample; RX_MEASURED_HEAT=<file> another, =off none): the functions measured running (at least
+RX_MEASURED_MIN samples, default 3) are forged in as well. The static choice above missed them: in Town 89.6% of the
+out-of-line float helpers' time was called from functions outside it, and 19 of the 20 hottest functions. Up to
+MEASURED_O2_MAX bytes of lifted C a function moves into the -O2 hot pieces (tier A); a bigger one stays in its chunk at
+-O1 with the inlined float fast paths written in place (tier B: the same exact checks, a64_fpx_hot_*, without the -O2
+compile of a giant goto-dense function). The hot code is split into 16 pieces then, and the measured functions lead
+hot_order.txt, hottest first.
 """
 import collections
 import glob
@@ -24,6 +33,21 @@ import split_hot  # noqa: E402
 CALL_RE = re.compile(r"\b(f_[0-9a-f]+)\(c\)")
 DECL_FN_RE = re.compile(r"\b(f_[0-9a-f]+)\b")
 HOT_FPX_DEF_RE = re.compile(r"\ba64_fpx_hot_([A-Za-z0-9_]+)\s*\(")
+MEASURED_O2_MAX = 72_000   # (the static choice's cap: bigger functions are not compiled at -O2)
+
+
+def load_heat():
+    """Biggoron's Forge: the measured heat, {function: samples}, and its path ({} with no file or RX_MEASURED_HEAT=off)"""
+    path = os.environ.get("RX_MEASURED_HEAT", os.path.join(ROOT, "work", "measured_heat.txt"))
+    if path.lower() in ("off", "0", "none") or not os.path.exists(path):
+        return {}, path
+    heat = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2 and parts[0].startswith("f_") and parts[1].isdigit():
+                heat[parts[0]] = int(parts[1])
+    return heat, path
 
 
 def restore_if_needed(gen, backup_dir):
@@ -161,7 +185,38 @@ def main():
             break
         selected.add(callee)
 
-    touched_chunks = sorted({fn_file[f] for f in selected})
+    # (MasterSword Biggoron's Forge) the measured functions: tier A into the -O2 pieces, tier B fast paths in place
+    heat, heat_path = load_heat()
+    measured_min = int(os.environ.get("RX_MEASURED_MIN", "3"))
+    tier_a, tier_b = set(), set()
+    # (work/hot_keep.txt: functions hot before, kept hot whatever their size: their -O2 builds are proven. The split of
+    # 2026-11-12 came from an earlier version of this script, and the choice above no longer makes all of it)
+    keep_path = os.path.join(ROOT, "work", "hot_keep.txt")
+    if heat and os.path.exists(keep_path):
+        with open(keep_path, encoding="utf-8") as f:
+            keep = {ln.strip() for ln in f if ln.startswith("f_")} & set(fn_size)
+        print(f"make_hot_split: {len(keep - selected)} functions of {keep_path} kept hot beyond the static choice")
+        selected |= keep
+    if heat:
+        for f, n in heat.items():
+            if n < measured_min or f not in fn_size or f in selected:
+                continue
+            (tier_a if fn_size[f] <= MEASURED_O2_MAX else tier_b).add(f)
+        static_sel = set(selected)
+        selected |= tier_a
+        heat_total = sum(heat.values())
+
+        def share(fs):
+            return 100.0 * sum(heat.get(f, 0) for f in fs) / max(1, heat_total)
+        print(f"make_hot_split: Biggoron's Forge from {heat_path}: {len(tier_a)} measured functions into the -O2 pieces "
+              f"({sum(fn_size[f] for f in tier_a) / 1e6:.1f} MB, {share(tier_a):.1f}% of the measured time), {len(tier_b)} "
+              f"with the float fast paths in place ({sum(fn_size[f] for f in tier_b) / 1e6:.1f} MB, {share(tier_b):.1f}%); "
+              f"the static choice holds {share(static_sel):.1f}%")
+    else:
+        print(f"make_hot_split: no measured heat ({heat_path}): the static choice alone")
+    pieces = 16 if heat else 8
+
+    touched_chunks = sorted({fn_file[f] for f in selected} | {fn_file[f] for f in tier_b})
     total_hot_bytes = sum(fn_size[f] for f in selected)
     print(
         f"make_hot_split: selected {len(selected)} hot functions "
@@ -189,6 +244,8 @@ def main():
             if name in selected:
                 hot_bodies[name] = fpx_replace_re.sub(r"a64_fpx_hot_\1", body)
             else:
+                if name in tier_b:   # (Biggoron's Forge tier B: stays here, its float fast paths inlined)
+                    body = fpx_replace_re.sub(r"a64_fpx_hot_\1", body)
                 kept_parts.append(body)
                 chunk_cost += chunks.fn_cost(len(body))
         new_text = "".join(kept_parts)
@@ -214,7 +271,7 @@ def main():
         for fn in sorted(hot_bodies):
             f.write(hot_bodies[fn])
 
-    split_hot.split(gen, 8)
+    split_hot.split(gen, pieces)
 
     # Pass 5: build work/hot_order.txt (host hot runtime + hot lifted functions + top called functions,
     # clustered by call affinity so callers and callees share i-cache lines and 2 MB iTLB pages)
@@ -236,7 +293,8 @@ def main():
     seed_rank = sorted(
         fn_size.keys(),
         key=lambda f: (
-            0 if f in selected else 1,
+            0 if heat.get(f, 0) >= measured_min else 1 if f in selected else 2,   # (measured first, hottest first)
+            -heat.get(f, 0),
             -(in_calls[f] * 10 + fn_fpx[f] * 3),
             f,
         ),

@@ -630,6 +630,43 @@ the 20 hottest functions (f_801102e0 alone 7%). Proposed next: **Biggoron's Forg
 (research doc s10). Gemini's D:\MS_AI AI bench reviewed (s11): nothing in it for MasterSword's base rate. HOS_SAMPLE_ALL left
 on in the smoke env (free until the .bat runs) for the Temper sample after the Forge.
 
+**Biggoron's Forge (2026-11-14, built 22:19 and deployed to smoke; waiting for its Temper run):** the hot split re-forged from Mask of Truth's measured heat.
+- `scripts/mask_of_truth_hot.py <samples> --write work/measured_heat.txt` writes the heat (per function: samples where it was
+  the innermost game function and the thread ran game code, not a wait's spin).
+- `nx2/make_hot_split.py` reads it (RX_MEASURED_HEAT=<file>|off, RX_MEASURED_MIN=3): measured functions up to 72 KB go into
+  the -O2 hot pieces (tier A: 699, 18.2 MB, 47.4% of Town's measured time); bigger ones stay at -O1 in their chunk with
+  the float fast paths (a64_fpx_hot_*) written in place (tier B: 400, 93.6 MB, 44.3%). 16 hot pieces; hot_order.txt
+  leads with the measured functions. work/hot_keep.txt (the 728 functions of the 11-12 split) always stays hot.
+- Result of the split: Town's measured time in the -O2 pieces 2.9% -> 50.3%. Correction: the 11-12 split has 728 functions
+  (the 1176 counted earlier included declarations); none is lost.
+- **Before re-splitting, `_cold_backup/code_005.c` was stale** (made 11-12, before the 11-14 Scarecrow/floor-web port patched
+  f_80652cb0 in gen): the normal re-split would have restored it and lost the floor web fix. Refreshed from gen (old copy in
+  work/sa/_stale_backups/). Check backups against gen before any future re-split.
+- Rollback: work/sa/_pre_biggoron/ holds the 11-12 hot pieces, the touched chunks as they were, chunk_costs, hot_order.txt,
+  and the old mastersword.exe + maps (the 21:53 Town sample must be read with RX_MAPS=work/sa/_pre_biggoron).
+- Built in 306 s (the 16 hot pieces 5-9 s each at -O2; code_005 and code_041 recompiled). f_801102e0 now at the start of
+  .text (was 384 MB in). Deployed: smoke mastersword.exe (backup mastersword.exe.bak_pre_biggoron); the renderer DLL kept as
+  tested (the rebuilt one differs only by build). Baseline kept: AB_test/log_pre_biggoron_2153.txt (Town-like windows,
+  >=2000 draws: 45.6 fps with the sampler off, 44.8 on) and AB_test/mask_of_truth_town_2153_pre_biggoron.txt (read it with
+  RX_MAPS=work/sa/_pre_biggoron).
+- Temper run: Town ~1 min without the sampler (the fps comparison), then "Mask of Truth - sample 30 seconds.bat" (the profile
+  comparison), then two other areas for correctness.
+
+**Next phase, agreed plan (2026-11-14), in order:**
+1. Temper of Biggoron's Forge (Town + Mask of Truth sample + two other areas for correctness). Nothing stacks before it.
+2. PGO on the hot pieces: `RX_PGO=gen` instrumented build, a profile session (Town, Field, Kokiri, a dungeon; `HOS_PGO=<path>`
+   with `<path>.reset` / `<path>.dump` to leave loads out), `python -I nx2/pgo_pieces.py <in> <out> 16` (16 pieces now), then
+   `RX_PGO=<merged .prof>`. Tier B (big functions in the chunks) gets no profile.
+3. `-mllvm -hot-cold-split=true` as its own A/B after PGO (needs the profile; expect small).
+4. Profile-guided grouping of the hot pieces (split_hot groups by call counts now: 2566 of 3754 hot calls stay in one piece);
+   scoped ThinLTO only if hot cross-piece calls still show after that (object keys, /order and PGO all touched).
+5. In parallel (DLL only): take_capture / submit_memory_work on the game's submitting thread (~1 ms a frame on MainThread):
+   measure its parts per thread (memsync_part_ns), then fewer bytes (write-tracked pages) or off the game thread.
+- Dropped with reasons: f_800998a0's 20 us sleep-poll (the job wait itself; the host yields precisely; upstream measured a
+  shorter poll: no change; workers are 86% idle waiting for jobs, not for cores) and 1:1 P-core HOS_PIN (4-5 of 8 P-cores
+  busy; ~14-16 threads want P-cores; hard pins remove the scheduler's freedom the soft placement was tuned to keep; would need
+  an ETW trace showing harmful migration first).
+
 ---
 
 ## 5. Releases
