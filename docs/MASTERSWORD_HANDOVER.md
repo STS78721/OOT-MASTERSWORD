@@ -152,6 +152,20 @@ Deployed to the smoke folder on 2026-11-14 (exe + both DLLs). The pre-port backu
 played**, so the first run should check: shader preparation finishes, Zora's Domain ice and water, Kokiri lighting, the frame
 rate, and occlusion culling (nothing popping or missing).
 
+### Findings 2026-11-14 (user tests)
+
+- **Ghost clones with DLSS frame generation come from Upscaling = Off.** In that mode DLSS-G gets the renderer's own
+  depth/motion (camera reprojection + actor motion only), and characters it can't follow leave a copy. With **Upscaling = DLSS
+  SR** the clones are gone. Recommended: DLSS SR with frame generation (DLAA quality keeps native resolution if fidelity is the
+  goal). `RX_VK_ACTOR_LOG=1` logs the draws actor motion turns away (mostly static scenery; some mesh-shader draws with large
+  palettes, likely crowds/foliage, which actor motion cannot follow).
+- **NVIDIA Profile Inspector → "Present Method (Vulkan/OpenGL)" = "Preferred layered on DXGI Swapchain"** gave a small fps gain:
+  Vulkan presents go through a DXGI flip-model swapchain (independent flip, Windows' game presentation path). It is a driver
+  profile setting the user sets; we do not change it for them. Worth a line in the README/launcher tips.
+- **The fps drop is not the occlusion queries**: with `RX_VK_OCC_QUERIES=0` four runs still read 50–53 fps. Pre-port runs
+  already ranged 52–62 by area. Remaining suspect: handle tables (`RX_VK_HANDLE_TABLES=0`, costs one ~140 s shader
+  re-preparation); the clean test is the same spot with the `*.bak_pre_longshot_ports` DLL.
+
 ---
 
 ## 5. Releases
