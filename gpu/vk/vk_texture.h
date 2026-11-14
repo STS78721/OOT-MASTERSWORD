@@ -43,7 +43,7 @@ struct Texture {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
-    bool bc = false;          // (and kept as BC3 or BC1: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc = false;          // (and kept as BC3, BC7 or BC1: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
     bool bc_resized = false;  // (hookshot-amd: its BC image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     uint8_t bc1 = 0;          // (0 not decided, 1 kept BC3 because alpha was seen, 2 kept as BC1)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
