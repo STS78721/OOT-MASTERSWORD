@@ -558,6 +558,12 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   6 at the default segment and at 96, clamped to the ceiling. Its learned table is now v3, so every area re-learns once
   (~6 s of trials the first time in each area). `tests/test_slate3_step3.py` updated (`b56d25bc`). **Not yet play-tested.**
   Watch the log for `Hero's Shade (area ...): latched winner (threads N, seg M)` with N = 5 or 6 in Town.
+- **Learning run (20:26):** Hero's Shade re-learned (v2 table ignored) and now really explores: winners **6 workers / seg 96**
+  in area `64e5593ca0762147` (21.63 -> 18.63 ms), **5 / 160** in `8a8100438bf3f2d4` (17.05 -> 16.33); **Town
+  (`1fcaa47aa314283b`) kept 4 workers, seg 240** (22.63 -> 20.88 ms); other areas 4 workers at seg 64/96/240. Some wins are
+  0.1-0.9 ms (possibly noise while walking). The run's own fps was lower (52.8 / 51.8 / 38.0 by stretch): the first visit to
+  every area ran 9 trial combinations, some bad on purpose. **The table is saved in the Slate; the next run applies the
+  winners without trials and is the real comparison** (vs 19:32: Field ~57, Town ~48). Log: `AB_test/log_shade_learning_*.txt`.
 
 ### Town's recording time (from the 20:11 log) and the profiling run
 
