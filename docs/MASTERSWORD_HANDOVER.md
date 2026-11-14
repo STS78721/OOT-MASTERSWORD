@@ -7,6 +7,11 @@ still open.
 
 ---
 
+**Companion document:** `docs/MASTERSWORD_TECHNIQUES.md` is the playbook of MasterSword's techniques (hybrid-CPU
+placement, parallel replay sizing, memory census, the memory pack, resident floor, import ahead), written so other games
+and recompilation projects can implement them, with what came from Hookshot and what is MasterSword's own. Keep it in
+step with this file.
+
 ## 1. Locations
 
 | What | Where |
@@ -280,3 +285,8 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
    the memory pack is the headline).
 7. Visual bugs: duplicate items flickering, skybox and Link colour at Hyrule Castle.
 8. Keep watching Longshot (`git fetch longshot`, then `git log mastersword-fg..longshot/main`) for perf and fix commits.
+9. **Next investigation (after the import-ahead run): console-style data delivery** (playbook, last section). PS5 Kraken
+   -> compress the memory pack (zstd/LZ4 on the E-cores, or GDeflate on the GPU); Xbox BCPack -> cache the GPU's BC1/BC3/BC7
+   re-encodes of ASTC textures on disk, compressed, so later loads skip the encode; Xbox Advanced Shader Delivery -> nothing
+   game-derived may ship, so make the local start-up preparation incremental instead (a driver update shouldn't mean
+   preparing from scratch). Measure first: how long texture re-encodes and pack reads take in the log.
