@@ -548,6 +548,15 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   the game's wait. **Late reads are off** (no gain, a frame of staleness). **The lever for Town is the replay's speed.**
   Logs: `AB_test/log_readback_late_three_*.txt`.
 
+### Town's recording time (from the 20:11 log) and the profiling run
+
+- Town frames: ~2,500 draws held 60 fps with ~7 ms of recording; 3,064 draws took 8.5 ms (54.8 fps). The parallel segments
+  account for only ~2 ms of a heavy command buffer (5 segments on 4 threads); the rest of the 6.7-8.5 ms is serial on the
+  replay thread (the dry pass, the frame's five other command buffers, memory work, submission).
+- **Profiling run set up:** `RX_VK_PROF_FINE=1` in the env file (per-NVN-operation and per-draw-section timers; their own
+  cost lowers fps a little, so that run's fps doesn't count). Goal: what the serial replay time is, then make the serial part
+  smaller or parallel.
+
 ---
 
 ## 5. Releases
