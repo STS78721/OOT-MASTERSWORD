@@ -134,10 +134,19 @@ threads, opt-in and reversible. The handbook is written so another assistant (e.
 | `6ce8ca3a` (#2226) | `132ded3b` | Big ASTC textures as **BC7**, opt-in `RX_VK_ASTC_BC7=1` | Same VRAM as BC3, better gradients. With it on, BC1 is skipped. Commented line in `hookshot_env.txt` |
 | `7315957c` (#107) | `5634ba55` | Clustered lights sample their own shadow maps (handle tables as descriptor arrays) | Fixes dark stair-step blocks on Zora's ice/water and green blocks on snow. `RX_VK_HANDLE_TABLES=0` turns it off. **Shader cache stamp bumped ("HT01"): one longer "preparing shaders" on the next launch** |
 
-**Deferred: `ae96bad3` quick pipelines.** It draws with an unoptimized stand-in pipeline while the full build compiles, so a new
-shader never hitches. It depends on subsystems this tree lacks: `driver_faults.h` quarantine, `fallback_size_policy.h`,
-`translate_wait.h`, the use-counters census and Longshot's newer job queue (`jobs_wait` returning bool, `on_failure`). Porting
-it means porting those first. This is worth doing if pipeline-compile hitches show up in the logs (`slow` lines naming a pipeline).
+| `ae96bad3` (#234) | `f1ee63a7` | **Quick pipelines**: `RX_VK_QUICK_MS=8` (off unless set; **on** in the smoke env). A draw whose pipeline is still compiling gets one built without the driver optimizer (into no cache), not skipped or waited on | Ported without Longshot's AMD driver-fault gate and cache-only ask (not in this tree). Own test: `tests/test_quick_pipelines_ms.py` |
+| `dfc8fa5e` (#2787) | `e9be4a9f` | **DLSS / FG ghosting**: motion vectors for rigid one-bone models (Navi, props, held items), two-bone skinning (Navi's wings) and Link's fifth-bone single influence | Merged into this tree's `temporal_skin_check` |
+
+Checked and already in this tree: `5cbfead0` reactive mask, `3319e88a` DLSS mip bias, `549a43b5` DLSS kept through
+loading screens, `8b925b67` skinned-draw actor motion, `cd3d5044` DLSS failure latching. Still to port on the FG/DLSS side,
+all small and not ghosting fixes: `1bf4284a` (FG uses the multiplier its sets were made for), `ee29dd55` (V-Sync Auto with
+DLSS-G), `6b2dafef` (DLSS preset settle), `f3dd4486` (DLAA switch waits for the native scene).
+
+**Frame-rate question (2026-11-14):** the first run after the ports read about 4–5 fps lower in heavy scenes (53–54 vs
+56–59). The renderer's CPU per frame was unchanged (submit 8–10 ms), GPU-bound wait was 0, and runs from before the ports
+already varied 52–62 by area, with V-Sync modes switched mid-run. An A/B is set up in `hookshot_env.txt`: the same spot, with
+and without `RX_VK_OCC_QUERIES=0`. If occlusion queries are not the cause, try `RX_VK_HANDLE_TABLES=0`, which means one
+re-translation of about 140 s.
 
 Deployed to the smoke folder on 2026-11-14 (exe + both DLLs). The pre-port backups are `*.bak_pre_longshot_ports`. **Not yet
 played**, so the first run should check: shader preparation finishes, Zora's Domain ice and water, Kokiri lighting, the frame
@@ -186,6 +195,6 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 3. Attack the remaining pool-import hitches (§3).
 4. Try `RX_VK_ASTC_BC7=1` for fidelity and watch VRAM.
 5. Push `mastersword-fg`, then prepare 0.1.9d.
-6. Port quick pipelines once its dependencies are in (§4).
+6. Run the frame-rate A/B (§4) and keep or turn off whichever port costs fps.
 7. Visual bugs: duplicate items flickering, skybox and Link colour at Hyrule Castle.
 8. Keep watching Longshot (`git fetch longshot`, then `git log mastersword-fg..longshot/main`) for perf and fix commits.
