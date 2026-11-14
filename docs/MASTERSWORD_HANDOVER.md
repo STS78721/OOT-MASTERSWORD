@@ -472,6 +472,29 @@ Truth (exe export + renderer), the Owl Statue (10 saves), the resident floor, th
 **Next:** one Field -> Town -> Field run on this build for a real log (`hookshot_log.txt` is back), then verify Gemini's
 other two suspects and the base-fps plan in its notes (§5: ParLock contention, per-draw descriptor/ubo cost in Town).
 
+### Run 19:22 (the fixed build): logs back, mirrors given back, but base fps still declines over a session
+
+- Build confirmed: `hookshot_log.txt` written (windowed exe), start-up preparation ran (40 s once, refilling the cache),
+  Song of Time 14,355 shaders made ready, 11 area-picture matches.
+- **Mirror fix works as designed:** 61 mirrors (880 MB) given back; mirror memory held at 1.4-2.0 GB. The count still rose
+  127 -> 359 (turnover, or re-creation churn: not yet told apart).
+- **Base fps still fell by stretch (split at loading screens):**
+
+  | Stretch | fps | Renderer submit | GPU | Longest vcore wait | Capture texture pages / capture | Free RAM |
+  |---|---|---|---|---|---|---|
+  | 1 | 55.8 | 6.2 ms | 5.9 ms | 226 ms | 2,172 | 6.6 GB |
+  | 2 | 51.6 | 6.7 ms | 5.8 ms | 510 ms | 11,431 | 5.3 GB |
+  | 3 | 47.6 | 8.6 ms | 6.1 ms | 253 ms | 12,331 | 5.0 GB |
+  | 4 (return) | 38.7 | 6.9 ms | 5.4 ms | 825 ms | 16,958 | 4.1 GB |
+
+  Renderer and GPU flat; the growth is game/host-side. **Gemini's suspect B confirmed in the data:** capture texture pages
+  grow 8x. Mechanism (`vk_memory.cpp` `memory_note_texture_upload`): an upload marks its whole pool (up to 256 MB) as
+  texture storage, so every page the game writes there is shadow-copied each capture; a span only expires after 1,800
+  presents with no upload from it (`publish_tex_spans`).
+- **Next (asked of the user):** two runs of the same route, as-is and with `RX_VK_MIRROR_IDLE_BY_SYNC=1`, to clear or
+  convict the mirror fix. Then, if cleared: narrow texture-storage spans to the textures' own ranges instead of whole pools
+  (no visual change), and measure the shadow copy's time on the game's thread.
+
 ---
 
 ## 5. Releases
