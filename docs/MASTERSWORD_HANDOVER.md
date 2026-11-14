@@ -588,6 +588,15 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   smaller or parallel.
   (Result: see the Hero's Shade ceiling entries under the readback A/B.)
 
+### Research: idle hardware for a CPU-bound game (NPU, Tensor cores, GPU compute, E-cores)
+
+`docs/MASTERSWORD_HARDWARE_OFFLOAD_RESEARCH.md` (the user's request: use the NPU / Tensor cores beyond SR and FG). This PC
+exposes `VK_EXT_device_generated_commands`, `VK_EXT_descriptor_buffer`, cooperative matrix (Tensor cores from Vulkan) and
+multi-draw; the NPU (Intel AI Boost) is present. In a Town frame the GPU is ~70% idle, the NPU 100%. Verdict: the real
+prize is **GPU-driven submission ("Din's Fire")** built on **bindless descriptors**, using the GPU's idle compute to take
+over most per-draw CPU recording; the NPU fits as an advisory predictor ("Nayru's Love"); Tensor cores help only GPU work.
+Order: measure Vulkan call types in Town -> bindless descriptors -> Din's Fire -> Nayru's Love. Not built yet.
+
 ---
 
 ## 5. Releases
