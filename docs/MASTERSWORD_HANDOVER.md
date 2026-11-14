@@ -657,6 +657,22 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   45.6 -> 47.0 fps, but the runs stood in different spots (Town's area averaged 2186 draws before, 1830 after; per-area
   game/host changes -6% to +13% on single samples), and the job workers were busy 22% -> 24% (the float work now inside the
   functions; more actors where the second run stood?). Needs a same-scene A/B: a fixed spot, both exes, alternated.
+- **Same-scene A/B (overnight 2026-11-14, user-approved headless bench, "Hookshot Test - bench"): the Forge is SLOWER.**
+  Old exe 22.26 ms a frame (44.9 fps, 2 runs), Forge 22.98 ms (43.5 fps, 2 runs): +0.72 ms (+3.2%); every Forge run slower
+  than every old run; the per-area game/host part +0.4-0.6 ms, recording unchanged. (The Temper sample's busier job workers,
+  22% -> 24%, were this, not location.) Smoke folder put back on the old exe (the Forge one kept as
+  mastersword.exe.biggoron_v1_slower). Suspect: tier B, the float fast paths inlined into 400 giant -O1 functions, +11 MB of
+  code (416 vs 405 MB).
+- **V1 = tier A only (now the default; RX_MEASURED_TIER_B=1 brings tier B back): a measured win.** Pooled at equal draws
+  (2779; 0.365 ms per 100 draws): old 22.16 ms (4 runs, stdev 0.12), first Forge 22.74 ms (+2.6%), **V1 21.71 ms (-2.0%,
+  45.1 -> 46.1 fps)**; both V1 runs outside the old range. Clean (no faults). **Deployed to smoke** (mastersword.exe = V1,
+  md5 9199f6c5; the old one stays as mastersword.exe.bak_pre_biggoron). bench_compare.py now also prints equal-draw means.
+- **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
+  the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
+  mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),
+  scripts/bench_compare.py (frame time over presents 4800-12000, 2500+ draws). The bench copy: romfs/image.bin hard-linked,
+  caches copied, user_pristine restored before each run, Hero's Shade off. Route: newest autosave "Hyrule Castle Town",
+  "37:A,40.5:A,51.5:A,54:A,57:A,64.5:LUP/7000" -> standing in the market square (~2700-2900 draws, ~45 fps). Logs: stderr.
 
 **Next phase, agreed plan (2026-11-14), in order:**
 1. Temper of Biggoron's Forge (Town + Mask of Truth sample + two other areas for correctness). Nothing stacks before it.

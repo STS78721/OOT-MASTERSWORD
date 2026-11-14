@@ -198,10 +198,15 @@ def main():
         print(f"make_hot_split: {len(keep - selected)} functions of {keep_path} kept hot beyond the static choice")
         selected |= keep
     if heat:
+        # (RX_MEASURED_TIER_B=1: tier B too. Measured overnight 2026-11-14 in Town at equal draws: with it 2.6% slower than no Forge, +11 MB of code; tier A alone 2.0% faster)
+        use_b = os.environ.get("RX_MEASURED_TIER_B", "0") != "0"   # (default off: measured slower)
         for f, n in heat.items():
             if n < measured_min or f not in fn_size or f in selected:
                 continue
-            (tier_a if fn_size[f] <= MEASURED_O2_MAX else tier_b).add(f)
+            if fn_size[f] <= MEASURED_O2_MAX:
+                tier_a.add(f)
+            elif use_b:
+                tier_b.add(f)
         static_sel = set(selected)
         selected |= tier_a
         heat_total = sum(heat.values())
@@ -214,7 +219,7 @@ def main():
               f"the static choice holds {share(static_sel):.1f}%")
     else:
         print(f"make_hot_split: no measured heat ({heat_path}): the static choice alone")
-    pieces = 16 if heat else 8
+    pieces = int(os.environ.get("RX_HOT_PIECES", "16" if heat else "8"))
 
     touched_chunks = sorted({fn_file[f] for f in selected} | {fn_file[f] for f in tier_b})
     total_hot_bytes = sum(fn_size[f] for f in selected)
