@@ -236,6 +236,27 @@ Cache 100 GB / Pre-compile High: fine. PrimoCache would not help (a disk block c
 - Every switch named here goes in the smoke folder's `hookshot_env.txt`; the file says what each line was for and its result.
 - Build/deploy recipe: §2. The memory file `mastersword-build-workflow.md` (Claude's memory) has the same.
 
+### MasterSword Triforce Shader Delivery and the import-ahead result (2026-11-14, later)
+
+- **Import ahead (`RX_VK_BG_IMPORT=play`) failed; it's off.** Run 10:38: only 32 of ~380 chunks were imported ahead in
+  time (351 dropped), and the background page pinning slowed the game's own imports (avg 34 -> 43 ms, worst 51 -> 290 ms).
+  Loads took much longer, with big stutters after them. Commented out in `hookshot_env.txt`. Don't retry it in this form.
+- **The pack had a load-time cost.** Every pipeline build read its shader back and the driver parsed it again: 53,000 reads,
+  3.4 GB a session. The area changes' slowest frames spent 924 ms in pipelines against 417 ms before the pack.
+- **Texture re-encodes are cheap** (3 slow uploads, 127 ms a session), so a BCPack-style texture cache isn't worth it now.
+- **MasterSword Triforce Shader Delivery** (`gpu/vk/vk_mempack.cpp`, commit 724087f9), on by default:
+  - **Power: the pack.** As before (`RX_MEM_PACK=0` off).
+  - **Wisdom: the hot cache.** Modules of recently used shaders are kept, up to `RX_TRIFORCE_HOT_MB` (default 1024; 0 none),
+    in an LRU of the modules no build holds. `StageCode` holds a reference (`hot_key`) and releases it in its destructor
+    (`triforce_release`), so a module is never destroyed during a create. A miss reads the pack, makes the module outside
+    the lock, and keeps the other thread's module if one raced in.
+  - **Courage: the warm-up.** When the pack opens, a background-priority thread (`THREAD_MODE_BACKGROUND_BEGIN`, E-cores, its
+    own `FILE_FLAG_SEQUENTIAL_SCAN` handle) reads the pack front to back in 8 MB reads into Windows' file cache, only when
+    free RAM is at least twice the pack's size (`RX_TRIFORCE_WARM=0` never).
+  - Census lines to check: `Triforce hot cache: N modules (X MB of 1024), H builds served from it, M made, E evicted`, and
+    `Triforce Shader Delivery: warm-up read ...`. **Not yet play-tested.** Compare area-change frames against the 10:21 log
+    (pipelines 924 ms) and the pre-pack A log (417 ms).
+
 ---
 
 ## 5. Releases
@@ -273,8 +294,8 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 
 ## 7. Open items, in priority order
 
-1. Play-test `RX_VK_BG_IMPORT=play` (§4, the memory work): fewer `a binding waited` lines and no new slowdown or hang.
-   If it hangs or slows down, comment it out.
+1. Play-test Triforce Shader Delivery: area changes as fast as before the pack or faster, no missing objects, the hot cache
+   hit rate in the census line. If loads get slower, try `RX_TRIFORCE_WARM=0`, then `RX_TRIFORCE_HOT_MB=0`.
 2. If imports still hitch: find what makes them ~34 ms with RAM free (commit/`VirtualQuery` on write-watch memory, the
    driver's page pinning) and make it cheaper, or import further ahead.
 3. Frame rate: warm A vs warm B (A/B kit) to settle whether the Longshot ports cost ~3 fps; suspect the handle tables

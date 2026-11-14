@@ -14,7 +14,8 @@ What came from where:
 | Memory census | **MasterSword** (2026-11-14) |
 | Resident floor | **MasterSword** (2026-11-14) |
 | The memory pack (shader code on NVMe, handed to the driver inline) | **MasterSword** (2026-11-14). Hookshot and its successor Longshot keep every shader module for the session |
-| Import ahead in play | **MasterSword** (2026-11-14, under test) |
+| MasterSword Triforce Shader Delivery (the pack + a hot module cache + a warm-up) | **MasterSword** (2026-11-14) |
+| Import ahead in play | **MasterSword** experiment, measured worse and switched off |
 | Reserved core for the replay thread | Hookshot (upstream), restored in MasterSword |
 | X3D cache-CCD placement | Hookshot (upstream) |
 
@@ -135,6 +136,26 @@ driver's compiled output; the pack only removes the long-lived source copy.
 Code: `gpu/vk/vk_mempack.cpp` (`stage_set_code`, `stage_bind`), `gpu/vk/vk_shader.h` (`Stage::code_at`, `code_words`,
 `StageCode`), and the build sites in `gpu/vk/vk_draw.cpp`.
 
+### 4b. MasterSword Triforce Shader Delivery: the pack, made fast
+
+The pack alone has a cost: every pipeline build reads its shader back and the driver parses it again (53,000 reads,
+3.4 GB a session), and area changes' pipeline time doubled. Triforce Shader Delivery keeps the pack's RAM saving without
+that cost, in three parts:
+
+| Part | What | How | Switch |
+|---|---|---|---|
+| **Power** | The pack | Every distinct shader stored once on the NVMe, content-addressed (§4) | `RX_MEM_PACK=0` |
+| **Wisdom** | A hot module cache | Modules of shaders used recently are kept, up to a RAM budget (1 GB), and the least recently used one that no build holds is destroyed. A pipeline build takes a reference and gives it back when its create call has returned, so a module is never destroyed under a build. An area's builds reuse one parse | `RX_TRIFORCE_HOT_MB=<MB>`, 0 none |
+| **Courage** | A warm-up ahead of need | At start-up, a thread at background priority (low I/O and memory priority, on the E-cores, its own sequential-scan handle) reads the pack front to back in 8 MB reads, so first reads in an area come from Windows' file cache at the drive's sequential speed. Only when free RAM is twice the pack's size; those pages are the first Windows evicts | `RX_TRIFORCE_WARM=0` |
+
+The idea in one line, for other projects: **store all shaders once on fast storage, keep only a bounded hot set parsed in
+the driver, and stream the cold set in big sequential reads before it's needed.** That's the console data-delivery idea
+(below) applied to shaders with the PC's own pieces: an NVMe, the OS file cache, and a bounded cache.
+
+**What didn't work: importing memory ahead in the background.** Mapping new game memory for the GPU on a background thread
+before the first draw asked for it (§6) made imports slower, because the driver's page pinning contended with the game's.
+Loads got longer. It's switched off, and kept here as a measured negative result.
+
 ## 5. The resident floor: protect the game's RAM, softly
 
 Windows trims every process's working set under pressure, and a game whose threads touch trimmed pages stalls on each fault.
@@ -155,7 +176,9 @@ creates it, before any draw asks. Lessons from the attempt that failed first:
 - **Only the part that will be used:** the first chunk, not the whole pool.
 - **Cap the queue** (16 here), so a burst of allocations can't flood the thread.
 
-Status: under test. Code: `gpu/vk/vk_memory.cpp` (`memory_pool_created`, `bg_main`).
+Status: **measured worse and switched off** (only 32 of ~380 chunks imported in time; the game's own imports slowed
+from 34 to 43 ms on average, 290 ms worst). The lesson: background page pinning competes with the foreground's. Code:
+`gpu/vk/vk_memory.cpp` (`memory_pool_created`, `bg_main`).
 
 ## 7. Method notes that made the difference
 
