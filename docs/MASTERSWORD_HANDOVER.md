@@ -564,6 +564,12 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   0.1-0.9 ms (possibly noise while walking). The run's own fps was lower (52.8 / 51.8 / 38.0 by stretch): the first visit to
   every area ran 9 trial combinations, some bad on purpose. **The table is saved in the Slate; the next run applies the
   winners without trials and is the real comparison** (vs 19:32: Field ~57, Town ~48). Log: `AB_test/log_shade_learning_*.txt`.
+- **Run 20:37 found a second bug:** none of 20:26's area keys came back; every area re-ran its trials (lighter stretches 52.7
+  fps vs ~56-57 before, heavy 47.3). Cause: Hero's Shade keys an area by `picture_sig(head)`, and the Sheikah Slate replaced
+  a re-seen area's whole picture, head included (the first 48 programs vary a little each visit). **Fixed (commit after
+  `c64a3f62`, DLL only, backup `*.bak_pre_stable_sig`):** a matched picture keeps its head and refreshes only what it makes
+  ready. The next run may re-learn once more (keys from 20:37's mixed heads), then areas should keep their winners. Logs:
+  `AB_test/log_shade_relearned_*.txt`.
 
 ### Town's recording time (from the 20:11 log) and the profiling run
 
