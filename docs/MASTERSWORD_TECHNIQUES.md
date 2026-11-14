@@ -277,6 +277,20 @@ visible as white flashes.)
 
 ---
 
+## Future direction: a learned predictor (ML) for shader and streaming delivery
+
+The user asked whether a CPU's NPU or a GPU's Tensor cores could drive an "ML Shader / Streaming Delivery" system, as ML
+drives super resolution and frame generation. **Verdict for MasterSword today: not worth it.** Measured: in-play shader builds
+are already near zero (Triforce, the Slate, start-up preparation); the remaining frame cost is CPU work, Vulkan command
+recording (~2.8 us per draw) and the game's own code, which only CPU cores can run (an NPU runs neural networks, not driver
+calls or recompiled game logic), and the Tensor cores already run DLSS SR and frame generation. A model would mostly re-learn
+what the Sheikah Slate's decayed scores and area pictures already predict, for fractions of a millisecond, at the price of a
+runtime (OpenVINO / DirectML) and a per-game model.
+
+**Where it could pay, in another port or later:** a game whose delivery work is *not* already near zero (heavy in-play
+shader compiles, streaming that misses), where predicting the next area or asset earlier than a statistical cache can buys
+real time. The Slate's file (scores, area pictures, per-area timings) is the natural training data for such a predictor.
+
 ## Future investigations: what consoles do for data delivery
 
 PS5 and Xbox Series X|S move data with dedicated hardware and shipping formats. Each has a PC-side analogue worth

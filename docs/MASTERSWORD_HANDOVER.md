@@ -570,6 +570,13 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   `c64a3f62`, DLL only, backup `*.bak_pre_stable_sig`):** a matched picture keeps its head and refreshes only what it makes
   ready. The next run may re-learn once more (keys from 20:37's mixed heads), then areas should keep their winners. Logs:
   `AB_test/log_shade_relearned_*.txt`.
+- **Runs 20:44 and 20:48 (stable keys):** 20:44 re-learned 5 areas; **20:48 ran trials in only 1 area** (the rest reused
+  their winners: the key fix works). Results vs 19:32: heavy areas' recording 8.5 -> **7.4 ms** but fps unchanged (48.0 ->
+  48.1: Town is paced by its frame's GPU work finishing); **lighter areas worse, 57.1 -> 53.9 fps (59+ 57% -> 24%)**,
+  recording 5.8 -> 6.8 ms, likely winners latched from noisy trials while walking. **Hero's Shade is not a proven win.**
+  Next: one run with `RX_HEROS_SHADE=0`; if the lighter areas return to ~57 fps with no loss in Town, keep it off until its
+  trials are noise-resistant (more samples, a stationary-camera gate, a margin before a winner replaces the default).
+  Logs: `AB_test/log_shade_stable1_2044.txt`, `AB_test/log_shade_stable2_2048.txt`.
 
 ### Town's recording time (from the 20:11 log) and the profiling run
 
