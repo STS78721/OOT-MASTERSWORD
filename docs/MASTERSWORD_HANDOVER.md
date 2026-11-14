@@ -297,6 +297,32 @@ comments, log lines, switches' docs and these documents). Upstream Hookshot/Long
   - The census line now ends with `Song of Time made N ready; Mirror Shield checked M codes`.
 - **The pack's 3.6 GB isn't a limit:** it's every distinct shader the game has. RAM use is governed by the hot cache.
 
+### MasterSword Sheikah Slate: the self-training memory (2026-11-14, latest; not yet play-tested)
+
+The user's request: the system should be self-aware and train itself, keeping snapshots so a cold boot doesn't start over.
+Measured first (11:08 run, the first with Lens of Truth): start-up shaders 5.6 s (warm caches), pack warm-up 4 s in the
+background, Lens of Truth answered 83 of 128 imports, Wisdom shrank 1 GB -> 512 MB with free RAM, Song of Time 0 (nothing
+saved yet).
+
+`gpu/vk/vk_mempack.cpp` (commit 4475506a), `mastersword_slate.bin` in the game folder, saved every 1800 frames and when the
+window closes (`slate_close` from `vk_main.cpp`):
+- **Scores:** every shader use (hot-cache hit or module made, `slate_note_use` from `stage_bind`, called after `hot_mu`
+  is released) is counted; each save gives score = old x 0.75 + this session's uses. Best 65,536 kept; under 0.05 forgotten.
+- **Area pictures:** `slate_frame` (each frame, from `texture_frame` in `vk_texture.cpp`, with the texture counter): more than
+  8 textures made in one frame means an area streams in, and a picture begins of the codes first used in the next 900
+  frames (up to 4096). When an area streams again, its first 24 codes are matched against every picture's first 48; the
+  best match of at least 12 makes that picture's remaining codes ready on an E-core thread (`make_ready`). A new picture
+  replaces one with half its head in common; 64 pictures at most, the least recently seen dropped. No scene number needed.
+- **Wisdom's settled budget** is saved and is the next start's budget.
+- **Song of Time** now replays the Slate's best-scored codes at a start (90% of the budget).
+- Damaged with the pack: the Mirror Shield deletes `mastersword_slate.bin` with the pack.
+- Log lines: `Sheikah Slate: session N; X shaders it knows the worth of, Y area pictures; Wisdom starts at Z MB`,
+  `Sheikah Slate: an area streams in; it matches a picture ...`, `Song of Time (...): N shaders made ready ... in M ms`, and
+  the census line's `Sheikah Slate made N ready (P area pictures replayed, T taken)`.
+- Switches: `RX_SLATE_PICTURES=0` (no pictures), `RX_TRIFORCE_SONG=0` (no replay at start). Delete the file to make it forget.
+- To test: 2-3 sessions through the same areas; from the second on, area changes should show picture matches and fewer
+  `made` modules in the census.
+
 ---
 
 ## 5. Releases
@@ -334,7 +360,7 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
 
 ## 7. Open items, in priority order
 
-1. Play-test Lens of Truth and the Triforce upgrades: import times (the `vk: import` breakdown lines' `commit+properties`
+1. Play-test the Sheikah Slate over 2-3 sessions (above), then Lens of Truth and the Triforce upgrades: import times (the `vk: import` breakdown lines' `commit+properties`
    should be ~0), the `Lens of Truth` counts, Song of Time's start-up line, Wisdom's budget changes, no Mirror Shield alarms.
 2. If imports still hitch: the driver's pinning half (5-35 ms). Fewer, larger imports at quiet moments, or reusing pinned
    memory, without background pinning during play (that failed).

@@ -18,6 +18,7 @@ What came from where:
 | Import ahead in play | **MasterSword** experiment, measured worse and switched off |
 | MasterSword Lens of Truth (a commit bitmap instead of VirtualQuery) | **MasterSword** (2026-11-14) |
 | Triforce upgrades: Wisdom adaptive, Song of Time, Mirror Shield | **MasterSword** (2026-11-14) |
+| MasterSword Sheikah Slate (the self-training memory, area pictures) | **MasterSword** (2026-11-14) |
 | Reserved core for the replay thread | Hookshot (upstream), restored in MasterSword |
 | X3D cache-CCD placement | Hookshot (upstream) |
 
@@ -173,6 +174,23 @@ Loads got longer. It's switched off, and kept here as a measured negative result
 
 For other projects: **a persistent cache needs a budget that follows the machine, a memory of what was hot, and a
 self-check that turns corruption into a rebuild, not a crash.**
+
+### 4e. MasterSword Sheikah Slate: a cache that trains itself and survives cold boots
+
+A shader cache that only knows "what was used last" starts cold after every boot and forgets areas you haven't visited lately.
+The Sheikah Slate is a small file of learned state, saved every 30 s and on exit:
+
+- **It learns what matters across sessions:** each shader's score is old x 0.75 + this session's uses, so long-term favourites
+  rise and abandoned ones fade. At start, Song of Time pre-builds the best-scored ones in the background.
+- **It takes pictures of areas without knowing the game:** a burst of new textures marks an area streaming in; the shaders
+  first used in the next 15 s are that area's picture. On a later burst, the first 24 shaders seen are matched against the
+  album, and a good match gets the rest of the area's shaders ready ahead, on an E-core thread. An area is recognised by what
+  it draws, so this works for any game.
+- **It remembers its own tuning** (Wisdom's settled budget), so it doesn't re-learn the PC's RAM each time.
+- **It's damaged with the data it describes:** the Mirror Shield wipes the Slate together with a damaged pack.
+
+For other projects: **persist the learned state, not just the data; score with decay; and key snapshots by behaviour (what
+gets drawn) when you can't see the game's state.**
 
 ## 4d. MasterSword Lens of Truth: know your own memory instead of asking the OS
 
