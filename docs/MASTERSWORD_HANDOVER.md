@@ -512,6 +512,21 @@ other two suspects and the base-fps plan in its notes (§5: ParLock contention, 
   GPU only ~5 ms. Next: Town's per-draw cost (descriptors, commands, ParLock contention: 3,000+ draws) and what the game's
   own threads spend there (Gemini's notes §5). Unverified suspect left: the 3,500-texture ceiling (suspect C).
 
+### Town base fps: the measured breakdown (run 19:32) and the next step
+
+- Gemini's Temper 3 per-area lines: **game/host 11-15.5 ms in every area**, renderer submit 4-9.5 ms; Town ~9.5 + ~12 =
+  ~21-22 ms (47 fps), Field ~5.5 + ~11 (60). GPU ~5-6 ms everywhere: CPU-bound on both sides.
+- **Lock contention is not it:** outside loading screens the parallel recording threads wait ~0.1 ms per command buffer on
+  locks (BufBind, TexTouch, Targets, PassMarks, TexView), one 7 ms spike during a load.
+- **The game-side lever: readback waits.** ~26 GPU-result reads a frame, 5.7 of them wait 0.45-0.63 ms: **~3 ms a frame**
+  of game threads stopped on the GPU (of the ~12 ms game side). Gemini ported Longshot's `RX_VK_READBACK_LATE` (rules:
+  `newest`, or exact range sizes) which reads chosen ranges a frame late; on a Steam Deck the `0x3980` pair was 40-94% of the
+  wait. **Never the exposure meter** (a GPU-added sum the CPU reads and zeroes: read late it double-counts = the white
+  flashes, `vk_replay.cpp` ~3145).
+- **Next:** one Field <-> Town run with `RX_VK_LOG_READBACK_RANGES=1` (in the env file now, measurement only) to see which
+  ranges wait on this PC; then a size rule for the non-exposure ones, A/B'd, watching for flashes or popping.
+- After that, the renderer side of Town (~9.5 ms submit for ~2,700 draws): per-draw descriptor and command cost.
+
 ---
 
 ## 5. Releases
