@@ -156,3 +156,11 @@ no per-frame trace, so a Stone of Agony needs one first.
   profiled which game functions it is. Proposed next measurement: **Mask of Truth**, a sampling profiler of the game's
   threads (a low-priority thread samples their instruction pointers and maps them to recompiled functions), so Deku Scrub
   SIMD and game-side patches can aim at what's really there.
+
+## 9. Mask of Truth (built 2026-11-14)
+
+The sampler existed upstream (`HOS_SAMPLE_ALL`); MasterSword adds the reading of it for the game's side:
+`scripts/mask_of_truth.py` and a timed 30-second sample (`scripts/mask_of_truth_sample.bat`). What its first Town sample
+decides: how much of the main thread's time is the game's own code, the recompiler's helpers (`a64_*`: the float helpers
+are the first suspect), SDK services or waiting; which `f_` functions are the hot ones (for Deku Scrub SIMD or a patch);
+and what runs while the main thread waits (the frame's critical path).

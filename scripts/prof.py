@@ -65,7 +65,7 @@ def main():
     skip = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
     only = sys.argv[4] if len(sys.argv) > 4 else None
     maps = {}
-    for mod in ("hookshot_vk.dll", "hookshot.exe"):
+    for mod in ("mastersword_vk.dll", "mastersword.exe", "hookshot_vk.dll", "hookshot.exe"):   # (MasterSword's, and upstream's)
         mp = os.path.join(BUILD, mod[:-4] + ".map")
         if os.path.exists(mp):
             base = 0x180000000 if mod.endswith(".dll") else 0x140000000

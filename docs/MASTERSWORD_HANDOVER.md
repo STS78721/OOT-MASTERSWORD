@@ -612,6 +612,17 @@ lights' handle tables) are the texture cost; the view lookup is already cached. 
 ("Gossip Stones v2", at most ~1 ms of Town's recording) or **Mask of Truth**, a sampling profiler of the game's own threads
 (~7.5 ms of Town's frame never profiled). See the research doc s8.
 
+**Mask of Truth (2026-11-14, built, waiting for its first sample):** the engine already had an all-thread sampler
+(`HOS_SAMPLE_ALL=<file>` in host/mkw_glue.c: every 2 ms each guest thread's and `mkw_vk*` thread's stack, while `<file>.go`
+exists; it is in the release exe), so nothing was rebuilt. New: `scripts/mask_of_truth.py` (names frames from
+work/sa/build/*.map, which match the deployed exe; game functions are `f_<guest address>`; prints running share by thread,
+the kind of code, game functions inclusive/innermost, SDK services, what the serial threads wait in, the critical path) and
+`scripts/mask_of_truth_sample.bat` (in the smoke folder as "Mask of Truth - sample 30 seconds.bat": waits 10 s, samples 30 s).
+scripts/prof.py and crit.py now know the mastersword binaries. Smoke env: `HOS_SAMPLE_ALL=mask_of_truth_samples.txt` (remove
+after the run). Read it with: `python -I scripts/mask_of_truth.py "<smoke>/mask_of_truth_samples.txt"`. The sampler takes its
+thread list when the .go file appears, so start it in play, not at boot. Rule from Gemini's notes: no automated headless runs
+unless the user asks.
+
 ---
 
 ## 5. Releases
