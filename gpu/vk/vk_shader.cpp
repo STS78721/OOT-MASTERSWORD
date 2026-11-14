@@ -702,6 +702,9 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
 
 } // namespace
 
+/// (vk_mempack.cpp) a module as before the memory pack: its fallback, and RX_MEM_PACK=0
+VkShaderModule make_module_counted(const std::vector<uint32_t>& spirv) { return make_module(spirv); }
+
 /// A word of a stage's constant bank: c0 / c2 the driver's banks, c1 its own constants, c3.. its uniform buffers
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset) {
     if (index == 1) {
@@ -1558,8 +1561,8 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
                 ok = false;
                 break;
             }
-            st.module = make_module(spirv);
-            ok = ok && st.module;
+            const bool made = stage_set_code(st, spirv);   // (MasterSword: in the memory pack, or a module)
+            ok = ok && made;
         }
         if (!ok) {
             static std::atomic<int> logged{0};
@@ -1679,7 +1682,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             Stage st;
             st.nvn_stage = 5;
             st.info = t->program.info;
-            st.module = make_module(spirv);
+            stage_set_code(st, spirv);
             kept.push_back(spirv);
             st.vk_stage = VK_SHADER_STAGE_COMPUTE_BIT;
             st.c1 = csc->c1;
@@ -1732,7 +1735,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                          bi ? " base instance" : "", di ? " draw index" : "");
             }
             v.info = vs->program.info;
-            v.module = make_module(vspirv);
+            stage_set_code(v, vspirv);
             kept.push_back(vspirv);
             v.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
             v.c1 = vsc->c1;
@@ -1753,7 +1756,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Stage f;
                 f.nvn_stage = 1;
                 f.info = fs->program.info;
-                f.module = make_module(fspirv);
+                stage_set_code(f, fspirv);
                 kept.push_back(fspirv);
                 f.vk_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
                 f.c1 = fsc->c1;
@@ -1761,7 +1764,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             }
         }
         for (const Stage& st : p.stages)
-            if (!st.module) throw Shader::LogicError("vkCreateShaderModule failed");
+            if (!stage_has_code(st)) throw Shader::LogicError("vkCreateShaderModule failed");
         if (questions || answers_in) record_answers(p, s);
         st_translated++;
         ptr_diag_log(p.key, csc ? "compute" : fsc ? "graphics" : "vertex");
@@ -1851,7 +1854,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             Stage st;
             st.nvn_stage = bank_stage(*task);
             st.info = task_t->program.info;
-            st.module = make_module(spirv);
+            stage_set_code(st, spirv);
             st.vk_stage = fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_TASK_BIT_EXT;
             st.c1 = task->c1;
             p.stages.push_back(std::move(st));
@@ -1886,7 +1889,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         Stage ms;
         ms.nvn_stage = bank_stage(mesh);
         ms.info = mesh_t->program.info;
-        ms.module = make_module(mspirv);
+        stage_set_code(ms, mspirv);
         ms.vk_stage = fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_MESH_BIT_EXT;
         ms.c1 = mesh.c1;
         p.stages.push_back(std::move(ms));
@@ -1917,7 +1920,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             Stage v;
             v.nvn_stage = 0;
             v.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
-            v.module = make_module(vspirv);
+            stage_set_code(v, vspirv);
             v.c1 = mesh.c1;
             p.stages.push_back(std::move(v));
             const u32 topo{mesh.topology == 3 ? 4u : mesh.topology == 1 ? 0u : mesh.topology};
@@ -1961,13 +1964,13 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             Stage f;
             f.nvn_stage = 1;
             f.info = fs->program.info;
-            f.module = make_module(fspirv);
+            stage_set_code(f, fspirv);
             f.vk_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
             f.c1 = fsc->c1;
             p.stages.push_back(std::move(f));
         }
         for (const Stage& st : p.stages)
-            if (!st.module) throw Shader::LogicError("vkCreateShaderModule failed");
+            if (!stage_has_code(st)) throw Shader::LogicError("vkCreateShaderModule failed");
         record_answers(p, s);   // (task questions not counted: kept conservative)
         (void)questions;
         ptr_diag_log(p.key, task ? "task+mesh" : "mesh");

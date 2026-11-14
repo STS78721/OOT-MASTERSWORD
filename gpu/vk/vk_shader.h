@@ -20,10 +20,27 @@ namespace mkwvk {
 struct Stage {
     int nvn_stage = 0;   // 0 vertex, 1 fragment, 5 compute (what its banks are read for)
     VkShaderStageFlagBits vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
-    VkShaderModule module = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;   // (none while its code is in the memory pack: code_words)
     Shader::Info info;
     std::vector<uint8_t> c1;   // its c1 constants (the code area's tail)
+    // (MasterSword, vk_mempack.cpp) its SPIR-V in the memory pack on disk, handed to the driver inline at each pipeline build
+    // instead of a module the driver keeps for the session (13.5 GB of them, 2026-11-14)
+    uint64_t code_at = 0;
+    uint32_t code_words = 0;
 };
+
+/// (MasterSword) A stage's code: in the memory pack (RX_MEM_PACK, on where the device takes inline SPIR-V), or a module as
+/// before. false: neither could be made
+bool stage_set_code(Stage& st, const std::vector<uint32_t>& spirv);
+inline bool stage_has_code(const Stage& st) { return st.module != VK_NULL_HANDLE || st.code_words != 0; }
+/// What stage_bind reads into: kept alive until the pipeline is created
+struct StageCode {
+    std::vector<uint32_t> words;
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+};
+/// si's code: st.module, or st's SPIR-V read back from the pack into holder and chained inline (after pin_subgroup, which
+/// sets si.pNext). false: the pack could not be read
+bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode& holder);
 
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
 /// recompiler) run over the stage's constant banks and storage buffers as the draw has them. element is the descriptor

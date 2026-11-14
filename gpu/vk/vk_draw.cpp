@@ -1890,6 +1890,8 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
+    std::vector<StageCode> codes(p.stages.size());   // (MasterSword: the memory pack's code, read back for this build)
+    size_t code_i = 0;
     for (const Stage& st : p.stages) {
         // (hookshot: the fallback's dispatches are not graphics stages. Only a fallback program's: with native mesh shaders
         // the task and mesh stages are the pipeline's own, and a mesh program built without them was a fragment stage
@@ -1898,9 +1900,9 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
             continue;
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = st.vk_stage;
-        si.module = st.module;
         si.pName = "main";
         pin_subgroup(si);
+        if (!stage_bind(si, st, codes[code_i++])) return VK_NULL_HANDLE;
         stages.push_back(si);
     }
     // vertex input: the attributes the vertex stage reads; those without a stream read zeros (binding 15)
@@ -5953,9 +5955,10 @@ bool fallback_compute_pipelines(Program& p) {
         any = true;
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        si.module = st.module;
         si.pName = "main";
         pin_subgroup(si);
+        StageCode code;   // (MasterSword: the memory pack)
+        if (!stage_bind(si, st, code)) return false;
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = si;
         ci.layout = p.layout;
@@ -7656,9 +7659,10 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = p.stages[0].module;
         ci.stage.pName = "main";
         pin_subgroup(ci.stage, p.workgroup[0]);
+        StageCode code;   // (MasterSword: the memory pack)
+        if (!stage_bind(ci.stage, p.stages[0], code)) return;
         ci.layout = p.layout;
         if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         VkPipeline pl = VK_NULL_HANDLE;
@@ -7837,12 +7841,13 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                 ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                 ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                ci.stage.module = p.stages[0].module;
                 ci.stage.pName = "main";
                 pin_subgroup(ci.stage, p.workgroup[0]);
+                StageCode code;   // (MasterSword: the memory pack)
+                const bool bound = stage_bind(ci.stage, p.stages[0], code);
                 ci.layout = p.layout;
                 VkPipeline made = VK_NULL_HANDLE;
-                if (cached_compute(&ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
+                if (!bound || cached_compute(&ci, &made) != VK_SUCCESS) made = VK_NULL_HANDLE;
                 std::lock_guard lk(pre->mu);
                 if (!pre->abandoned) p.compute_pipeline = made;
                 else if (made) vkDestroyPipeline(dev.device, made, nullptr);   // (the game went on: it builds its own)
@@ -8090,13 +8095,14 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             // (issue 496: one at a time on Intel. RX_VK_COMPUTE_SERIAL=1 or 0 says so on any GPU)
             static const bool serial = getenv("RX_VK_COMPUTE_SERIAL") ? getenv("RX_VK_COMPUTE_SERIAL")[0] == '1'
                                                                      : dev.props.vendorID == 0x8086;
-            const auto info = [](const Program& q) {
+            // (MasterSword: code holds the memory pack's code for as long as ci is used; bound false: it could not be read)
+            const auto info = [](const Program& q, StageCode& code, bool& bound) {
                 VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                 ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                 ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                ci.stage.module = q.stages[0].module;
                 ci.stage.pName = "main";
                 pin_subgroup(ci.stage, q.workgroup[0]);
+                bound = stage_bind(ci.stage, q.stages[0], code);
                 ci.layout = q.layout;
                 static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
                 if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
@@ -8104,16 +8110,21 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             };
             // (one the prepare left in our cache is only asked for here: it comes back at once. Queued, it waited for a worker
             // behind their graphics builds, and its dispatch was left out)
-            VkComputePipelineCreateInfo asked = info(p);
+            StageCode asked_code;
+            bool asked_bound = false;
+            VkComputePipelineCreateInfo asked = info(p, asked_code, asked_bound);
             asked.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
             VkPipeline cached = VK_NULL_HANDLE;
-            if (dev.vk13.pipelineCreationCacheControl && cached_compute(&asked, &cached) != VK_SUCCESS) cached = VK_NULL_HANDLE;
+            if (asked_bound && dev.vk13.pipelineCreationCacheControl && cached_compute(&asked, &cached) != VK_SUCCESS)
+                cached = VK_NULL_HANDLE;
             auto build = [job, info] {
                 Program& q = const_cast<Program&>(*job);
-                VkComputePipelineCreateInfo ci = info(q);
+                StageCode code;
+                bool bound = false;
+                VkComputePipelineCreateInfo ci = info(q, code, bound);
                 const auto t0 = std::chrono::steady_clock::now();
                 VkPipeline made = VK_NULL_HANDLE;
-                if (const VkResult r = cached_compute(&ci, &made); r != VK_SUCCESS || !made) {
+                if (const VkResult r = bound ? cached_compute(&ci, &made) : VK_ERROR_UNKNOWN; r != VK_SUCCESS || !made) {
                     static std::atomic<int> told{0};
                     if (told++ < 20) logf("vk: compute pipeline of %016llx not made (%d)", (unsigned long long)q.key, (int)r);
                     q.failed = true;
@@ -8154,9 +8165,13 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = p.stages[0].module;
         ci.stage.pName = "main";
         pin_subgroup(ci.stage, p.workgroup[0]);
+        StageCode code;   // (MasterSword: the memory pack)
+        if (!stage_bind(ci.stage, p.stages[0], code)) {
+            p.failed = true;
+            SKIP_HERE();
+        }
         ci.layout = p.layout;
         {   // (local) RX_VK_NOOPT=1, as for graphics pipelines above
             static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
