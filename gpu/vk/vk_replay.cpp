@@ -1856,7 +1856,29 @@ int par_threads() {
     }();
     return n;
 }
+/// (MasterSword, Hero's Shade Temper 2026-11-14) The most parallel-replay workers Hero's Shade may try in an area: the default
+/// (par_threads) is what an area gets until Hero's Shade has measured a faster count. Town's profile (20:18): the replay thread's
+/// own ops ~0.6 ms a frame; it waits ~8 ms for 4 workers recording ~15 ms of draws. Auto: the fast cores less two (the replay's
+/// and one for the game), at most 6; never under the default. RX_VK_PARALLEL_MAX=<n> sets it; 0 or the default: no more.
+int par_threads_max() {
+    static const int n = [] {
+        const int def = par_threads();
+        if (def <= 0) return 0;
+        int v = def;
+        if (const char* e = getenv("RX_VK_PARALLEL_MAX")) {
+            v = atoi(e);
+        } else {
+            const FastCores& f = fast_cores();
+            v = std::clamp(f.n - 2, def, 6);
+        }
+        v = std::clamp(v, def, 8);
+        if (v > def) logf("vk: MasterSword Hero's Shade may try up to %d parallel replay workers in an area (default %d)", v, def);
+        return v;
+    }();
+    return n;
+}
 }   // namespace
+int par_threads_max_public() { return par_threads_max(); }   // (vk_mempack.cpp: Hero's Shade's candidates)
 /// (0.1.9c) vk_draw.h: shader translation and pipeline builds are background work, and the P-cores are the game's six and the
 /// replay's; a draw that waits for its pipeline still builds it itself when it is queued (jobs_wait)
 void jobs_worker_placement() {
@@ -1994,10 +2016,11 @@ int64_t stream_work(const uint8_t* p, int64_t most) {
 /// the threads. may_stop: up to a wait not met, which it returns (null: the command buffer done)
 const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_stop = false) {
     const int base_threads = par_threads();
+    const int max_threads = par_threads_max();   // (MasterSword: Hero's Shade may go above the default, up to this)
     static const int base_per = getenv("RX_VK_PARALLEL_SEG") ? std::max(32, atoi(getenv("RX_VK_PARALLEL_SEG"))) : 160;
     int threads = base_threads, per_i = base_per;
     heros_shade_tune(base_threads, base_per, &threads, &per_i);
-    threads = std::clamp(threads, 0, base_threads);
+    threads = std::clamp(threads, 0, max_threads);
     const int64_t per = std::max(32, per_i);
     NvnState& state = *cur_state;
     suspend_at = nullptr;
@@ -2068,9 +2091,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     }
     if (!par_pool.started) {
         par_pool.started = true;
-        for (int i = 0; i < base_threads; i++) std::thread(par_worker_main).detach();
-        logf("vk: parallel replay: big command buffers recorded on %d threads in segments of ~%lld draws and dispatches",
-             base_threads, (long long)per);
+        for (int i = 0; i < max_threads; i++) std::thread(par_worker_main).detach();   // (idle ones wait on the pool)
+        logf("vk: parallel replay: big command buffers recorded on %d threads (up to %d) in segments of ~%lld draws and "
+             "dispatches", base_threads, max_threads, (long long)per);
     }
     // what came before, to the GPU now (its uploads included); then each segment into a recording of its own (its
     // command buffer and uploads), recorded in order by the threads and submitted in order as they are done

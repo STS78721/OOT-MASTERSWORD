@@ -37,6 +37,7 @@
 namespace mkwvk {
 
 VkShaderModule make_module_counted(const std::vector<uint32_t>& spirv);   // (vk_shader.cpp: a module, as before the pack)
+int par_threads_max_public();   // (vk_replay.cpp: the most parallel-replay workers Hero's Shade may try)
 
 // ---- 3. The memory pack (RX_MEM_PACK, on by default where the device takes inline SPIR-V) ----
 // The census of 2026-11-14: 194425 shader modules made, 13.5 GB of SPIR-V handed to the driver, the host's private memory
@@ -659,7 +660,12 @@ void t3_record_frame(double total_ms, double submit_ms, int64_t par_locks_n, dou
                         add_cand(def_t, 96);
                         add_cand(def_t, 240);
                         add_cand(std::max(2, def_t - 1), 96);
-                        add_cand(std::min(6, def_t + 1), 96);
+                        // (MasterSword Temper: the counts above the default, up to par_threads_max; before, the +1 was
+                        // clamped back to the default and re-tested it)
+                        {
+                            const int top = par_threads_max_public();
+                            for (int t = def_t + 1; t <= top; t++) add_cand(t, def_s), add_cand(t, 96);
+                        }
                         hs_active_threads.store(sp.cands[0].threads, std::memory_order_release);
                         hs_active_seg.store(sp.cands[0].seg, std::memory_order_release);
                     }
@@ -1026,7 +1032,7 @@ void slate_save() {
         Temper3& st = t3_state();
         std::lock_guard tk(st.mu);
         if (!st.shade_learned.empty()) {
-            const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 2;
+            const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 3;   // (3: learned with counts above the default)
             const uint32_t count = (uint32_t)std::min<size_t>(st.shade_learned.size(), 64);
             uint32_t len_zero = 0;
             put(&tag, 4);
@@ -1157,7 +1163,7 @@ void slate_load() {
         };
         uint32_t ver = 0, count = 0;
         if (takes(&ver, 4)) {
-            if (ver == 2 && takes(&count, 4)) {
+            if (ver == 3 && takes(&count, 4)) {
                 if (count > 64) count = 64;
                 Temper3& st = t3_state();
                 std::lock_guard tk(st.mu);
@@ -1166,8 +1172,9 @@ void slate_load() {
                     if (!takes(&sd, sizeof sd)) break;
                     st.shade_learned[sd.pic_sig] = {sd.threads, sd.seg, sd.base_ms, sd.best_ms, sd.flags, sd.reserved};
                 }
-            } else if (ver != 2) {
-                logf("vk: MasterSword Hero's Shade: ignoring v%u table (re-learning with Step 3 timings)", (unsigned)ver);
+            } else if (ver != 3) {
+                logf("vk: MasterSword Hero's Shade: ignoring v%u table (re-learning, now with up to %d workers)", (unsigned)ver,
+                     par_threads_max_public());
             }
         }
     }
@@ -1215,7 +1222,7 @@ void heros_shade_tune(int default_threads, int default_seg, int* out_threads, in
         hs_def_seg.store(default_seg, std::memory_order_relaxed);
     const int t = hs_active_threads.load(std::memory_order_acquire);
     const int s = hs_active_seg.load(std::memory_order_acquire);
-    *out_threads = t >= 0 ? std::clamp(t, 0, default_threads) : default_threads;
+    *out_threads = t >= 0 ? std::clamp(t, 0, std::max(default_threads, par_threads_max_public())) : default_threads;
     *out_seg = s >= 32 ? s : default_seg;
 }
 
