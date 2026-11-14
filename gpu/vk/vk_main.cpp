@@ -931,6 +931,7 @@ __attribute__((visibility("default")))
 void mkwvk_close_asked(void) {
     using namespace mkwvk;
     pipeline_cache_close();
+    mkwvk::slate_close();   // (vk_mempack.cpp: the MasterSword Sheikah Slate kept as the window closes)
     if (prep_running.load() && !prepare_stopped()) {
         logf("vk: the window was closed while the shaders were prepared: stopping, what is done is kept");
         prepare_stop();

@@ -4476,6 +4476,10 @@ void texture_frame(uint64_t completed) {
             ++it;
         }
         spare_staging_tend();
+        {   // (vk_mempack.cpp: the MasterSword Sheikah Slate takes area pictures as areas stream in)
+            void slate_frame(uint64_t frame_no, uint64_t textures_made);
+            slate_frame(frame_no, st_made);
+        }
         if (frame_no % 30 == 0) {   // (MasterSword: the PC's memory pressure, the multi-second stalls with an idle renderer)
             void mempack_tick(uint64_t frame_no);   // (vk_mempack.cpp: the resident floor, the memory census)
             mempack_tick(frame_no);

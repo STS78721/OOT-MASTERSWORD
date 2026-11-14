@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -69,7 +70,9 @@ Pack& pack() {
 }
 
 void triforce_warm();   // (below: Courage)
-void song_of_time_play();   // (below: Wisdom remembered)
+void song_of_time_play();   // (below: the Sheikah Slate's boot replay)
+void slate_note_use(uint64_t at);   // (below: the Sheikah Slate learns from every use)
+void slate_load();
 
 uint64_t code_hash(const std::vector<uint32_t>& w) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t)w.size();
@@ -100,6 +103,7 @@ void pack_open() {
     const std::string marker = dir + "mastersword_spirv.damaged";
     if (GetFileAttributesA(marker.c_str()) != INVALID_FILE_ATTRIBUTES) {
         DeleteFileA(pack_path.c_str()), DeleteFileA(idx_path.c_str()), DeleteFileA((dir + "mastersword_spirv.song").c_str());
+        DeleteFileA((dir + "mastersword_slate.bin").c_str());
         DeleteFileA(marker.c_str());
         logf("vk: MasterSword Mirror Shield: the shader pack was found damaged last run: rebuilt from nothing");
     }
@@ -145,6 +149,7 @@ void pack_open() {
          "hot ones (RX_TRIFORCE_HOT_MB, default 1024), the rest are read back from the pack (RX_MEM_PACK=0: all as modules, as "
          "before)", pack_path.c_str(), p.recs.size(), (unsigned long long)(p.end >> 20));
     triforce_warm();
+    slate_load();
     song_of_time_play();
 }
 bool pack_on() {
@@ -307,12 +312,19 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
     if (st.module || !st.code_words) return st.module != VK_NULL_HANDLE;
     const uint64_t key = st.code_at;
     if (hot_budget()) {   // (Wisdom: a module made lately for this code)
-        std::lock_guard lk(hot_mu);
-        if (auto it = hot.find(key); it != hot.end()) {
-            if (it->second.refs++ == 0) hot_lru.erase(it->second.lru);
-            holder.hot_key = key;
-            si.module = it->second.module;
-            hot_hits++;
+        bool hit = false;
+        {
+            std::lock_guard lk(hot_mu);
+            if (auto it = hot.find(key); it != hot.end()) {
+                if (it->second.refs++ == 0) hot_lru.erase(it->second.lru);
+                holder.hot_key = key;
+                si.module = it->second.module;
+                hot_hits++;
+                hit = true;
+            }
+        }
+        if (hit) {
+            slate_note_use(key);   // (the Sheikah Slate learns from it)
             return true;
         }
     }
@@ -323,20 +335,23 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
         ci.pCode = holder.words.data();
         VkShaderModule m = VK_NULL_HANDLE;
         if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) == VK_SUCCESS && m) {
-            std::lock_guard lk(hot_mu);
-            auto [it, fresh] = hot.try_emplace(key);
-            if (!fresh) {   // (another thread made it meanwhile: theirs)
-                vkDestroyShaderModule(dev.device, m, nullptr);
-                if (it->second.refs++ == 0) hot_lru.erase(it->second.lru);
-            } else {
-                it->second.module = m, it->second.words = (uint32_t)holder.words.size(), it->second.refs = 1;
-                hot_bytes += ci.codeSize;
-                hot_made++;
+            {
+                std::lock_guard lk(hot_mu);
+                auto [it, fresh] = hot.try_emplace(key);
+                if (!fresh) {   // (another thread made it meanwhile: theirs)
+                    vkDestroyShaderModule(dev.device, m, nullptr);
+                    if (it->second.refs++ == 0) hot_lru.erase(it->second.lru);
+                } else {
+                    it->second.module = m, it->second.words = (uint32_t)holder.words.size(), it->second.refs = 1;
+                    hot_bytes += ci.codeSize;
+                    hot_made++;
+                }
+                holder.hot_key = key;
+                si.module = it->second.module;
+                hot_evict_locked();
             }
-            holder.hot_key = key;
-            si.module = it->second.module;
             std::vector<uint32_t>().swap(holder.words);
-            hot_evict_locked();
+            slate_note_use(key);   // (the Sheikah Slate learns from it)
             return true;
         }
     }
@@ -347,69 +362,76 @@ bool stage_bind(VkPipelineShaderStageCreateInfo& si, const Stage& st, StageCode&
     return true;
 }
 
-// MasterSword Song of Time: Wisdom remembered. Now and then (with the census) the hot cache's working set, newest first, is
-// written to mastersword_spirv.song; at the next start a thread on the E-cores reads those codes back (each checked by the
-// Mirror Shield) and makes their modules into the hot cache, up to most of its budget, before the first areas ask for them.
-// RX_TRIFORCE_SONG=0: neither.
+// ---- MasterSword Sheikah Slate: the self-training memory (mastersword_slate.bin, kept across cold boots) ----
+// What a start no longer has to learn again:
+//  - scores: every use of a shader's code (a hot-cache hit, or a module made) is counted; at each save a code's score becomes
+//    old * 0.75 + this session's uses, so what the player uses session after session rises and what they left behind fades;
+//  - pictures: when an area streams in (more than 8 textures made in a frame), the codes first used in the next 15 s are taken
+//    as that area's picture (up to 4096). When an area streams again, its first 24 codes are compared with every picture's
+//    first 48; the best match of at least half is replayed: its codes made ready in the hot cache on an E-core thread, before
+//    the area asks for them. No scene number is needed: an area is known by what it draws. 64 pictures, the least seen go;
+//  - Wisdom's settled budget, the start's budget the next time.
+// Saved every 1800 frames and when the window closes; damaged with the pack, rebuilt with it (Mirror Shield).
+// Song of Time plays it at a start: the best-scored codes made ready, up to 90% of the budget.
+// RX_TRIFORCE_SONG=0: no replay at a start; RX_SLATE_PICTURES=0: no pictures.
 namespace {
+struct Picture {
+    std::vector<uint64_t> head, all;   // (head: the first 48 codes of the area's burst; all: the burst's codes in first-use order)
+    uint64_t seen = 0;                 // (the session counter when last taken or matched)
+};
+struct Slate {
+    std::mutex mu;
+    std::unordered_map<uint64_t, float> score;      // (by the code's place in the pack)
+    std::unordered_map<uint64_t, uint32_t> uses;    // (this session's)
+    std::vector<Picture> pictures;
+    uint64_t sessions = 0, learned_budget = 0;
+    // (the picture being taken)
+    bool taking = false, matched = false;
+    uint64_t taking_until = 0;
+    std::vector<uint64_t> taken;
+    std::unordered_set<uint64_t> taken_seen;
+    std::atomic<int64_t> replays{0}, pictures_taken{0};
+};
+Slate& slate() {
+    static Slate s;
+    return s;
+}
 bool song_on() {
     static const bool on = !getenv("RX_TRIFORCE_SONG") || atoi(getenv("RX_TRIFORCE_SONG")) != 0;
     return on;
 }
-std::atomic<int64_t> song_played{0};
-void song_of_time_save() {
-    Pack& p = pack();
-    if (!p.on || !song_on() || !hot_budget()) return;
-    std::vector<std::pair<uint64_t, uint32_t>> list;   // (place, words), newest first
-    {
-        std::lock_guard lk(hot_mu);
-        for (const auto& [key, h] : hot)
-            if (h.refs > 0) list.push_back({key, h.words});
-        for (auto it = hot_lru.rbegin(); it != hot_lru.rend(); ++it)
-            if (auto h = hot.find(*it); h != hot.end()) list.push_back({*it, h->second.words});
-    }
-    const std::string path = p.dir + "mastersword_spirv.song", tmp = path + ".tmp";
-    const HANDLE f = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return;
-    DWORD put = 0;
-    const bool ok = list.empty() || WriteFile(f, list.data(), (DWORD)(list.size() * sizeof list[0]), &put, nullptr);
-    CloseHandle(f);
-    if (ok) MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
-    else DeleteFileA(tmp.c_str());
+bool pictures_on() {
+    static const bool on = !getenv("RX_SLATE_PICTURES") || atoi(getenv("RX_SLATE_PICTURES")) != 0;
+    return on;
 }
-void song_of_time_play() {
-    Pack& p = pack();
-    if (!p.on || !song_on() || !hot_budget()) return;
-    const std::string path = p.dir + "mastersword_spirv.song";
-    const HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return;
-    LARGE_INTEGER size{};
-    GetFileSizeEx(f, &size);
-    std::vector<std::pair<uint64_t, uint32_t>> list((size_t)(size.QuadPart / sizeof(std::pair<uint64_t, uint32_t>)));
-    DWORD got = 0;
-    if (!list.empty()) ReadFile(f, list.data(), (DWORD)(list.size() * sizeof list[0]), &got, nullptr);
-    CloseHandle(f);
-    list.resize(got / sizeof list[0]);
-    if (list.empty()) return;
-    std::thread([list = std::move(list)] {
-        SetThreadDescription(GetCurrentThread(), L"mkw_vk Song of Time");
+std::atomic<int64_t> song_played{0};
+
+/// Codes made ready in the hot cache, in the order given (most wanted first), up to fill of the budget, on an E-core thread
+void make_ready(std::vector<uint64_t> list, double fill, const char* why) {
+    if (list.empty() || !hot_budget()) return;
+    std::thread([list = std::move(list), fill, why] {
+        SetThreadDescription(GetCurrentThread(), L"mkw_vk Sheikah Slate");
         jobs_worker_placement();
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         const auto t0 = GetTickCount64();
         std::vector<uint32_t> words;
         int64_t made = 0;
-        // (the oldest of the list first, so the newest end up the most recently used in the LRU)
+        // (the least wanted first, so the most wanted end up the most recently used in the LRU)
         for (auto it = list.rbegin(); it != list.rend(); ++it) {
-            const auto [at, n] = *it;
-            {
-                std::lock_guard lk(hot_mu);
-                if (hot_bytes + (uint64_t)n * 4 > hot_budget() * 9 / 10) continue;
-                if (hot.count(at)) continue;
-            }
+            const uint64_t at = *it;
+            uint32_t n = 0;
             {
                 Pack& pk = pack();
                 std::lock_guard lk(pk.mu);
-                if (!pk.hash_at.count(at)) continue;   // (not a record of this pack)
+                const auto h = pk.hash_at.find(at);
+                if (h == pk.hash_at.end()) continue;   // (not a record of this pack)
+                const auto r = pk.recs.find(h->second);
+                if (r == pk.recs.end()) continue;
+                n = r->second.words;
+            }
+            {
+                std::lock_guard lk(hot_mu);
+                if (hot.count(at) || hot_bytes + (uint64_t)n * 4 > (uint64_t)(hot_budget() * fill)) continue;
             }
             if (!pack_read(at, n, words)) continue;
             VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -429,11 +451,204 @@ void song_of_time_play() {
             made++;
         }
         song_played += made;
-        logf("vk: MasterSword Song of Time: %lld shaders from the last session made ready in the hot cache in %llu ms",
-             (long long)made, (unsigned long long)(GetTickCount64() - t0));
+        logf("vk: MasterSword %s: %lld shaders made ready in the hot cache in %llu ms", why, (long long)made,
+             (unsigned long long)(GetTickCount64() - t0));
     }).detach();
 }
+
+size_t overlap(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+    std::unordered_set<uint64_t> in(b.begin(), b.end());
+    size_t n = 0;
+    for (const uint64_t x : a) n += in.count(x);
+    return n;
+}
+
+void slate_note_use(uint64_t at) {
+    Slate& sl = slate();
+    std::vector<uint64_t> replay;
+    {
+        std::lock_guard lk(sl.mu);
+        sl.uses[at]++;
+        if (!sl.taking || sl.taken.size() >= 4096 || !sl.taken_seen.insert(at).second) return;
+        sl.taken.push_back(at);
+        if (sl.matched || sl.taken.size() != 24) return;
+        sl.matched = true;   // (the area's first 24 codes: which picture is it?)
+        size_t best = 0, best_i = SIZE_MAX;
+        for (size_t i = 0; i < sl.pictures.size(); i++) {
+            const size_t o = overlap(sl.taken, sl.pictures[i].head);
+            if (o > best) best = o, best_i = i;
+        }
+        if (best_i == SIZE_MAX || best < 12) return;
+        Picture& pic = sl.pictures[best_i];
+        pic.seen = sl.sessions;
+        for (const uint64_t x : pic.all)
+            if (!sl.taken_seen.count(x)) replay.push_back(x);
+        sl.replays++;
+        static int told = 0;
+        if (told++ < 20)
+            logf("vk: MasterSword Sheikah Slate: an area streams in; it matches a picture (%zu of its first 24 codes): %zu more "
+                 "of its shaders made ready ahead", best, replay.size());
+    }
+    make_ready(std::move(replay), 1.0, "Sheikah Slate, an area's picture");
+}
+
+/// Each frame (vk_texture.cpp texture_frame): textures made so far; more than 8 in a frame: an area streams in
+void slate_frame_locked_free(uint64_t frame_no, uint64_t made) {
+    static uint64_t prev = 0;
+    const bool burst = made > prev + 8;
+    prev = made;
+    if (!pictures_on()) return;
+    Slate& sl = slate();
+    std::lock_guard lk(sl.mu);
+    if (sl.taking && frame_no > sl.taking_until) {   // (the picture is taken)
+        sl.taking = false;
+        if (sl.taken.size() >= 32) {
+            Picture pic;
+            pic.head.assign(sl.taken.begin(), sl.taken.begin() + std::min<size_t>(48, sl.taken.size()));
+            pic.all = sl.taken;
+            pic.seen = sl.sessions;
+            size_t best = 0, best_i = SIZE_MAX;   // (the same area seen again: its picture is replaced)
+            for (size_t i = 0; i < sl.pictures.size(); i++) {
+                const size_t o = overlap(pic.head, sl.pictures[i].head);
+                if (o > best) best = o, best_i = i;
+            }
+            if (best_i != SIZE_MAX && best * 2 >= pic.head.size()) sl.pictures[best_i] = std::move(pic);
+            else {
+                if (sl.pictures.size() >= 64) {
+                    size_t old = 0;
+                    for (size_t i = 1; i < sl.pictures.size(); i++)
+                        if (sl.pictures[i].seen < sl.pictures[old].seen) old = i;
+                    sl.pictures.erase(sl.pictures.begin() + (ptrdiff_t)old);
+                }
+                sl.pictures.push_back(std::move(pic));
+            }
+            sl.pictures_taken++;
+        }
+    }
+    if (burst && !sl.taking) {   // (an area streams in: a picture is begun)
+        sl.taking = true, sl.matched = false;
+        sl.taking_until = frame_no + 900;
+        sl.taken.clear(), sl.taken_seen.clear();
+    }
+}
+
+std::string slate_path() { return pack().dir + "mastersword_slate.bin"; }
+
+void slate_save() {
+    Pack& p = pack();
+    if (!p.on) return;
+    static std::mutex save_mu;   // (the periodic save and the one as the window closes: one at a time)
+    std::lock_guard save_lk(save_mu);
+    Slate& sl = slate();
+    std::vector<uint8_t> out;
+    const auto put = [&out](const void* d, size_t n) { out.insert(out.end(), (const uint8_t*)d, (const uint8_t*)d + n); };
+    {
+        std::lock_guard lk(sl.mu);
+        // (this session's uses folded into the scores as they stand now; the session's own counts go on growing)
+        std::unordered_map<uint64_t, float> sc = sl.score;
+        for (auto& [at, v] : sc) v *= 0.75f;
+        for (const auto& [at, n] : sl.uses) sc[at] += (float)n;
+        const uint32_t head[2] = {0x31544C53u /* "SLT1" */, 1};
+        put(head, sizeof head);
+        const uint64_t budget = hot_budget_auto.load(), sessions = sl.sessions;
+        put(&budget, 8), put(&sessions, 8);
+        // (the scores, the best 65536: a code under 0.05 is forgotten)
+        std::vector<std::pair<uint64_t, float>> best(sc.begin(), sc.end());
+        std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (best.size() > 65536) best.resize(65536);
+        while (!best.empty() && best.back().second < 0.05f) best.pop_back();
+        const uint64_t n = best.size();
+        put(&n, 8);
+        for (const auto& [at, v] : best) put(&at, 8), put(&v, 4);
+        const uint64_t np = sl.pictures.size();
+        put(&np, 8);
+        for (const Picture& pic : sl.pictures) {
+            const uint64_t nh = pic.head.size(), na = pic.all.size();
+            put(&nh, 8), put(&na, 8), put(&pic.seen, 8);
+            put(pic.head.data(), nh * 8), put(pic.all.data(), na * 8);
+        }
+    }
+    const std::string path = slate_path(), tmp = path + ".tmp";
+    const HANDLE f = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    const bool ok = WriteFile(f, out.data(), (DWORD)out.size(), &w, nullptr) && w == out.size();
+    CloseHandle(f);
+    if (ok) MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileA(tmp.c_str());
+}
+
+void slate_load() {
+    Slate& sl = slate();
+    const HANDLE f = CreateFileA(slate_path().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        logf("vk: MasterSword Sheikah Slate: none yet (it learns this session)");
+        return;
+    }
+    LARGE_INTEGER size{};
+    GetFileSizeEx(f, &size);
+    std::vector<uint8_t> in((size_t)std::min<LONGLONG>(size.QuadPart, 512ll << 20));
+    DWORD got = 0;
+    if (!in.empty()) ReadFile(f, in.data(), (DWORD)in.size(), &got, nullptr);
+    CloseHandle(f);
+    in.resize(got);
+    size_t at = 0;
+    const auto take = [&](void* d, size_t n) {
+        if (at + n > in.size()) return false;
+        std::memcpy(d, in.data() + at, n), at += n;
+        return true;
+    };
+    uint32_t head[2]{};
+    uint64_t budget = 0, sessions = 0, n = 0, np = 0;
+    if (!take(head, sizeof head) || head[0] != 0x31544C53u || head[1] != 1 || !take(&budget, 8) || !take(&sessions, 8) ||
+        !take(&n, 8) || n > (1u << 20)) {
+        logf("vk: MasterSword Sheikah Slate: not readable: it starts learning again");
+        return;
+    }
+    std::lock_guard lk(sl.mu);
+    std::lock_guard pk(pack().mu);
+    const auto known = [](uint64_t a) { return pack().hash_at.count(a) != 0; };
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t a = 0;
+        float v = 0;
+        if (!take(&a, 8) || !take(&v, 4)) break;
+        if (known(a)) sl.score[a] = v;
+    }
+    if (take(&np, 8) && np <= 64)
+        for (uint64_t i = 0; i < np; i++) {
+            uint64_t nh = 0, na = 0;
+            Picture pic;
+            if (!take(&nh, 8) || !take(&na, 8) || !take(&pic.seen, 8) || nh > 48 || na > 4096) break;
+            pic.head.resize(nh), pic.all.resize(na);
+            if (!take(pic.head.data(), nh * 8) || !take(pic.all.data(), na * 8)) break;
+            std::erase_if(pic.all, [&](uint64_t a) { return !known(a); });
+            sl.pictures.push_back(std::move(pic));
+        }
+    sl.sessions = sessions + 1;
+    if (budget && hot_budget_fixed() < 0) hot_budget_auto.store(budget);
+    logf("vk: MasterSword Sheikah Slate: session %llu; %zu shaders it knows the worth of, %zu area pictures; Wisdom starts at "
+         "%llu MB, as it settled last time", (unsigned long long)sl.sessions, sl.score.size(), sl.pictures.size(),
+         (unsigned long long)(hot_budget() >> 20));
+}
+
+// Song of Time: the Slate played at a start: its best-scored codes made ready, up to 90% of the budget
+void song_of_time_play() {
+    if (!pack().on || !song_on() || !hot_budget()) return;
+    std::vector<uint64_t> list;
+    {
+        Slate& sl = slate();
+        std::lock_guard lk(sl.mu);
+        std::vector<std::pair<uint64_t, float>> best(sl.score.begin(), sl.score.end());
+        std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (const auto& [at, v] : best) list.push_back(at);
+    }
+    make_ready(std::move(list), 0.9, "Song of Time (the Sheikah Slate's best, at the start)");
+}
 } // namespace
+
+void slate_frame(uint64_t frame_no, uint64_t textures_made) { slate_frame_locked_free(frame_no, textures_made); }
+void slate_close() { slate_save(); }   // (vk_main.cpp, as the window closes)
 
 // Courage: the pack read ahead of need. At start, a thread at background priority (its disk reads and the pages they bring in
 // both lowest: Windows takes those pages first) reads the pack front to back in 8 MB reads, so the first build of a shader in
@@ -594,10 +809,11 @@ void census_run() {
         if (p.on) {
             std::lock_guard lk(hot_mu);
             logf("vk: Triforce hot cache: %zu modules (%llu MB of %llu), %lld builds served from it, %lld made, %lld evicted; "
-                 "Song of Time made %lld ready; Mirror Shield checked %lld codes",
+                 "Sheikah Slate made %lld ready (%lld area pictures replayed, %lld taken); Mirror Shield checked %lld codes",
                  hot.size(), (unsigned long long)(hot_bytes >> 20), (unsigned long long)(hot_budget() >> 20),
                  (long long)hot_hits.load(), (long long)hot_made.load(), (long long)hot_evicted.load(),
-                 (long long)song_played.load(), (long long)p.shield_checked.load());
+                 (long long)song_played.load(), (long long)slate().replays.load(), (long long)slate().pictures_taken.load(),
+                 (long long)p.shield_checked.load());
         }
     }
     for (const auto& a : allocs)
@@ -614,7 +830,7 @@ void mempack_tick(uint64_t frame_no) {
     static const int every = env_int("RX_MEM_CENSUS", 3600);
     if (every > 0 && frame_no >= 600 && frame_no % (uint64_t)std::max(every, 30) < 30) jobs_push([] { census_run(); });
     if (frame_no % 300 < 30) wisdom_adapt();   // (Wisdom, adaptive: the hot cache's budget by the PC's free RAM)
-    if (frame_no >= 1800 && frame_no % 1800 < 30) jobs_push([] { song_of_time_save(); });   // (Song of Time: the hot set kept)
+    if (frame_no >= 1800 && frame_no % 1800 < 30) jobs_push([] { slate_save(); });   // (the Sheikah Slate, kept)
 }
 
 } // namespace mkwvk
