@@ -758,6 +758,14 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   - The readback that the frame waits for is written in its submission's last part, with ~7-8 ms of GPU work still queued
     when that part is submitted; the late-readback experiment could not drop it (the exposure meter must be fresh). No switch
     removes this wait: the chain itself has to get shorter (faster recording, a cheaper GPU frame).
+  - **Rito (GPU copy engine), measured before building (2026-11-15 ~05:30, bench ritocount_1, DLL counter in mirror_sync):**
+    only **40%** of the mirror-sync bytes go into pools the GPU never wrote (gpu_only and gpu_written both false: ~755 MB
+    per 600 submits, ~9 MB a frame); the other 60% go into pools the GPU writes, which must stay in order on the graphics
+    queue (the write-back race: the exposure page; and the GPU's own writes of the submission before). In GPU time ~40% of
+    the profiled 2.7 ms (~1.1 ms a frame), and only the copies in the frame's last parts are on the critical path: ~0.3-0.5
+    ms a frame expected (1-2%) for a new queue, concurrent sharing, per-recording copy command buffers and a semaphore, in
+    code with a history of one-frame flickers. **Not built**; the counter stays (log line "MasterSword Rito (600 submits)").
+    Design if revisited: research doc s12. The user picked Rito; the measurement says it is not worth it now.
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),

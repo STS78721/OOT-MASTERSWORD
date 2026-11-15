@@ -2668,6 +2668,10 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
         logf("vk: pool %#llx remade larger (%zu retired)", (unsigned long long)old->lo, retired_pools.size());
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
+// (MasterSword Rito, 2026-11-15: the sync bytes by pool kind: pools the GPU never wrote (their copies could go on a transfer
+// queue beside the rendering) and pools it did (they stay in order on the graphics queue: the write-backs and the GPU's own
+// writes of the submission before must land first). Logged with the mirror syncs, every 600 submits)
+int64_t st_sync_bytes_cpu, st_sync_bytes_gpu;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
 std::unordered_map<uint64_t, int64_t> live_by_pool;
 std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
@@ -2799,6 +2803,7 @@ void mirror_sync(Pool& p) {
         gp.items = (int)rs.size();
         vkCmdCopyBuffer(upload_command_buffer(), buf, p.mirror, (uint32_t)rs.size(), rs.data());
         for (const VkBufferCopy& r : rs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
+        for (const VkBufferCopy& r : rs) (p.gpu_only || p.gpu_written ? st_sync_bytes_gpu : st_sync_bytes_cpu) += (int64_t)r.size;
         st_sync_copies += (int64_t)rs.size();
     }
     if (runs.empty()) return;
@@ -2808,6 +2813,7 @@ void mirror_sync(Pool& p) {
     note_in_place_read();   // (these pages as guest memory has them when the GPU gets here)
     vkCmdCopyBuffer(upload_command_buffer(), p.buffer, p.mirror, (uint32_t)runs.size(), runs.data());
     for (const VkBufferCopy& r : runs) st_sync_bytes += (int64_t)r.size, gp.bytes += r.size;
+    for (const VkBufferCopy& r : runs) (p.gpu_only || p.gpu_written ? st_sync_bytes_gpu : st_sync_bytes_cpu) += (int64_t)r.size;
     st_sync_copies += (int64_t)runs.size();
 }
 
@@ -4225,6 +4231,14 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
                  (long long)(st_sync_old_pages - l_old), (long long)(st_sync_live_pages - l_live), cap_bufs.size(),
                  (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
+            {   // (MasterSword Rito: how much of the mirror syncs' copying a transfer queue could take)
+                static int64_t l_cpu, l_gpu;
+                const int64_t c = st_sync_bytes_cpu - l_cpu, g = st_sync_bytes_gpu - l_gpu;
+                logf("vk: MasterSword Rito (600 submits): mirror sync copies %.1f MB into pools the GPU never wrote (a transfer "
+                     "queue could take them), %.1f MB into pools it wrote (in order on the graphics queue): %.0f%% movable",
+                     c / 1048576.0, g / 1048576.0, c + g ? 100.0 * c / (double)(c + g) : 0.0);
+                l_cpu = st_sync_bytes_cpu, l_gpu = st_sync_bytes_gpu;
+            }
             if (shadow_bytes || st_wbd_runs)
                 logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows; %llu MB of shadows; "
                      "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself",
