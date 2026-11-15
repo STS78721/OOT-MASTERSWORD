@@ -766,6 +766,18 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
     ms a frame expected (1-2%) for a new queue, concurrent sharing, per-recording copy command buffers and a semaphore, in
     code with a history of one-frame flickers. **Not built**; the counter stays (log line "MasterSword Rito (600 submits)").
     Design if revisited: research doc s12. The user picked Rito; the measurement says it is not worth it now.
+  - **Faster recording, first try (2026-11-15 ~06:00): recording faster made the frame SLOWER.** Mask of Truth on the
+    bench (motrec_1, maps work/sa/_maps_ritocount): vk_mvec.cpp env_on() called getenv("RX_VK_MVEC") on every call, and
+    mvec_on (from the temporal notes) asks it every scene draw: in 29% of the replay workers' running samples, _Mtx_lock 11%
+    (the C runtime's environment lock, all workers at once). Cached it (static): segments 2.0 -> 1.36 ms a command buffer,
+    dry pass 0.29 -> 0.20 ms, ParLock waits 0.6 -> 1.0 ms; but the frame 21.30 -> 22.04 ms at equal draws (+3.3%), both fix
+    runs slower than both base runs (bench "envfix"). **Reverted** (not committed). Leading hypothesis: with the lock the
+    workers were serialized, fewer P-cores busy at once, higher boost for the game's critical threads (main, module
+    workers); without it six workers run at once and the boost drops. Test in progress when the user restarted the PC:
+    Mask of Truth samples with and without (job motenv: compare the game threads' running time per frame). If confirmed,
+    the levers are the game threads on the favoured P-cores and fewer recording workers busy at once (no system settings).
+  - Bench state for the next session: exe_old.exe = V1 (9199f6c5), dll_base.dll = copy split (f519b943), both in place;
+    dll_ritocount.dll = copy split + the Rito counter (c8435b6b), dll_envfix.dll = + the getenv cache (e0d67c65).
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),
