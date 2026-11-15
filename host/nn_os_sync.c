@@ -12,6 +12,8 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+void hos_wake_note(int kind, uint64_t key, uint64_t lr);   /* (suns_song.c: HOS_WAKE_TRACE) */
+const char *hos_name_interned(const char *n);              /* (suns_song.c: a thread name that outlives its thread) */
 
 enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_HOLDER, K_TIMER };
 
@@ -680,7 +682,7 @@ static void wake_lat_note(int how, int64_t lat_ns) {   /* how: 0 ready, 1 spun, 
     static SRWLOCK lk = SRWLOCK_INIT;
     static struct { const char *thread; int64_t n[3], lat, max; } tab[32];
     static int64_t last;
-    const char *thread = hos_thread_name(hos_self());
+    const char *thread = hos_name_interned(hos_thread_name(hos_self()));
     AcquireSRWLockExclusive(&lk);
     int i = 0;
     while (i < 32 && tab[i].thread && tab[i].thread != thread) i++;
@@ -744,11 +746,11 @@ static int event_peek(Obj *e) {
 }
 
 /* SignalEvent from host code (any host thread): devices the OS layer emulates, the video decoder for one. */
-void hos_event_signal(uint64_t guest_event) { event_signal(obj(guest_event, K_EVENT)); }
+void hos_event_signal(uint64_t guest_event) { hos_wake_note(3, guest_event, 0); event_signal(obj(guest_event, K_EVENT)); }
 
 HLE(_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE) { event_init(ARG(0), (int)(ARG(1) & 1), (int)ARG(2)); }
 HLE(_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE) { drop(ARG(0)); }
-HLE(_ZN2nn2os11SignalEventEPNS0_9EventTypeE) { event_signal(obj(ARG(0), K_EVENT)); }
+HLE(_ZN2nn2os11SignalEventEPNS0_9EventTypeE) { hos_wake_note(3, ARG(0), c->x[30]); event_signal(obj(ARG(0), K_EVENT)); }
 HLE(_ZN2nn2os10ClearEventEPNS0_9EventTypeE) { event_clear(obj(ARG(0), K_EVENT)); }
 
 /* HOS_WAIT_LOG=1 (diagnostic): event waits by guest caller and thread every 5 s (count, total, longest), the
@@ -776,7 +778,7 @@ static int logged_wait(Ctx *c, Obj *e, int64_t timeout_ns, int try_only, const c
     static SRWLOCK lk = SRWLOCK_INIT;
     static struct { uint64_t lr; const char *thread, *what; int64_t n, total, max; } tab[128];
     static int64_t last;
-    const char *thread = hos_thread_name(hos_self());
+    const char *thread = hos_name_interned(hos_thread_name(hos_self()));
     AcquireSRWLockExclusive(&lk);
     int i = 0;
     while (i < 128 && tab[i].lr && !(tab[i].lr == c->x[30] && tab[i].thread == thread)) i++;
@@ -838,7 +840,7 @@ static void who_note_signal(Ctx *c, uint64_t key) {
     static SRWLOCK lk = SRWLOCK_INIT;
     static struct { uint64_t key, lr; const char *thread; int64_t n; } tab[64];
     static int64_t last;
-    const char *thread = hos_thread_name(hos_self());
+    const char *thread = hos_name_interned(hos_thread_name(hos_self()));
     AcquireSRWLockExclusive(&lk);
     int i = 0;
     while (i < 64 && tab[i].key && !(tab[i].key == key && tab[i].lr == c->x[30] && tab[i].thread == thread)) i++;
@@ -857,6 +859,7 @@ static void who_note_signal(Ctx *c, uint64_t key) {
     ReleaseSRWLockExclusive(&lk);
 }
 HLE(_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE) {
+    hos_wake_note(3, ARG(0), c->x[30]);
     who_note_signal(c, ARG(0));
     event_signal(obj(ARG(0), K_EVENT));
 }
@@ -884,19 +887,28 @@ HLE(_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE) {
     who_note_wait(c, ARG(0));
     const int gate = prof_gate_match(c);
     if (gate) __atomic_add_fetch(&hos_prof_gate, 1, __ATOMIC_SEQ_CST);
+    hos_wake_note(1, ARG(0), c->x[30]);
     logged_wait(c, obj(ARG(0), K_EVENT), 0, 0, "light");
+    hos_wake_note(2, ARG(0), c->x[30]);
     if (gate) __atomic_sub_fetch(&hos_prof_gate, 1, __ATOMIC_SEQ_CST);
 }
 HLE(_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE) {
-    RET(event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0));
+    if ((int64_t)ARG(1) > 0) hos_wake_note(1, ARG(0), c->x[30]);
+    const int r = event_wait(obj(ARG(0), K_EVENT), (int64_t)ARG(1) > 0 ? (int64_t)ARG(1) : 1, (int64_t)ARG(1) <= 0);
+    if ((int64_t)ARG(1) > 0) hos_wake_note(2, ARG(0), c->x[30]);
+    RET(r);
 }
 
 /* System events are created by other HLE APIs (vsync, audio device changes ...) with hos_system_event_init. */
 void hos_system_event_init(uint64_t key, int autoclear) { event_init(key, 0, autoclear); }
-void hos_system_event_signal(uint64_t key) { event_signal(obj(key, K_EVENT)); }
+void hos_system_event_signal(uint64_t key) { hos_wake_note(3, key, 0); event_signal(obj(key, K_EVENT)); }
 HLE(_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE) { drop(ARG(0)); }
 HLE(_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE) { event_clear(obj(ARG(0), K_EVENT)); }
-HLE(_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE) { logged_wait(c, obj(ARG(0), K_EVENT), 0, 0, "system"); }
+HLE(_ZN2nn2os15WaitSystemEventEPNS0_15SystemEventTypeE) {
+    hos_wake_note(1, ARG(0), c->x[30]);
+    logged_wait(c, obj(ARG(0), K_EVENT), 0, 0, "system");
+    hos_wake_note(2, ARG(0), c->x[30]);
+}
 HLE(_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE) { RET(event_wait(obj(ARG(0), K_EVENT), 0, 1)); }
 
 /* ---- timer events ------------------------------------------------------------------------------------------ */
@@ -1052,22 +1064,26 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
 
 HLE(_ZN2nn2os22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm) { queue_init(ARG(0), (int)ARG(2)); }
 HLE(_ZN2nn2os20FinalizeMessageQueueEPNS0_16MessageQueueTypeE) { drop(ARG(0)); }
-HLE(_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm) { queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 0); }
+HLE(_ZN2nn2os16SendMessageQueueEPNS0_16MessageQueueTypeEm) { hos_wake_note(4, ARG(0), c->x[30]); queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 0); }
 HLE(_ZN2nn2os19ReceiveMessageQueueEPmPNS0_16MessageQueueTypeE) {
     uint64_t v;
+    hos_wake_note(5, ARG(1), c->x[30]);
     queue_get(obj(ARG(1), K_QUEUE), &v, 1, -1);
+    hos_wake_note(6, ARG(1), c->x[30]);
     G64(ARG(0)) = v;
 }
 
 HLE(_ZN2nn2os27InitializeLightMessageQueueEPNS0_21LightMessageQueueTypeEPmm) { queue_init(ARG(0), (int)ARG(2)); }
 HLE(_ZN2nn2os25FinalizeLightMessageQueueEPNS0_21LightMessageQueueTypeE) { drop(ARG(0)); }
-HLE(_ZN2nn2os21SendLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 0); }
-HLE(_ZN2nn2os24TrySendLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { RET(queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 1)); }
-HLE(_ZN2nn2os20JamLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { queue_put(obj(ARG(0), K_QUEUE), ARG(1), 1, 0); }
-HLE(_ZN2nn2os23TryJamLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { RET(queue_put(obj(ARG(0), K_QUEUE), ARG(1), 1, 1)); }
+HLE(_ZN2nn2os21SendLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { hos_wake_note(4, ARG(0), c->x[30]); queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 0); }
+HLE(_ZN2nn2os24TrySendLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { hos_wake_note(4, ARG(0), c->x[30]); RET(queue_put(obj(ARG(0), K_QUEUE), ARG(1), 0, 1)); }
+HLE(_ZN2nn2os20JamLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { hos_wake_note(4, ARG(0), c->x[30]); queue_put(obj(ARG(0), K_QUEUE), ARG(1), 1, 0); }
+HLE(_ZN2nn2os23TryJamLightMessageQueueEPNS0_21LightMessageQueueTypeEm) { hos_wake_note(4, ARG(0), c->x[30]); RET(queue_put(obj(ARG(0), K_QUEUE), ARG(1), 1, 1)); }
 HLE(_ZN2nn2os24ReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE) {
     uint64_t v;
+    hos_wake_note(5, ARG(1), c->x[30]);
     queue_get(obj(ARG(1), K_QUEUE), &v, 1, -1);
+    hos_wake_note(6, ARG(1), c->x[30]);
     G64(ARG(0)) = v;
 }
 HLE(_ZN2nn2os27TryReceiveLightMessageQueueEPmPNS0_21LightMessageQueueTypeE) {

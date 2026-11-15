@@ -1202,7 +1202,14 @@ HLE(_ZN2nn2os11YieldThreadEv) {
     SwitchToThread();
 }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
+void hos_wake_note(int kind, uint64_t key, uint64_t lr);   /* (suns_song.c: HOS_WAKE_TRACE) */
+static void sleep_logged_inner(int64_t ns, uint64_t lr);
 void hos_sleep_logged(int64_t ns, uint64_t lr) {
+    hos_wake_note(7, (uint64_t)ns, lr);
+    sleep_logged_inner(ns, lr);
+    hos_wake_note(8, (uint64_t)ns, lr);
+}
+static void sleep_logged_inner(int64_t ns, uint64_t lr) {
     /* HOS_POLL_SLEEP_NS=<ns> (experiment): a guest sleep of up to 100 us lasts at most that long. TOTK's job system
        waits for its workers by sleeping 20 us and looking again (~90 times a frame at the castle, on MainThread and
        the workers): a shorter step notices the job's end sooner (the loop looks again; nothing else changes).

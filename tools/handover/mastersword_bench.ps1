@@ -34,19 +34,23 @@ New-Item -ItemType Directory -Force $runs | Out-Null
 if (Get-Process mastersword -ErrorAction SilentlyContinue) { throw "mastersword.exe is running: close the game first" }
 Copy-Retry (Join-Path $Game "exe_$Exe.exe") (Join-Path $Game "mastersword.exe")
 if ($Dll) { Copy-Retry (Join-Path $Game "dll_$Dll.dll") (Join-Path $Game "mastersword_vk.dll") }
+$envSet = @()   # (removed again after the run: runs of one job share this process's environment)
 if ($Env) {
     foreach ($pair in $Env.Split(";")) {
         if (-not $pair) { continue }
         $k, $v = $pair.Split("=", 2)
         Set-Item -Path "Env:$k" -Value $v
+        $envSet += $k
     }
 }
-$touches = @()
+$touches = @()   # ("f@s": create f at s seconds; "f@s0-s1": create at s0, delete at s1, e.g. a trace's .go file)
 if ($Touch) {
     foreach ($t in $Touch.Split(";")) {
         if (-not $t) { continue }
         $f, $at = $t.Split("@", 2)
-        $touches += [pscustomobject]@{ Path = (Join-Path $Game $f); At = [double]$at; Done = $false }
+        $a, $b = $at.Split("-", 2)
+        $touches += [pscustomobject]@{ Path = (Join-Path $Game $f); At = [double]$a; Until = $(if ($b) { [double]$b } else { -1 });
+                                       Done = $false; Gone = $false }
     }
 }
 # (every run from the same saves: a run's own autosaves would change which save the Load menu puts on top)
@@ -94,9 +98,14 @@ while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
     $t = ((Get-Date) - $t0).TotalSeconds
     if ($Sample -and $t -ge $s0 -and $t -lt $s1 -and -not (Test-Path $go)) { New-Item -ItemType File $go | Out-Null }
     if ($Sample -and $t -ge $s1 -and (Test-Path $go)) { Remove-Item $go }
-    foreach ($x in $touches) { if (-not $x.Done -and $t -ge $x.At) { New-Item -ItemType File -Force $x.Path | Out-Null; $x.Done = $true } }
+    foreach ($x in $touches) {
+        if (-not $x.Done -and $t -ge $x.At) { New-Item -ItemType File -Force $x.Path | Out-Null; $x.Done = $true }
+        if ($x.Done -and -not $x.Gone -and $x.Until -ge 0 -and $t -ge $x.Until) { Remove-Item $x.Path -ErrorAction SilentlyContinue; $x.Gone = $true }
+    }
 }
 Remove-Item $go -ErrorAction SilentlyContinue
+foreach ($x in $touches) { if ($x.Until -ge 0 -and -not $x.Gone) { Remove-Item $x.Path -ErrorAction SilentlyContinue; $x.Gone = $true } }
+if ($touches | Where-Object { $_.Until -ge 0 }) { Start-Sleep -Seconds 4 }   # (a trace is written when its .go file goes)
 if (-not $p.HasExited) {
     try { $p.CloseMainWindow() | Out-Null } catch {}
     Start-Sleep -Seconds 3
@@ -111,4 +120,5 @@ $samples = Join-Path $Game "mask_of_truth_samples.txt"
 if (Test-Path $samples) { Move-Item -Force $samples (Join-Path $runs "samples.txt") }
 Copy-Retry (Join-Path $Game "exe_old.exe") (Join-Path $Game "mastersword.exe")   # (the bench copy is left on the baseline)
 if ($Dll) { Copy-Retry (Join-Path $Game "dll_base.dll") (Join-Path $Game "mastersword_vk.dll") }
+foreach ($k in $envSet) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
 "done exe=$Exe exited=$($p.HasExited) shots=$(@(Get-ChildItem $shots -Filter *.png -ErrorAction SilentlyContinue).Count)"

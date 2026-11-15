@@ -716,6 +716,42 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   jobs (ReceiveLightMessageQueue) that nobody has posted yet. Who posts them late is the open question: it needs a
   wake-chain trace (ETW CSwitch/ReadyThread via WPR, admin), which this session could not take. The uncapped run
   (HOS_FPS_MAX=1000) never left the gate (frame-clock inputs came early in the faster menus): not comparable, dropped.
+- **Found (2026-11-15 ~03:30-04:00): the idle gaps are the game's GPU-result readbacks waiting for the GPU.**
+  - New diagnostic **Sun's Song** (host/suns_song.c, HOS_WAKE_TRACE=<file> + <file>.go window; scripts/suns_song.py):
+    every guest event wait/wake/signal, message-queue send/receive and sleep with time, thread, object, caller.
+    Bench trace suns_1.csv (3 s, market): sead::MainThread blocked 75% of the time; 60% is one wait, event 100a758600 from
+    lr 0x80080188, 8-10 ms each, released by a ModuleSystemWorker (mostly #1) ~6 us after its signal. ModuleSystemWorker1
+    in that window shows no traced block for ~9 ms: the sampler has it in the renderer, rx_nvn_invalidate -> invalidate ->
+    wait_recorded_part (8% of its samples; the main thread's own ~9%).
+  - RX_VK_LOG_READBACK_WAITS=1 (bench rbw_1): readback waits on three pairs of double-buffered ranges (0x11497e3000/
+    0x11497e8000 +0x3980, 0x116a006000/0x116a021580 +0x1b580, 0x118b0c0000/0x118b15b040 +0x9b040), 7-9 ms each when long;
+    "its part's = its submission's last, submitted, not done, behind 0": recorded and submitted, waiting for the GPU to
+    finish the end of the submission (the write-back is in its last part); the GPU ~4 submissions behind the fence.
+    So the CPU waits for the GPU every frame (no overlap there): GPU time is on the critical path after all.
+  - Also fixed: HOS_WAKE_LAT / HOS_WAIT_LOG / HOS_WAIT_WHO kept a thread-name pointer into the freed thread: crash in
+    strnlen (bench who_1). Names are interned now (hos_name_interned).
+  - The bench script removes -Env variables after each run (runs of a job shared them) and takes "file@s0-s1" windows.
+  - Next: GPU pass timing (RX_VK_GPU_PROFILE=1, bench gprof_1) to size the GPU's frame and its last part; then either
+    an earlier write-back for those ranges (split the part right after the work that writes them, so the GPU signals before
+    the rest of the frame) or GPU-side savings in what precedes them.
+  - **GPU pass timing, market (bench gprof_1, RX_VK_GPU_PROFILE=1; timestamps inflate, read shares):** 17.25 ms a frame
+    in all. Recordings' command buffers 13.09 ms first-to-last, of it 6.87 ms in spans (passes 4.0, the game's barriers
+    1.65 = 147 full barriers + render-pass ends a frame) and **6.22 ms between spans: the GPU waiting for recording**.
+    Upload command buffers 4.16 ms: **msync copies 2.70 ms** (CPU-written pages capture -> mirror, 20.8 MB a frame in
+    ~2,700 regions, already coalesced) and **rbrefresh 1.34 ms** (readback pages guest -> mirror, 34 a frame, each behind
+    a full barrier). Shader cost is the small part: "SM86"/faster shaders would not move the frame; the GPU's frame is
+    copies, barriers and waiting for recording.
+  - The game's barriers by NVN flags a frame: 0x12 (ORDER_FRAGMENTS|INVALIDATE_TEXTURE) ~95, 0x11 (ORDER_PRIMITIVES|
+    INVALIDATE_TEXTURE) 41, 0x28 16, 0x1 4.8, 0x21 4, 0x8 3, 0x92 3, ... all become full_barrier + end_pass.
+  - **Considered and not done overnight (need the user watching, visual risk):** (1) refresh only readback pages the CPU
+    wrote: page_gen also carries GPU stamps (memory_stamp_gpu) and the refresh copies guest memory as it is now, CPU
+    writes not yet collected included; a stamp-based skip could miss the exposure reset (white flashes). (2) precise
+    barriers per NVN flag (~0.3-0.5 ms GPU at most, flicker risk). (3) the msync copies on a transfer queue (Rito copy
+    engine: up to ~2.7 ms off the graphics queue, overlapping the previous submission; queue ownership + semaphores).
+  - **The critical path, end to end:** game frame -> submits (Presentation Thread) -> recording (~8 ms, parallel) ->
+    GPU (copies 4 ms + passes 4 ms + barriers, starting as parts arrive) -> the readback ranges written back in the
+    submission's last part -> a ModuleSystemWorker's invalidate waits for it -> it signals the main thread's event
+    100a758600 -> the next frame. Levers: recording speed (the last part arrives sooner), GPU copies (Rito), barriers.
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),
