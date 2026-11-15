@@ -690,6 +690,32 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
   PGO 21.59 ms (+0.18), PGO + hot-cold-split 21.37 ms (-0.04); raw medians: baseline 21.13, PGO 21.40, hcs 21.54. Neither
   deployed. Read: the hot code is already -O2 with the float fast paths; what is left on the critical path (the job system's
   chain and its waits) is not branch layout. The tools stay (RX_PGO, RX_HOT_FLAGS, mastersword_pgo_profile.ps1) for later.
+- **New lead (2026-11-15 ~02:30, bench Mask of Truth of V1 + copy split, motb_1_old; maps in work/sa/_maps_v1):** the main
+  thread runs 17.5%; it waits on the job event in f_8007fe60 ~60% of the time, but while it does, **64% of the time no job
+  worker runs and 36% of the time no sampled thread runs at all** (31.6% of all instants: ~6.8 ms a frame with nothing
+  running). The renderer's GPU-bound wait is 0.0 ms. A timeline shows 8-12 ms gaps where everything is idle, then a burst.
+  Hypothesis: the game waits for a timed tick (nn_vi.c's 60 Hz vsync thread / the Mastersword Pacer), so frames are quantized
+  (17-20 ms of work waits for 33.3 ms). Test queued (job pace1): default vs HOS_FPS_MAX=1000 (the Insert menu's Uncapped:
+  vsync at 1 kHz) with HOS_PRESENT_TRACE per-present intervals; check the uncapped route still arrives (screenshots), since
+  frame-clock inputs may come early in faster menus. Also: the main thread waits ~9% for the renderer's recording
+  (wait_recorded_part in rx_nvn_invalidate / capture_make): recording speed is on the critical path there.
+- The session scratchpad was wiped during a pause; build scripts are now work/build_full.bat and work/build_vk.bat.
+- **Correction:** after the copy-split batch the bench's mastersword_vk.dll in place was the OLD DLL (791384c; the A/B script
+  swaps DLLs only for runs that name one). So the PGO/hcs batch ("tri"), the Mask of Truth sample (motb_1_old), Hero's Shade
+  and the pacing runs used V1 + the old DLL, the same on both sides of each comparison (the comparisons stand; "baseline V1 +
+  copy split" there means V1 + old DLL). The bench now has the copy-split DLL in place (f519b943), as smoke does.
+- **Hero's Shade A/B (bench, 2026-11-15 ~02:26-03:07): no measurable effect; left as the user has it (on).** Clean runs:
+  Town on 22.27 / 22.03 ms (median window) vs off 21.95; outside the gate (the "field" route ends looking back at the town,
+  ~2840 draws, not the light area) on 19.18 vs off 19.49 / 19.19. Several runs of this batch were disturbed: shtown_3
+  (an ~80 s freeze while heavy Python analyses ran beside the 15 GB game: paging, most likely: **never run heavy analysis
+  during a bench run**), shtown_4 and shfield_1 slower throughout (cause unknown).
+- **The idle gaps are not the vsync, not oversleeping, not the GPU:** the log's present histograms (vi: present intervals)
+  show 17.8-30 ms frames and none at 30-40 (no quantization to 33 ms); the GPU-bound wait is 0.0 ms; HOS_SLEEP_LOG=1
+  (bench sleeplog_1) shows the job polls (lr 0x8009a478 / 0x8009aff0, in f_800998a0) asking 20 us and sleeping ~22 us,
+  PreActorModelCompose x6 at 100 ms, OptimizeChangeBanc (f_8002f7a0) a 16 ms loop. During the gaps the job workers wait for
+  jobs (ReceiveLightMessageQueue) that nobody has posted yet. Who posts them late is the open question: it needs a
+  wake-chain trace (ETW CSwitch/ReadyThread via WPR, admin), which this session could not take. The uncapped run
+  (HOS_FPS_MAX=1000) never left the gate (frame-clock inputs came early in the faster menus): not comparable, dropped.
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),
