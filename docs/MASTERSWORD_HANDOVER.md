@@ -855,3 +855,20 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
    re-encodes of ASTC textures on disk, compressed, so later loads skip the encode; Xbox Advanced Shader Delivery -> nothing
    game-derived may ship, so make the local start-up preparation incremental instead (a driver update shouldn't mean
    preparing from scratch). Measure first: how long texture re-encodes and pack reads take in the log.
+
+---
+
+## 8. After 0.1.9d (2026-11-15)
+
+- **Icons (fixed, committed):** `assets/`, `launcher/assets/` and `runtime/mastersword.ico` had the same baked checkerboard as
+  the old splash logo (opaque grey squares where transparency should be). Regenerated from the cleaned
+  `assets/mastersword.png` with `python nx2/make_icon.py assets/mastersword.png work` (7 sizes, real alpha). make_icon.py
+  now writes `work/mastersword.ico` + `work/mastersword.res`: the names nx2/build.py looks for. Before, it wrote
+  `hookshot.*`, so the game exe linked no icon at all; it now has one (window, taskbar, Explorer). The launcher spec
+  excludes numpy (unused; Pillow pulls it in only when installed: 35.5 MB -> 23.4 MB, as 0.1.9d shipped). Old icon kept
+  locally at `work/icon_backup/`. Deployed to the smoke folder (exe c1d946c5, DLL a14157d5, launcher af074f8f; previous
+  files `*.bak_pre_icon`). Windows caches icons per path: if Explorer still shows the old one, it is the icon cache.
+- **getenv cache in `vk_mvec.cpp` env_on (uncommitted, in the working tree; patch also at `work/envcache.patch`):** not in
+  the icon build. Its A/B is unsettled: the first A/B said +3.3% slower (likely AV-disturbed), the Mask of Truth sample
+  said faster (22.4 vs 25.3 ms). A clean 6-run A/B (`-Tag envfix3`, `-Dlls envfix,ritocount,...`) was stopped after run 1
+  at the user's request; rerun it whole before deciding.

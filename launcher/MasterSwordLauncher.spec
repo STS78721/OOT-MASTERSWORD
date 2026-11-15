@@ -15,7 +15,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['numpy'],   # (unused; Pillow only pulls it in when installed)
     noarchive=False,
     optimize=0,
 )
