@@ -199,3 +199,29 @@ Good, isolated work (a sandbox outside the project, validated numbers). What it 
   MasterSword's constraint; it would mean rewriting every recompiled shader's texture sampling. Not for MasterSword.
 - **Cooperative vectors 12.96x:** real, and good to know, but nothing in MasterSword's frame is an MLP and the GPU has room.
 - Its bottom line's first point agrees with the measurements: Town's base rate is CPU-side work.
+
+## 12. The frame's critical path, measured (2026-11-15 night, headless bench, market)
+
+Sun's Song (host/suns_song.c) + RX_VK_LOG_READBACK_WAITS + RX_VK_GPU_PROFILE: the main thread waits ~60% of the time on one
+event, released by a ModuleSystemWorker after its renderer readback (`invalidate` -> `wait_recorded_part`) waits for the GPU
+to finish the submission part that writes three pairs of double-buffered result ranges back (7-9 ms when long). The GPU's
+frame (profiled, inflated): copies 4.2 ms (mirror syncs 2.7, readback refresh 1.3), passes 4.0, the game's barriers 1.65
+(147 full barriers + render-pass ends), **6.2 ms idle waiting for recording**. Shader cost is the small part.
+
+**What follows for the levers:**
+- **Recording speed is on the critical path** (the last part arrives sooner, the GPU finishes sooner): the descriptor
+  translation work (textures 31% of draw work) and the capture copies (copy split: measured 1.7%) are worth more than
+  their CPU share suggested.
+- **Rito copy engine (transfer queue) — design sketch, not built:** the msync copies go into a transfer-queue command
+  buffer submitted as soon as the submit's capture is made, signalling a semaphore the recording's graphics submit waits
+  on (VK_PIPELINE_STAGE_2_COPY / ALL_COMMANDS); mirrors and capture buffers created VK_SHARING_MODE_CONCURRENT across the
+  two families (or ownership transfers); the texture uploads/decodes (compute) stay on the graphics queue. Gain: only
+  where the graphics queue is busy when the copies would run — measure the last part's GPU time first (the GPU is idle
+  6.2 ms a frame waiting for recording, when copies cost nothing).
+- **Barriers:** a per-flag translation (0x12 ORDER_FRAGMENTS|INVALIDATE_TEXTURE ~95 a frame, 0x11 41, 0x28 16) instead of
+  full_barrier + end_pass; a few tenths of a ms of GPU at most; visual risk.
+- **Readback refresh:** copies every recently-read result page guest -> mirror at each recording behind a full barrier;
+  narrowing it needs a CPU-only write record (page_gen also carries GPU stamps, and uncollected CPU writes must still go
+  through: the exposure meter's reset).
+- **Not a lever:** newer shader targets ("SM86", a newer shader model): the driver already compiles natively for the
+  GPU, and shaders are the small part of the GPU's frame.

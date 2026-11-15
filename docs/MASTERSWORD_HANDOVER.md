@@ -752,6 +752,12 @@ on in the smoke env (free until the .bat runs) for the Temper sample after the F
     GPU (copies 4 ms + passes 4 ms + barriers, starting as parts arrive) -> the readback ranges written back in the
     submission's last part -> a ModuleSystemWorker's invalidate waits for it -> it signals the main thread's event
     100a758600 -> the next frame. Levers: recording speed (the last part arrives sooner), GPU copies (Rito), barriers.
+  - Sun's Song's hooks cost nothing when off (bench "sunsab": the clean pair 21.68 ms Sun's Song exe vs 22.20 ms V1 with
+    80 more draws; two runs disturbed while the PC was in use and set aside). Bench exe_suns.exe = V1 game code + the
+    tracer + the wait-log name fix; not deployed to smoke (diagnostics only; ships with the next real change).
+  - The readback that the frame waits for is written in its submission's last part, with ~7-8 ms of GPU work still queued
+    when that part is submitted; the late-readback experiment could not drop it (the exposure meter must be fresh). No switch
+    removes this wait: the chain itself has to get shorter (faster recording, a cheaper GPU frame).
 - **The bench (tools/handover/):** mastersword_bench.ps1 (one headless run of the bench copy: -Exe/-Dll name, -Script on
   the frame clock, -Live, -ShotEvery, -Sample, -Env, -Touch), mastersword_bench_ab.ps1 (the Town route, alternated runs),
   mastersword_detached.ps1 (runs a job outside the tool's time limit: bench_runs/_jobs/<job>.done|.failed|.log),
