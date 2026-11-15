@@ -16,6 +16,31 @@ static int safe_tag(const char *s) {
         if (!isalnum((unsigned char)s[i]) && !strchr("._+-", s[i])) return 0;
     return 1;
 }
+
+/* (MasterSword, 2026-11-15) The order of two release tags: < 0, 0, > 0 as a is older, the same, newer than b. Dot-separated parts,
+   each a number then letters ("0.1.9c": 0, 1, 9 c; a leading v ignored): the numbers first, then the letters (none < a < b...).
+   The offer compared for difference only: a game folder built ahead of the latest release (a test build, 0.1.9d before it is
+   published) was offered the older release as "a new version" at every start, and Yes would have built the folder back to it */
+static int tag_order(const char *a, const char *b) {
+    if (*a == 'v' || *a == 'V') a++;
+    if (*b == 'v' || *b == 'V') b++;
+    while (*a || *b) {
+        unsigned long na = 0, nb = 0;
+        while (isdigit((unsigned char)*a)) na = na * 10 + (unsigned long)(*a++ - '0');
+        while (isdigit((unsigned char)*b)) nb = nb * 10 + (unsigned long)(*b++ - '0');
+        if (na != nb) return na < nb ? -1 : 1;
+        while (*a && *a != '.' && *b && *b != '.') {
+            const int ca = tolower((unsigned char)*a++), cb = tolower((unsigned char)*b++);
+            if (ca != cb) return ca < cb ? -1 : 1;
+        }
+        const int ea = !*a || *a == '.', eb = !*b || *b == '.';
+        if (!ea && eb) return 1;    /* (a has more letters in this part) */
+        if (ea && !eb) return -1;
+        if (*a == '.') a++;
+        if (*b == '.') b++;
+    }
+    return 0;
+}
 #endif
 
 #ifdef _WIN32
@@ -111,7 +136,7 @@ void hos_update_check(void) {
         return;
     }
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
-    if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
+    if (!strcmp(tag, have) || !strcmp(tag, skipped) || tag_order(tag, have) <= 0) return;   /* (only a newer release) */
 
     wchar_t wtag[128], whave[128], wbuilder[MAX_PATH], text[2048];
     MultiByteToWideChar(CP_UTF8, 0, tag, -1, wtag, 128);
@@ -278,7 +303,7 @@ void hos_update_check(void) {
         return;
     }
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
-    if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
+    if (!strcmp(tag, have) || !strcmp(tag, skipped) || tag_order(tag, have) <= 0) return;   /* (only a newer release) */
     snprintf(path, sizeof path, "%smastersword_version.txt", dir);
     const int has_builder = installed_builder(builder, sizeof builder) ||
                             (read_value(path, "builder", builder, sizeof builder) && access(builder, X_OK) == 0);

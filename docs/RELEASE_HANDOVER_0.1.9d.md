@@ -38,6 +38,21 @@ slower: off by default). New diagnostics (Sun's Song `HOS_WAKE_TRACE`, Mask of T
 4. The program cache (7.4 GB) is not invalidated by these changes (no `eden/`, `sirit/`, `compat/`, `vk_shader.cpp`,
    `vk_state.h`, `vk_api.h` or `Program`/`Shader::Info` size change).
 
+## Also fixed for 0.1.9d (2026-11-15, after the first version of this handover)
+
+- **The start screen's logo:** `assets/mastersword.png` had a fake-transparency checkerboard baked into its pixels and a
+  clipped line of text along its top edge (both showed on the start screen). Cleaned: real transparency, cropped to the
+  badge and centred in its image. Original kept locally at `work/asset_backup/mastersword_original_checker.png`. Both start
+  screens use it (the ImGui one in vk_menu.cpp `draw_startup` and the GDI one in vk_startup_paint.h). The launcher has its
+  own assets (`launcher/assets`): check those separately if it shows the same checkerboard.
+- **The update offer:** host/hos_update.c compared the latest release's tag for difference only, so a folder built ahead of
+  the latest release (0.1.9d before it is published) was offered 0.1.9c as "a new version" at every start, and Yes would
+  have rebuilt it back. Now only a newer tag is offered (`tag_order`: numbers, then letters; tested on 0.1.9c/0.1.9d/0.1.10/
+  v0.2.0/0.1.9). The launcher's own update check (launcher/MasterSwordLauncher.py) was not looked at.
+- **Built and deployed to the smoke folder** (exe md5 f0badaea, DLL 6702b6e7; the previous pair kept as
+  `*.bak_pre_019d`). The splash should read 0.1.9d. If the logo group looks off-centre on a full screen (a cropped
+  screenshot made it look so), look at `draw_startup`'s width (`c.w`) against the window's.
+
 ## Must be tested live before release (the bench was headless)
 
 The bench ran offscreen at 1080p without a window, present, Reflex or frame generation. Before shipping, play with the
@@ -58,7 +73,7 @@ keep them uncommitted).
 
 ## Release steps
 
-1. `VERSION` -> `0.1.9d`; `runs/_release_prep/PATCH_NOTES_0.1.9d.md` from the draft below (match 0.1.9c's style).
+1. `VERSION` is already `0.1.9d` (Claude, 2026-11-15). Write `runs/_release_prep/PATCH_NOTES_0.1.9d.md` from the draft below (match 0.1.9c's style).
 2. Build (above), test live (above), package per the ship set.
 3. Tag and publish on **STS78721/OOT-MASTERSWORD** only. Never push to `origin` (NotRexed/Hookshot) or `longshot`; never
    force-push `main`.
