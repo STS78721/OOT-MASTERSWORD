@@ -5,6 +5,9 @@ Horizon OS host, and NVN replayed on Vulkan 1.3. Hookshot upstream is gone. Its 
 (MagicBeanDev), which we track and port from. This file covers what lives where, what was found, what changed, and what is
 still open.
 
+**Start here (2026-11-16): `docs/HANDOVER_TO_GEMINI.md`**: upstreams and how to check them, the work in progress, the
+measured findings, tools and next steps, on one page.
+
 ---
 
 **Companion document:** `docs/MASTERSWORD_TECHNIQUES.md` is the playbook of MasterSword's techniques (hybrid-CPU
