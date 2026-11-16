@@ -872,3 +872,16 @@ the OpClock per-NVN-op report in `vk_replay.cpp`.
   the icon build. Its A/B is unsettled: the first A/B said +3.3% slower (likely AV-disturbed), the Mask of Truth sample
   said faster (22.4 vs 25.3 ms). A clean 6-run A/B (`-Tag envfix3`, `-Dlls envfix,ritocount,...`) was stopped after run 1
   at the user's request; rerun it whole before deciding.
+- **Longshot check (2026-11-16, `longshot/main` at bbe421f5, 199 commits since 11-14):**
+  - **Next to test, no build needed: the render target pool (#994, 1db4c290).** Same code and switches here; our bench logs
+    show the same churn (~6,700 targets made new and ~6,550 destroyed per Town run). Longshot's new defaults:
+    `RX_VK_DEAD_EVERY=1 RX_VK_DEAD_MIN_UNUSED=1 RX_VK_TARGET_POOL_MB=768` (pool bound = driver allowance / 12, 256-768 MB).
+    They measured Market at night (RTX 4070 S): images made new -62%, frames over 25 ms 76 -> 49, 1% low 42 -> 45 fps, median
+    about the same. Fidelity note: their one-frame-flip count rose (60/119 vs 17-60), all small and spread out. A/B it on the
+    bench via `-Envs`, then check the picture live before making it default.
+  - **Already covered here:** #766 copy lock (c9fbb0d6): this tree has Hookshot's sharded live-handle set, an incremental
+    sweep and frees outside the lock, which is stronger. Only Longshot's `dead_first` early-out is missing (minor).
+  - **Bigger ports, later:** #588 render thread for the replay (82886e89, plus its fix #838 343a1dfa: don't pin it to one
+    core); #38 fast float regions in the lifter (02608169, nx2/fastfp.py: a lift change, full re-translate); #569 renderer
+    PGO with a committed profile (4e80ea63, 3-5%); #231 flat per-draw caches (3d880bf6, +3.4 fps in one of two configs);
+    #590 three replay costs (6109660c). None apply cleanly (git apply fails); each needs a hand port.
