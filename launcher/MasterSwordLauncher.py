@@ -15,9 +15,9 @@ CURRENT_VERSION = "0.1.9d"
 EDITION_NAME = "SteelTemple MasterSword Edition"
 APP_TITLE = "The Legend of Zelda: Ocarina of Time - PC Recompiled"
 VERSION_STRING = f"V {CURRENT_VERSION}"
-GITHUB_URL = "https://github.com/STS78721/OOT-MASTERSWORD"
-RELEASES_URL = GITHUB_URL + "/releases"
-RELEASES_API_URL = "https://api.github.com/repos/STS78721/OOT-MASTERSWORD/releases/latest"
+GITHUB_URL = "https://gitlab.com/steeltemplesaint-recomps/OOT-MASTERSWORD"
+RELEASES_URL = GITHUB_URL + "/-/releases"
+RELEASES_API_URL = "https://gitlab.com/api/v4/projects/steeltemplesaint-recomps%2FOOT-MASTERSWORD/releases/permalink/latest"
 COLOR_BG_DARK = "#0a0c10"
 COLOR_GOLD = "#ffd24d"
 COLOR_GOLD_HOVER = "#fff2a3"
@@ -1825,7 +1825,7 @@ class MasterSwordLauncherApp(tk.Tk):
         tk.Button(footer,text="CHECK FOR UPDATES",command=self.check_for_updates,font=("Segoe UI",8,"bold"),fg=COLOR_WHITE,bg=COLOR_BUTTON_HOVER,activebackground=COLOR_GOLD,activeforeground="#000",bd=0,padx=10,pady=5,cursor="hand2").pack(anchor="e",pady=(6,0))
         self.release_btn=tk.Button(footer,text="VIEW RELEASE NOTES",command=self.open_latest_release,font=("Segoe UI",8,"bold"),fg="#000",bg=COLOR_GOLD,activebackground=COLOR_GOLD_HOVER,bd=0,padx=10,pady=6,cursor="hand2"); self.release_btn.pack_forget()
         self.canvas.create_window(1050,565,window=footer,anchor="se")
-        repo=tk.Button(self.canvas,text="★ GitHub Repository (STS78721)",font=("Segoe UI",9,"bold"),fg=COLOR_GOLD,bg=COLOR_CARD,activebackground=COLOR_CARD_BORDER,activeforeground=COLOR_GOLD_HOVER,bd=1,relief="solid",padx=14,pady=6,cursor="hand2",command=lambda:webbrowser.open(GITHUB_URL)); self.canvas.create_window(70,570,window=repo,anchor="w")
+        repo=tk.Button(self.canvas,text="★ GitLab Repository (steeltemplesaint-recomps)",font=("Segoe UI",9,"bold"),fg=COLOR_GOLD,bg=COLOR_CARD,activebackground=COLOR_CARD_BORDER,activeforeground=COLOR_GOLD_HOVER,bd=1,relief="solid",padx=14,pady=6,cursor="hand2",command=lambda:webbrowser.open(GITHUB_URL)); self.canvas.create_window(70,570,window=repo,anchor="w")
         self.canvas.create_text(70,608,text=f"{EDITION_NAME.upper()}  ·  USE YOUR OWN GAME DATA",font=("Segoe UI",8,"bold"),fill=COLOR_TEXT_DIM,anchor="w")
     def _save_keep_launcher(self):self.launcher_cfg["show_launcher"]=self.keep_launcher_var.get(); save_config(self.launcher_cfg)
     def choose_game_directory(self):
@@ -2015,20 +2015,20 @@ class MasterSwordLauncherApp(tk.Tk):
         self.release_check_active = True
         self.update_action_btn.pack_forget()
         self.release_btn.pack_forget()
-        self.update_status.config(text="Checking GitHub Releases…", fg=COLOR_TEXT_DIM)
+        self.update_status.config(text="Checking GitLab Releases…", fg=COLOR_TEXT_DIM)
         threading.Thread(target=self._check_release_worker, daemon=True).start()
 
     def _check_release_worker(self):
         try:
-            req = urllib.request.Request(RELEASES_API_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "MasterSwordLauncher"})
+            req = urllib.request.Request(RELEASES_API_URL, headers={"Accept": "application/json", "User-Agent": "MasterSwordLauncher"})
             with urllib.request.urlopen(req, timeout=12) as r:
                 data = json.loads(r.read().decode("utf-8"))
             tag = (data.get("tag_name") or "").strip()
             title = (data.get("name") or tag or "Latest MasterSword release").strip()
-            page = data.get("html_url") or RELEASES_URL
+            page = (data.get("_links") or {}).get("self") or f"{GITHUB_URL}/-/releases/{tag}" or RELEASES_URL
             if not tag:
                 raise ValueError("The latest release did not include a version tag.")
-            assets = data.get("assets", [])
+            assets = (data.get("assets") or {}).get("links") or data.get("assets") or []
             tag_clean = tag.replace("-", "").replace(".", "")
             candidates = [
                 f"SteelTemple-MasterSword-{tag}-Update.zip",
@@ -2040,7 +2040,7 @@ class MasterSwordLauncherApp(tk.Tk):
             if not asset:
                 asset = next((item for item in assets if "update" in item.get("name", "").lower() and item.get("name", "").lower().endswith(".zip")), None)
             asset_name = asset.get("name") if asset else None
-            asset_url = asset.get("browser_download_url") if asset else None
+            asset_url = (asset.get("url") or asset.get("browser_download_url")) if asset else None
             self.after(0, lambda: self._show_release_result(tag, title, page, asset_url, asset_name))
         except Exception as exc:
             detail = str(exc)
@@ -2098,7 +2098,7 @@ class MasterSwordLauncherApp(tk.Tk):
         self.update_in_progress = True
         self._auto_installing = bool(auto)
         self.update_action_btn.config(state=tk.DISABLED, text="DOWNLOADING UPDATE…")
-        self.update_status.config(text="Connecting to GitHub Releases…", fg=COLOR_TEXT_DIM)
+        self.update_status.config(text="Connecting to GitLab Releases…", fg=COLOR_TEXT_DIM)
         threading.Thread(target=self._download_update_worker, args=(self.latest_release.copy(),), daemon=True).start()
 
     def _download_update_worker(self, release):
@@ -2231,7 +2231,7 @@ Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         MasterSwordSettingsDialog(self)
     def open_extras(self):
         menu=tk.Menu(self,tearoff=0,bg=COLOR_CARD,fg=COLOR_WHITE,activebackground=COLOR_GOLD,activeforeground="#000",font=("Segoe UI",10,"bold"),bd=1)
-        menu.add_command(label="🌐  Visit SteelTempSaint MasterSword (GitHub)",command=lambda:webbrowser.open(GITHUB_URL))
+        menu.add_command(label="🌐  Visit SteelTempSaint MasterSword (GitLab)",command=lambda:webbrowser.open(GITHUB_URL))
         menu.add_command(label="⬆  Check for SteelTemple Releases",command=self.check_for_updates)
         menu.add_command(label="🧩  Open Mod Manager",command=lambda:MasterSwordModsManagerDialog(self))
         menu.add_command(label="🛡  Save Backup Vault",command=self.open_save_vault); menu.add_separator()
