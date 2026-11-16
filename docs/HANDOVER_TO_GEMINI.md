@@ -34,6 +34,16 @@ Deploy the renderer as `mastersword_vk.dll`.
 | `origin` | https://github.com/NotRexed/Hookshot | The original Hookshot. Dead. | History only. Never push. |
 | (no remote) | https://github.com/Shakoquo/Mako | A GPL-3 Hookshot fork aimed at AMD | Ideas only: its Castle Town import-stall fix and "NaN guard". It publishes no fps numbers. |
 
+**Moving to Codeberg (2026-11-16, GitHub down):** the user is moving the repository to Codeberg.
+- **Repository and remote:** create an empty repository there (no README or licence), then
+  `git remote add codeberg https://codeberg.org/STS78721/<repo>.git` and `git push codeberg mastersword-fg main`.
+- **Credentials:** the user signs in themselves, with a Codeberg access token in the Windows credential prompt. Never put a
+  password in a script, a remote URL or a note.
+- **Releases don't move with git.** The 0.1.9d zips must be uploaded again on Codeberg.
+- **Update checks:** the game's update check (`host/hos_update.c`) and the launcher (`launcher/MasterSwordLauncher.py`) read
+  GitHub releases. If Codeberg becomes the home, point both at Codeberg's releases API, which is Forgejo's and
+  GitHub-like: `/api/v1/repos/<owner>/<repo>/releases`.
+
 **Checking Longshot for new work:**
 
 ```
