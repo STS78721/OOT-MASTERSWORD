@@ -71,8 +71,12 @@ struct State {
 bool env_on() {
     // RX_VK_MVEC=0 force off; =1 force on. Default: only when DLSS SR can actually run — otherwise the
     // 4K block-match flow every frame TDRs the GPU for no benefit (DLSS SR was not loading).
-    if (const char* e = getenv("RX_VK_MVEC")) return atoi(e) != 0;
-    return false /* Streamline SR retired; temporal owns MVs */;
+    // Read once: env_on() runs on every recorded draw, and getenv walks the whole environment block each call.
+    static const bool v = [] {
+        if (const char* e = getenv("RX_VK_MVEC")) return atoi(e) != 0;
+        return false /* Streamline SR retired; temporal owns MVs */;
+    }();
+    return v;
 }
 uint32_t max_edge() {
     // Hard cap: 2560+ block-match with DLSS DLAA@4K exhausted VRAM and froze the machine (2026-11-09).

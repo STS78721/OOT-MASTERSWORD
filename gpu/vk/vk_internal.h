@@ -291,6 +291,7 @@ void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel r
 void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
+uint64_t vk_retirement_value();   // (longshot #442/#788) a timeline value that follows every recording currently alive
 void vk_timeline_wait(uint64_t v);
 /// (hookshot #2633) A capture write-back part: 1 done, 0 submitted, -1 unknown. Wait returns true when known (done or timed out).
 int vk_part_state(uint64_t part);

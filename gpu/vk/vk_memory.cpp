@@ -2602,7 +2602,8 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
 } // namespace
 void memory_cpu_owned(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
-    if (off || !guest) return;
+    // (longshot #590, no mirrors: no write-back will ever cut these words out)
+    if (off || !guest || !mirror_on()) return;
     std::lock_guard lk(cpu_words_mu);
     if (cpu_words.size() + cpu_words_recent.size() + cpu_words_new.size() > 65536) {   // (as before: forgotten when it gets this big)
         cpu_words_merge();   // (which leaves cpu_words_new empty)
@@ -4133,7 +4134,8 @@ bool wbd_pipe_ready() {
     return ok;
 }
 void shadow_written_to(std::vector<uint32_t>& list, const uint32_t* pages, int64_t n) {
-    if (n <= 0 || !wb_diff_on()) return;
+    // (longshot #590, no mirrors: the lists are read by a write-back's diff only)
+    if (n <= 0 || !wb_diff_on() || !mirror_on()) return;
     std::lock_guard lk(shadow_written_mu);
     if (shadow_written_pages.size() + shadow_written_collected_list.size() + shadow_written_by_replay.size() > (8u << 20)) {
         shadow_written_all = true;   // (no write-back has read them for a long while: all of them, then)
@@ -4154,7 +4156,7 @@ int guest_cpu_write(uint64_t gpu, const void* src, uint64_t n) {
     return ok;
 }
 void guest_cpu_wrote(uint64_t gpu, uint64_t n) {
-    if (!n || !wb_diff_on()) return;
+    if (!n || !wb_diff_on() || !mirror_on()) return;   // (longshot #590, as shadow_written_to)
     uint32_t pages[64];
     int k = 0;
     for (uint64_t a = gpu & ~4095ull; a < gpu + n; a += 4096) {   // (GPU pages are mapped to guest memory page by page)

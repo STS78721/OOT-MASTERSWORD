@@ -3524,6 +3524,11 @@ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
 }
 } // namespace
 
+uint64_t vk_retirement_value() {   // (longshot #442/#788)
+    const uint64_t s = std::atomic_ref<const uint64_t>(signaled).load(std::memory_order_acquire);
+    return timeline && s != UINT64_MAX ? s + 1 : 0;
+}
+
 void write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     std::vector<uint8_t> raw;
     raw.reserve((size_t)(w * 3 + 1) * h);
