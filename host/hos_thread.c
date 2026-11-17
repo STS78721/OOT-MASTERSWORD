@@ -36,8 +36,8 @@ struct HosThread {
     HANDLE wake;
     /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued, and
        whether it has run without one since an escape (vc_acquire; until its next block, hos_vcore_away, or the next
-       hos_vcore_back) */
-    int vc_held, vc_last, vc_queued, vc_escaped;
+       hos_vcore_back); vc_starved: waiting longer than HOS_VCORE_STARVE_US (it goes first at the next release) */
+    int vc_held, vc_last, vc_queued, vc_escaped, vc_starved;
     volatile int vc_kick;
     int64_t vc_since;
     CONDITION_VARIABLE vc_cv;
@@ -1521,7 +1521,7 @@ static SRWLOCK vc_lock = SRWLOCK_INIT;
 static HosThread *vc_owner[8];
 static HosThread *vc_queue[1024];
 static int vc_nq;
-static struct { int64_t takes, waits, wait_ns, max_ns, escapes, kicks, yields, since; } vc_st;
+static struct { int64_t takes, waits, wait_ns, max_ns, escapes, kicks, yields, boosts, since; } vc_st;
 
 int hos_vcores_on(void) {
     static int on = -1;
@@ -1538,9 +1538,11 @@ static unsigned vc_allowed(HosThread *t) {
     if (!m) m = 1u << hos_thread_core(t);
     return m;
 }
-/* a runs before b */
+/* a runs before b: a starved waiter first (the one waiting longest first among them), then by priority (#594) */
 static int vc_better(HosThread *a, HosThread *b) {
-    return a->priority != b->priority ? a->priority < b->priority : a->vc_since < b->vc_since;
+    if (a->vc_starved != b->vc_starved) return a->vc_starved;
+    if (!a->vc_starved && a->priority != b->priority) return a->priority < b->priority;
+    return a->vc_since < b->vc_since;
 }
 /* a free core t may run on (its last one, its ideal one, then the lowest), or -1; holding vc_lock */
 static int vc_free_for(HosThread *t) {
@@ -1557,6 +1559,7 @@ static void vc_take(HosThread *t, int c) {
     t->vc_held = c + 1;
     t->vc_last = c + 1;
     t->vc_kick = 0;
+    t->vc_starved = 0;
 }
 static void vc_dequeue(HosThread *t) {
     for (int i = 0; i < vc_nq; i++)
@@ -1572,6 +1575,7 @@ static void vc_grant(int c) {
     for (int i = 0; i < vc_nq; i++)
         if ((vc_allowed(vc_queue[i]) >> c & 1) && (!best || vc_better(vc_queue[i], best))) best = vc_queue[i];
     if (!best) return;
+    vc_st.boosts += best->vc_starved;
     vc_dequeue(best);
     vc_take(best, c);
     WakeConditionVariable(&best->vc_cv);
@@ -1579,10 +1583,10 @@ static void vc_grant(int c) {
 static void vc_stats_locked(int64_t now) {
     if (!vc_st.since) vc_st.since = now;
     if (now - vc_st.since < 5000000000LL) return;
-    hos_log("vcores: %lld takes, %lld waits (mean %.0f us, longest %.1f ms), %lld kicks, %lld yields, %lld escapes in %.0f s",
+    hos_log("vcores: %lld takes, %lld waits (mean %.0f us, longest %.1f ms), %lld kicks, %lld yields, %lld starved grants, %lld escapes in %.0f s",
             (long long)vc_st.takes, (long long)vc_st.waits, vc_st.waits ? vc_st.wait_ns / 1e3 / vc_st.waits : 0.0,
-            vc_st.max_ns / 1e6, (long long)vc_st.kicks, (long long)vc_st.yields, (long long)vc_st.escapes,
-            (now - vc_st.since) / 1e9);
+            vc_st.max_ns / 1e6, (long long)vc_st.kicks, (long long)vc_st.yields, (long long)vc_st.boosts,
+            (long long)vc_st.escapes, (now - vc_st.since) / 1e9);
     memset(&vc_st, 0, sizeof vc_st);
     vc_st.since = now;
 }
@@ -1590,7 +1594,7 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
     const char *e = getenv(name);
     return (e ? atoll(e) : us) * 1000;
 }
-static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int64_t slice) {   /* (vc_lock held) */
+static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int64_t slice, int64_t starve) {   /* (vc_lock held) */
     const int64_t t0 = hos_now_ns();
     t->vc_since = t0;
     t->vc_queued = 1;
@@ -1612,6 +1616,11 @@ static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int
         if (!worst && elapsed > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
+        if (!worst && t->vc_starved)
+            for (int k = 0; k < vc_cores(); k++) {
+                HosThread *h = vc_owner[k];
+                if ((m >> k & 1) && h && (!worst || h->priority > worst->priority)) worst = h;
+            }
         if (worst && !worst->vc_kick) {
             worst->vc_kick = worst->priority > t->priority ? 1 : 2;
             Ctx *rc = worst->run_ctx;   /* (a fiber's context while it runs one) */
@@ -1633,8 +1642,10 @@ static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int
             break;
         }
         const int64_t waited = hos_now_ns() - t0;
+        if (starve > 0 && waited > starve) t->vc_starved = 1;
         if (waited > (worst ? esc_better : esc_eq)) {
             vc_dequeue(t);
+            t->vc_starved = 0;
             t->vc_escaped = 1;
             vc_st.escapes++;
             static int logged;
@@ -1657,13 +1668,14 @@ static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int
     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
     vc_stats_locked(hos_now_ns());
 }
-static int64_t vc_esc_better = -1, vc_esc_eq, vc_slice;
+static int64_t vc_esc_better = -1, vc_esc_eq, vc_slice, vc_starve;
 static void vc_init_params(void) {
     if (vc_esc_better < 0) {
         /* (#2127 / #1929) 2 s default: 250 ms escaped 6-8x/run on waits that finish alone within ~1.2 s */
         vc_esc_eq = vc_env_ns("HOS_VCORE_ESCAPE_EQ_US", 2000000);
         vc_esc_better = vc_env_ns("HOS_VCORE_ESCAPE_US", 2000000);
         vc_slice = vc_env_ns("HOS_VCORE_SLICE_US", 2000);
+        vc_starve = vc_env_ns("HOS_VCORE_STARVE_US", 1000000);
     }
 }
 static void vc_acquire(HosThread *t) {
@@ -1676,7 +1688,7 @@ static void vc_acquire(HosThread *t) {
         ReleaseSRWLockExclusive(&vc_lock);
         return;
     }
-    vc_wait_locked(t, vc_esc_better, vc_esc_eq, vc_slice);
+    vc_wait_locked(t, vc_esc_better, vc_esc_eq, vc_slice, vc_starve);
     ReleaseSRWLockExclusive(&vc_lock);
 }
 static void vc_release(HosThread *t) {
@@ -1699,7 +1711,7 @@ static void vc_yield(HosThread *t, int strict) {
     int any = 0;
     for (int i = 0; i < vc_nq && !any; i++) {
         HosThread *w = vc_queue[i];
-        any = (vc_allowed(w) >> c & 1) && (strict ? w->priority < t->priority : w->priority <= t->priority);
+        any = (vc_allowed(w) >> c & 1) && (w->vc_starved || (strict ? w->priority < t->priority : w->priority <= t->priority));
     }
     t->vc_kick = 0;
     if (!any) {
@@ -1717,7 +1729,7 @@ static void vc_yield(HosThread *t, int strict) {
         ReleaseSRWLockExclusive(&vc_lock);
         return;
     }
-    vc_wait_locked(t, vc_esc_better, vc_esc_eq, vc_slice);
+    vc_wait_locked(t, vc_esc_better, vc_esc_eq, vc_slice, vc_starve);
     ReleaseSRWLockExclusive(&vc_lock);
 }
 /* 1 when the caller is to take a core again after its block (hos_vcore_back): it gave its core up, or it has run without

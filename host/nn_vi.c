@@ -123,21 +123,39 @@ static volatile int present_interval = 1;
 /* (hookshot) Frame rate cap past 60 (Insert menu Game frame rate cap / HOS_FPS_MAX): pacing, the game's limiter and
    vsync event follow it; time step is the frames' own (realtime_step). Uncapped is 1000 fps (1 ms pacing). Unset/60: console. */
 int hos_ini_option(const char *key, int otherwise);   /* (nn_applet.c) */
-static int fps_max(void) {
-    enum { FPS_UNCAPPED = 1000 };
-    static int v = -1;
-    if (v < 0) {
-        /* frame_rate_cap=: 0..5 = 60..240, 6 Uncapped; unknown -> 60. HOS_FPS_MAX over it */
-        static const int caps[] = {60, 90, 120, 144, 165, 240, FPS_UNCAPPED};
-        enum { CAPS = sizeof caps / sizeof caps[0] };
+enum { FPS_UNCAPPED = 1000, FPS_MOVIE = 240 };   /* (#488: pace at 240 while a movie plays) */
+static volatile uint64_t movie_seen_at;
+static const int64_t MOVIE_STALE_NS = 250000000LL;
+static volatile int fps_now;
+static int fps_of(int want) { return want > 60 ? (want > FPS_UNCAPPED ? FPS_UNCAPPED : want) : 60; }
+static void fps_refresh(void) {
+    /* frame_rate_cap=: 0..5 = 60..240, 6 Uncapped; unknown -> 60. HOS_FPS_MAX over it */
+    static const int caps[] = {60, 90, 120, 144, 165, 240, FPS_UNCAPPED};
+    enum { CAPS = sizeof caps / sizeof caps[0] };
+    static int row = -1, movie_pace = -1;
+    if (row < 0) {
         const int i = hos_ini_option("frame_rate_cap", 0);
         const char *e = getenv("HOS_FPS_MAX");
-        const int want = e ? atoi(e) : caps[i >= 0 && i < CAPS ? i : 0];
-        v = want > 60 ? (want > FPS_UNCAPPED ? FPS_UNCAPPED : want) : 60;
-        if (v == FPS_UNCAPPED) hos_log("vi: frame rate uncapped: pacing, the game's limiter and its time step follow the frames");
-        else if (v > 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
+        row = fps_of(e ? atoi(e) : caps[i >= 0 && i < CAPS ? i : 0]);
+        movie_pace = !(getenv("HOS_MOVIE_PACE") && !atoi(getenv("HOS_MOVIE_PACE")));
     }
-    return v;
+    int v = row;
+    if (movie_pace && row == 60) {
+        const uint64_t seen = __atomic_load_n(&movie_seen_at, __ATOMIC_RELAXED);
+        if (seen && hos_now_ns() - (int64_t)seen < MOVIE_STALE_NS) v = FPS_MOVIE;
+    }
+    const int was = fps_now;
+    if (v == was) return;
+    fps_now = v;
+    if (v == FPS_MOVIE && row == 60) hos_log("vi: a movie is playing: the frame rate goes to %d for it (HOS_MOVIE_PACE=0 leaves it)", FPS_MOVIE);
+    else if (was == FPS_MOVIE && row == 60) hos_log("vi: the movie is over: back to the game's frame rate cap 60");
+    else if (v == FPS_UNCAPPED) hos_log("vi: frame rate uncapped: pacing, the game's limiter and its time step follow the frames");
+    else if (v > 60) hos_log("vi: frame rate cap %d: pacing, the game's limiter and its time step follow it", v);
+    else if (was) hos_log("vi: frame rate cap 60: the game's own limiter and step");
+}
+static int fps_max(void) {
+    if (!fps_now) fps_refresh();
+    return fps_now;
 }
 static int64_t next_frame_at, window_start, frames_in_window;
 /* Mastersword Pacer: when acquire returned and this frame's work began. Present reads it and does not sleep. */
@@ -249,6 +267,7 @@ volatile uint32_t hos_frame_seconds_bits = 0;   /* (frame seconds as float bits 
    that movie player is worth, the rest carried to its next one (issue 1742). Called by lifted f_83b7c710. */
 uint32_t hos_movie_frames(uint64_t player) {
     enum { PLACES = 16 };
+    __atomic_store_n(&movie_seen_at, (uint64_t)hos_now_ns(), __ATOMIC_RELAXED);   /* (#488: movie player just updated) */
     const uint32_t bits = __atomic_load_n(&hos_frame_seconds_bits, __ATOMIC_RELAXED);
     if (!bits) return 1;
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -445,6 +464,7 @@ static void present_trace(int64_t frame, int64_t now) {
     }
 }
 void hos_vi_native_presented(void) {
+    fps_refresh();
     static long long scan_n;
     scan_dt(++scan_n);
     {   /* HOS_FRAME_SLEEP_MS (diagnostic): slower frames, for game speed against frame rate */
