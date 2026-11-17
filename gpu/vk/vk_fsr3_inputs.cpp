@@ -73,8 +73,8 @@ struct State {
     bool have_frame = false;
     std::atomic<uint64_t> upscaled_frame{0};   // (the frame FSR's upscaler last drew: jitter_size, on the game's thread)
     std::atomic<uint32_t> jitter_w{0}, jitter_h{0}, jitter_phases{8};
-    struct Dead { uint64_t frame; std::function<void()> free; };
-    std::vector<Dead> dead;   // (what work in flight may still use: freed a few frames on)
+    struct Dead { uint64_t frame; uint64_t value; std::function<void()> free; };
+    std::vector<Dead> dead;   // (what work in flight may still use: freed once frames and timeline pass)
     const char* reason = nullptr;
     int reason_repeats = 0;
     bool told = false;
@@ -91,12 +91,12 @@ bool fail(const char* why) {   // (why, when it changes and every 600th time)
     return false;
 }
 
-void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), std::move(f)}); }
+void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), vk_retirement_value(), std::move(f)}); }
 void free_dead() {
     State& s = st();
-    const uint64_t now = texture_frame_no();
+    const uint64_t now = texture_frame_no(), done = vk_timeline_completed();
     for (size_t i = 0; i < s.dead.size();) {
-        if (now - s.dead[i].frame > 4) {
+        if (now - s.dead[i].frame > 4 && s.dead[i].value && done >= s.dead[i].value) {
             s.dead[i].free();
             s.dead[i] = std::move(s.dead.back());
             s.dead.pop_back();

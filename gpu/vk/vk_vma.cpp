@@ -5,6 +5,7 @@
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include "vk_internal.h"
+#include "vram_compact.h"
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
@@ -357,6 +358,18 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
             f += b[h].statistics.blockBytes - std::min(b[h].statistics.blockBytes, b[h].statistics.allocationBytes);
         }
     *used = u, *budget = t;
+    // (longshot #1091) AMD's Windows driver, once a process is over what it allows, reports the allowance as what the process uses.
+    static const bool at_count_rule = !getenv("RX_VK_ALLOWED_AT_COUNT") || atoi(getenv("RX_VK_ALLOWED_AT_COUNT")) != 0;
+    if (at_count_rule) {
+        const uint64_t was = t;
+        t = vram_compact::past_allowance(u, t);
+        static std::atomic<int> told{0};
+        if (t != was && told.fetch_add(1, std::memory_order_relaxed) < 8)
+            logf("vk: the driver's allowance is the count itself (%llu MB used of %llu): past it, taken as %llu MB "
+                 "(RX_VK_ALLOWED_AT_COUNT=0: as the driver says)", (unsigned long long)(u >> 20), (unsigned long long)(was >> 20),
+                 (unsigned long long)(t >> 20));
+        *budget = t;
+    }
     if (block_free) *block_free = f;
     return t != 0;
 }

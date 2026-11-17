@@ -214,8 +214,8 @@ struct State {
     uint64_t engines_made = 0;  // (prepare's new histories: a feature or context made again, each a stall in play)
     float status_jitter[2]{};   // (the last evaluation's jitter, in render pixels, and whether it had motion)
     bool status_motion = false;
-    struct Dead { uint64_t frame; std::function<void()> free; };
-    std::vector<Dead> dead;   // (what work in flight may still use: freed a few frames on)
+    struct Dead { uint64_t frame; uint64_t value; std::function<void()> free; };
+    std::vector<Dead> dead;   // (what work in flight may still use: freed once frames and timeline pass)
     uint64_t asked = 0;       // (the frame an upscale last asked for an engine: temporal_idle)
     std::atomic<bool> holding{false};   // (an engine's state, images or frees still to do: temporal_idle has something to let go)
 };
@@ -261,12 +261,12 @@ bool fail(const char* why) {   // (the network runs: why, when it changes and ev
     return false;
 }
 
-void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), std::move(f)}); }
+void later(std::function<void()> f) { st().dead.push_back({texture_frame_no(), vk_retirement_value(), std::move(f)}); }
 void free_dead(bool all) {
     State& s = st();
-    const uint64_t now = texture_frame_no();
+    const uint64_t now = texture_frame_no(), done = vk_timeline_completed();
     for (size_t i = 0; i < s.dead.size();) {
-        if (all || now - s.dead[i].frame > 4) {
+        if (all || (now - s.dead[i].frame > 4 && s.dead[i].value && done >= s.dead[i].value)) {
             s.dead[i].free();
             s.dead[i] = std::move(s.dead.back());
             s.dead.pop_back();
