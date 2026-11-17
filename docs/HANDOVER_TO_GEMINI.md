@@ -53,7 +53,7 @@ git show <hash> --format=%B | sed -n "/## Why/,/## Testing/p"     # their PR bod
 git show <hash> -- <files> > work/x.patch; git apply --check work/x.patch
 ```
 
-- **Last checked:** 2026-11-16, `longshot/main` = `bbe421f5`. Start the next check from that commit or that date.
+- **Last checked:** 2026-11-17, `longshot/main` = `544229a2` (25 applicable PRs ported across `b14fca13..34038ede`; skipped `#588` render thread, `#977` early reads, `#903`/`#1188` precompile, `#952` Intel UB snapshot, and relift PRs `#1098`/`#1224`/`#1152`/`#1191`/`#1233`).
 - **Porting from Longshot:**
   - Most of their patches no longer apply as-is, because the trees have drifted. Port by hand, and mark ported lines `(longshot #NNN)`.
   - Their tree uses `longshot_env.h` / `env_on()`, and ours uses plain `getenv`.
@@ -63,49 +63,14 @@ git show <hash> -- <files> > work/x.patch; git apply --check work/x.patch
 
 ---
 
-## 2. Current state (2026-11-16)
+## 2. Current state (2026-11-17)
 
-- **Released:** 0.1.9d on GitHub (Biggoron's Forge V1 + the capture copy split, about +4% in the market).
+- **Released:** 0.1.9d (Biggoron's Forge V1 + capture copy split, ~+4% in market).
   Release notes: `runs/_release_prep/PATCH_NOTES_0.1.9d.md`. Release handover: `docs/RELEASE_HANDOVER_0.1.9d.md`.
-- **Committed and pushed after the release:** `888d0a6f`, the icons. All three `.ico` files now have real transparency, regenerated
-  from `assets/mastersword.png`. The game exe has an icon again: `nx2/make_icon.py` now writes `work/mastersword.res`, which
-  `nx2/build.py` links. The launcher spec excludes numpy.
-- **Committed locally, not pushed:** `b32a315e` (handover: the Longshot check) and this file.
-
-### In progress: the user is play-testing the render target pool (Longshot #994)
-
-- **The change:** uncommitted in the working tree: `gpu/vk/vk_texture.cpp` plus the new, untracked `gpu/vk/target_pool.h`. Also saved as
-  `work/targetpool.patch`. It changes three defaults:
-  - The pool's bound is a twelfth of the VRAM the driver allows, 256-768 MB (it was a fixed 256 MB).
-  - `RX_VK_DEAD_EVERY` 10 → 1.
-  - `RX_VK_DEAD_MIN_UNUSED` 3 → 1.
-- **Why:** the game makes its per-frame render targets at shifted addresses every frame. Our bench logs show ~6,700 made new and
-  ~6,550 destroyed per Town run. Longshot measured in the market at night (RTX 4070 S):
-  - images made new: -62%
-  - frames over 25 ms: 76 → 49
-  - 1% low: 42 → 45 fps
-  - median fps: about the same
-- **Deployed:** the smoke folder runs it (exe `d9096b63`, DLL `f48dc04b`). The previous pair is kept as `*.bak_pre_pool`.
-- **The user's test shortcuts (desktop):**
-  - "MasterSword - NEW target pool" runs `Test - NEW target pool.bat` in the smoke folder.
-  - "MasterSword - OLD target pool" runs `Test - OLD target pool.bat`, which sets the three old values.
-  - Both run the same build.
-- **What to compare:**
-  - Hitches and 1% lows in the market, at night if possible.
-  - The log's `render target images: … made new` count. NEW also logs `render target pool: up to 768 MB`.
-  - **Fidelity:** single-frame flashes or wrong images. Longshot's picture check counted more small one-frame changes with it on.
-- **When the user reports:**
-  - **Better or equal, and no visual problem:** commit (`gpu/vk/vk_texture.cpp` + `gpu/vk/target_pool.h`) and push.
-  - **Worse, or a visual problem:** `git checkout gpu/vk/vk_texture.cpp`, delete `target_pool.h`, then restore the smoke `*.bak_pre_pool` files.
-
-### Parked: the getenv cache in `vk_mvec.cpp` `env_on()`
-
-- **The change:** set aside (not in the working tree), kept as `work/envcache.patch`. Re-apply with `git apply work/envcache.patch`.
-- **Unsettled:**
-  - The first A/B said +3.3% slower, but antivirus USB scanning every 7 s was disturbing runs then; the user has since fixed it.
-  - A Mask of Truth sample later said faster: 22.4 vs 25.3 ms a frame.
-- **To settle it:** a full clean 6-run A/B (`-Tag envfix3`; DLLs `dll_envfix.dll` vs `dll_ritocount.dll` in the bench folder).
-  That run was stopped after run 1 at the user's request.
+- **In progress — 0.2.0 staged & deployed to smoke for live playtest (`mastersword-fg`):**
+  - Ported 25 `MagicBeanDev/Longshot` PRs up to `544229a2` (`#231`, `#590`, `#621`, `#661`, `#552`, `#442`, `#994`, `#1255`, `#1222`, `#1091`, `#384`, `#672`, `#568`, `#553`, `#554`, `#1251`, `#1248`, `#1244`, `#311`, `#788`, `#1083`, `#468`, `#469`, `#431`, `#440`, `#670`, `#769`, `#1256`, `#594`, `#488`, `#1167`) while keeping **`RX_VK_DEAD_MIN_UNUSED=3`**, 96 MB pressure pool floor, 7.4 GB program cache stamp, ABI `10/11`, and all 91 lifted chunks untouched.
+  - Bumped `VERSION`, `host/hos_update.c` (`permalink/latest`), and `launcher/MasterSwordLauncher.py` to **`0.2.0`**, rebuilt standalone binaries + `MasterSwordLauncher.exe`, deployed to smoke (`C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b` with `*.bak_pre_020` backups, keeping `mastersword_vk.dll.bak_4x50`), and staged `0.2.0` zips in `runs/_release_prep/dist/`. Release handover: `docs/RELEASE_HANDOVER_0.2.0.md`.
+- **Note on earlier parked experiments:** `#994` target pool (with `DEAD_MIN_UNUSED=3` + `#1255`) and `vk_mvec.cpp` cached `getenv` are now integrated on `mastersword-fg`.
 
 ---
 
@@ -164,22 +129,17 @@ git show <hash> -- <files> > work/x.patch; git apply --check work/x.patch
 
 ## 5. Next steps, in order
 
-1. **Act on the user's target-pool test** (§2).
-2. **Settle the getenv cache** with a clean A/B, or drop it (§2).
-3. **Longshot ports worth doing**, all hand ports:
-   - **#231 flat per-draw caches** (`3d880bf6`): +3.4 fps in one of two configs on an RTX 5090.
-   - **#590 three replay costs** (`6109660c`): vertex-binding ranges, a lock per sampled texture. Its mirror bookkeeping part may
-     not apply: NVIDIA here uses mirrors.
+1. **Live smoke test `0.2.0`** (`C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b` — follow `docs/RELEASE_HANDOVER_0.2.0.md`).
+2. **Remaining Longshot leads (not yet ported):**
    - **#569 renderer PGO** (`4e80ea63`): 3-5% renderer time. Needs our own play profile for `mastersword_vk.dll`.
    - **#588 render thread** (`82886e89`) + **#838** (`343a1dfa`, don't pin it to one core): a big change. It replays frame N
-     while the game builds N+1. It needs care with our readback path, because the game waits on a readback every frame (§3).
-   - **#38 fast float regions** (`02608169`, `nx2/fastfp.py`): a lift change, so a full re-translate. It overlaps Biggoron's
+     while the game builds N+1. Needs care with our readback path, because the game waits on a readback every frame (§3).
+   - **#38 fast float regions** (`02608169`, `nx2/fastfp.py`): a lift change, so a full re-translate. Overlaps Biggoron's
      Forge's inline float fast paths, so measure against Forge, not against plain.
-   - Already covered, no port: **#766 copy lock** (our sharded live-handle set is stronger).
-4. **The readback on the critical path** (research doc §12): narrowing the readback refresh, and barrier precision. **Fidelity risk:**
+   - Already done on `mastersword-fg` (`b14fca13..34038ede`): **#231** flat caches, **#590** replay costs / `wrote_regions` / `getenv` caches, **#994+#1255** target pool (`RX_VK_DEAD_MIN_UNUSED=3`), **#1222** ASTC reuse, **#1256** shadow bucketing, **#1091** AMD `past_allowance`, **#1083/#468/#469/#431/#440/#769/#594/#488/#1167**, etc.; **#766** already covered.
+3. **The readback on the critical path** (research doc §12): narrowing the readback refresh, and barrier precision. **Fidelity risk:**
    only with the user watching the picture.
-5. **Release:** when enough has landed, follow `docs/RELEASE_HANDOVER_0.1.9d.md` (ship set, Pearl Abyss-style notes, publish on
-   `mastersword` only). The clean icons are not in a published zip yet.
+4. **Release `0.2.0`:** once live smoke passes, push/tag and publish from `runs/_release_prep/dist/` per `docs/RELEASE_HANDOVER_0.2.0.md`.
 
 ---
 

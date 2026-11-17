@@ -54,7 +54,7 @@ static int tag_order(const char *a, const char *b) {
 
 #define UPDATE_HOST L"gitlab.com"
 #define UPDATE_PATH L"/api/v4/projects/steeltemplesaint-recomps%2FOOT-MASTERSWORD/releases/permalink/latest"
-#define RELEASES_PAGE L"https://gitlab.com/steeltemplesaint-recomps/OOT-MASTERSWORD/-/releases/0.1.9d"
+#define RELEASES_PAGE L"https://gitlab.com/steeltemplesaint-recomps/OOT-MASTERSWORD/-/releases/permalink/latest"
 
 /* (a line "name=value" of a small text file, in UTF-8: its value, trimmed) */
 static int read_value(const wchar_t *path, const char *name, char *out, size_t cap) {
