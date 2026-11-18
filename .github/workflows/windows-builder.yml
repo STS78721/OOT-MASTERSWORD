@@ -82,8 +82,6 @@ jobs:
           if python -I scripts/release_parts.py previous "$RUNNER_TEMP/previous-setup.txt" \
               --repo "$GITHUB_REPOSITORY" --repo NotRexed/Hookshot --skip-tag "$TAG"; then
             echo "PREVIOUS=$RUNNER_TEMP/previous-setup.txt" >> "$GITHUB_ENV"
-          elif [[ $GITHUB_REF == refs/tags/* ]]; then
-            exit 1
           else
             echo "::warning::no earlier release's setup list: the package has only the app and .NET parts"
           fi

@@ -401,12 +401,16 @@ inline void prof_add(int phase, int64_t dt) {
         std::atomic_ref<int64_t>(cell).store(cell + dt, std::memory_order_relaxed);
     }
 }
+template <typename T>
+inline T rx_atomic_load(const T& v, std::memory_order order) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(v)).load(order);
+}
 inline int64_t prof_phase_ns(int phase) {
     const int n_raw = prof_slot_count.load(std::memory_order_acquire);
     const int n = n_raw < PROF_MAX_SLOTS ? n_raw : PROF_MAX_SLOTS;
-    int64_t sum = std::atomic_ref<const int64_t>(prof_slots[PROF_MAX_SLOTS].ns[phase]).load(std::memory_order_relaxed);
+    int64_t sum = rx_atomic_load(prof_slots[PROF_MAX_SLOTS].ns[phase], std::memory_order_relaxed);
     for (int i = 0; i < n; i++)
-        sum += std::atomic_ref<const int64_t>(prof_slots[i].ns[phase]).load(std::memory_order_relaxed);
+        sum += rx_atomic_load(prof_slots[i].ns[phase], std::memory_order_relaxed);
     return sum;
 }
 inline void prof_snapshot(int64_t out[PROF_COUNT]) {
@@ -415,9 +419,9 @@ inline void prof_snapshot(int64_t out[PROF_COUNT]) {
     const int n = n_raw < PROF_MAX_SLOTS ? n_raw : PROF_MAX_SLOTS;
     for (int s = 0; s < n; s++)
         for (int i = 0; i < PROF_COUNT; i++)
-            out[i] += std::atomic_ref<const int64_t>(prof_slots[s].ns[i]).load(std::memory_order_relaxed);
+            out[i] += rx_atomic_load(prof_slots[s].ns[i], std::memory_order_relaxed);
     for (int i = 0; i < PROF_COUNT; i++)
-        out[i] += std::atomic_ref<const int64_t>(prof_slots[PROF_MAX_SLOTS].ns[i]).load(std::memory_order_relaxed);
+        out[i] += rx_atomic_load(prof_slots[PROF_MAX_SLOTS].ns[i], std::memory_order_relaxed);
 }
 /// Nanoseconds from a performance-counter reading. An integer number of nanoseconds per tick is a multiply, so a
 /// reading past 2^53 does not lose its low bits the way the double divide does.

@@ -1645,7 +1645,7 @@ static bool span_has_nonzero(const uint8_t* s, size_t n) {
     if (probe64(s, p)) return true;
     if (n > 128 && probe64(s + (n / 2), 64)) return true;
     if (n > 64 && probe64(s + n - p, p)) return true;
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
     static const bool has_avx2 = []() {
         int r0[4]{}, r1[4]{}, r7[4]{};
         __cpuid(r0, 0);
@@ -1656,6 +1656,9 @@ static bool span_has_nonzero(const uint8_t* s, size_t n) {
         __cpuidex(r7, 7, 0);
         return (r7[1] & (1 << 5)) != 0;                                                   // AVX2
     }();
+    if (has_avx2) return span_has_nonzero_avx2(s, n);
+#elif !defined(_WIN32) && (defined(__x86_64__) || defined(__i386__)) && (defined(__clang__) || defined(__GNUC__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
     if (has_avx2) return span_has_nonzero_avx2(s, n);
 #endif
     size_t i = 0;
@@ -2787,7 +2790,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         // went missing at random (Hookshot issues 40 and 44), whenever the clear reached the image first
         static const bool take = getenv("RX_VK_CPU_OVER_GPU") != nullptr;
         if ((!take && !tex->only_cleared) ||
-            std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire) == epoch)
+            rx_atomic_load(tex->checked_epoch, std::memory_order_acquire) == epoch)
             return tex;
         static thread_local Ranges cpu, inner;
         if (!texture_dirty(*tex, std::max(tex->upload_gen, tex->gpu_gen), cpu)) {
@@ -2824,7 +2827,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         (void)parsed;
         static thread_local uint64_t last;
         if (rw && tex->width == rw && tex->height == rh && tex->uploaded &&
-            std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire) != epoch &&
+            rx_atomic_load(tex->checked_epoch, std::memory_order_acquire) != epoch &&
             last != frame_no) {
             last = frame_no;
             upload(*tex, nullptr);
@@ -2839,7 +2842,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         tex->upload_seg = tl_seg;
         return tex;
     }
-    if (tex->uploaded && std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire) == epoch) return tex;
+    if (tex->uploaded && rx_atomic_load(tex->checked_epoch, std::memory_order_acquire) == epoch) return tex;
     static thread_local Ranges dirty;
     static const bool no_partial = getenv("RX_VK_NO_PARTIAL") != nullptr;   // (A/B: whole re-uploads)
     // (a buffer the GPU wrote over its storage, done since: all of it again; the tiles of MKW's terrain are filled so
@@ -3926,7 +3929,7 @@ bool texture_touch_quick(Texture* tex, bool for_sampling) {
     if (tex->last_value != rec_value) tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
-    const uint32_t ep = std::atomic_ref<const uint32_t>(tex->checked_epoch).load(std::memory_order_acquire);
+    const uint32_t ep = rx_atomic_load(tex->checked_epoch, std::memory_order_acquire);
     if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) return false;
     return tex->uploaded && ep == epoch;
 }
@@ -4958,7 +4961,7 @@ void texture_frame(uint64_t completed) {
               : known                ? std::min<uint64_t>(allowed / 10 * 7, 6144ull << 20)   // (hookshot: at most 6 GB)
                                      : 4096ull << 20;
         if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
-            own = std::min(own, 2560ull << 20);
+            own = std::min<uint64_t>(own, 2560ull << 20);
             static bool told = false;
             if (!told) told = true, logf("vk: an integrated GPU shares the system's RAM: textures at most 2560 MB (RX_VK_VRAM_MB=<MB>: other)");
         }

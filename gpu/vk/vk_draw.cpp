@@ -670,7 +670,7 @@ VkFormat supported_vertex_format(VkFormat f) {
 constexpr uint32_t kPushSize = Shader::Backend::SPIRV::MESH_FALLBACK_PUSH_END;
 
 void ensure_layout(Program& p) {
-    if (std::atomic_ref<const VkPipelineLayout>(p.layout).load(std::memory_order_acquire)) return;
+    if (rx_atomic_load(p.layout, std::memory_order_acquire)) return;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     uint32_t total = 0;
     auto add = [&](VkDescriptorType type, VkShaderStageFlags stage, const auto& descriptors) {
@@ -6997,7 +6997,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PipeEntry* pe;
     {
         PROF_HOT(PROF_PIPE);
-        if (!std::atomic_ref<const VkPipelineLayout>(p.layout).load(std::memory_order_acquire)) {
+        if (!rx_atomic_load(p.layout, std::memory_order_acquire)) {
             PROF_EXACT();
             ParLock lk(ParSite::EnsureLayout);
             ensure_layout(p);
@@ -8634,7 +8634,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
     }
     Program& p = const_cast<Program&>(*cp);
-    if (!std::atomic_ref<const VkPipelineLayout>(p.layout).load(std::memory_order_acquire)) {
+    if (!rx_atomic_load(p.layout, std::memory_order_acquire)) {
         ParLock lk(ParSite::Compute);
         ensure_layout(p);
     }

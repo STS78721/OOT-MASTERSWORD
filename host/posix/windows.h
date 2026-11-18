@@ -47,7 +47,7 @@ typedef short SHORT;
 typedef unsigned short USHORT;
 typedef char CHAR;
 typedef wchar_t WCHAR;
-typedef void *HANDLE, *HMODULE, *HINSTANCE, *HWND, *HDC, *HGDIOBJ, *HBITMAP, *HFONT, *HBRUSH, *HICON, *HCURSOR, *HKEY;
+typedef void *HANDLE, *HMODULE, *HINSTANCE, *HWND, *HDC, *HGDIOBJ, *HBITMAP, *HFONT, *HBRUSH, *HPEN, *HICON, *HCURSOR, *HKEY;
 typedef void *PVOID, *LPVOID;
 typedef const void *LPCVOID;
 typedef char *LPSTR;
@@ -115,6 +115,7 @@ static inline int localtime_s(struct tm *out, const time_t *t) { return localtim
 #define ERROR_INVALID_HANDLE 6L
 #define ERROR_NOT_ENOUGH_MEMORY 8L
 #define ERROR_NO_MORE_FILES 18L
+#define ERROR_BAD_LENGTH 24L
 #define ERROR_HANDLE_EOF 38L
 #define ERROR_NOT_SUPPORTED 50L
 #define ERROR_FILE_EXISTS 80L
@@ -220,6 +221,8 @@ typedef DWORD (*LPTHREAD_START_ROUTINE)(void *);
 #define THREAD_PRIORITY_ABOVE_NORMAL 1
 #define THREAD_PRIORITY_HIGHEST 2
 #define THREAD_PRIORITY_TIME_CRITICAL 15
+#define THREAD_MODE_BACKGROUND_BEGIN 0x00010000
+#define THREAD_MODE_BACKGROUND_END 0x00020000
 #define DUPLICATE_SAME_ACCESS 0x2
 #define THREAD_ALL_ACCESS 0x1FFFFF
 #define THREAD_QUERY_INFORMATION 0x40
@@ -332,6 +335,42 @@ BOOL VirtualFree(void *addr, SIZE_T size, DWORD type);
 BOOL VirtualProtect(void *addr, SIZE_T size, DWORD protect, DWORD *old);
 SIZE_T VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T size);
 static inline SIZE_T GetLargePageMinimum(void) { return 0; }
+#define QUOTA_LIMITS_HARDWS_MIN_DISABLE 0x00000002
+#define QUOTA_LIMITS_HARDWS_MAX_DISABLE 0x00000008
+static inline BOOL SetProcessWorkingSetSizeEx(HANDLE h, SIZE_T lo, SIZE_T hi, DWORD f) {
+    (void)h, (void)lo, (void)hi, (void)f;
+    return FALSE;
+}
+typedef struct {
+    DWORD dwLength, dwMemoryLoad;
+    DWORDLONG ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual,
+        ullAvailExtendedVirtual;
+} MEMORYSTATUSEX, *LPMEMORYSTATUSEX;
+static inline BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *ms) {
+    if (!ms || ms->dwLength < sizeof *ms) return FALSE;
+    unsigned long long mem_total = 0, mem_avail = 0, swap_total = 0, swap_free = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char k[64];
+        unsigned long long v = 0;
+        while (fscanf(f, "%63[^:]: %llu kB%*[^\n]\n", k, &v) >= 1) {
+            if (!strcmp(k, "MemTotal")) mem_total = v << 10;
+            else if (!strcmp(k, "MemAvailable")) mem_avail = v << 10;
+            else if (!strcmp(k, "SwapTotal")) swap_total = v << 10;
+            else if (!strcmp(k, "SwapFree")) swap_free = v << 10;
+        }
+        fclose(f);
+    }
+    ms->dwMemoryLoad = mem_total ? (DWORD)(((mem_total - mem_avail) * 100) / mem_total) : 0;
+    ms->ullTotalPhys = mem_total;
+    ms->ullAvailPhys = mem_avail;
+    ms->ullTotalPageFile = mem_total + swap_total;
+    ms->ullAvailPageFile = mem_avail + swap_free;
+    ms->ullTotalVirtual = mem_total + swap_total;
+    ms->ullAvailVirtual = mem_avail + swap_free;
+    ms->ullAvailExtendedVirtual = 0;
+    return mem_total != 0;
+}
 
 /* ---- modules: dlopen; ".dll" names map to the shared libraries (win32_posix.c) ---- */
 #define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x2
@@ -544,6 +583,16 @@ static inline LONG_PTR GetWindowLongPtrA(HWND w, int i) { (void)w, (void)i; retu
 BOOL PostMessageA(HWND w, UINT msg, WPARAM wp, LPARAM lp);
 LONG GetWindowLongA(HWND w, int index);
 static inline int GetClassNameA(HWND w, LPSTR s, int n) { (void)w; if (n > 0) s[0] = 0; return 0; }
+typedef HANDLE HMONITOR;
+#define MONITOR_DEFAULTTOPRIMARY 1
+typedef struct {
+    DWORD cbSize;
+    RECT rcMonitor, rcWork;
+    DWORD dwFlags;
+} MONITORINFO, *LPMONITORINFO;
+static inline HMONITOR MonitorFromWindow(HWND w, DWORD f) { (void)w, (void)f; return NULL; }
+static inline BOOL GetMonitorInfoW(HMONITOR m, LPMONITORINFO mi) { (void)m, (void)mi; return FALSE; }
+#define GetMonitorInfo GetMonitorInfoW
 DWORD GetWindowThreadProcessId(HWND w, DWORD *pid);
 int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type);
 #define MB_OK 0
@@ -598,6 +647,12 @@ BOOL GdiFlush(void);
 HFONT CreateFontA(int height, int width, int escapement, int orientation, int weight, DWORD italic, DWORD underline,
                   DWORD strikeout, DWORD charset, DWORD out_precision, DWORD clip_precision, DWORD quality, DWORD pitch,
                   LPCSTR face);
+#define PS_SOLID 0
+static inline HPEN CreatePen(int style, int width, COLORREF c) { (void)style, (void)width, (void)c; return NULL; }
+static inline BOOL RoundRect(HDC dc, int l, int t, int r, int b, int w, int h) {
+    (void)dc, (void)l, (void)t, (void)r, (void)b, (void)w, (void)h;
+    return TRUE;
+}
 HBRUSH CreateSolidBrush(COLORREF c);
 int FillRect(HDC dc, const RECT *r, HBRUSH b);
 int SetBkMode(HDC dc, int mode);

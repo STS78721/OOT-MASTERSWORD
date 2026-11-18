@@ -112,7 +112,7 @@ jobs:
 
   release:
     name: Release asset
-    if: startsWith(github.ref, 'refs/tags/') && github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts'
+    if: startsWith(github.ref, 'refs/tags/') && github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts' && vars.CI_RELEASE_LINUX == 'true'
     needs: appimage
     runs-on: ubuntu-24.04
     timeout-minutes: 15
