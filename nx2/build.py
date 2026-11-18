@@ -803,10 +803,15 @@ def main():
                    (imgui_deps if base in imgui_users else b"")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
                             vflags + ([stamp_def] if base == "vk_menu.cpp" else []) +
-                            (ngx_flags if base == "vk_dlss.cpp" else []) +
+                            (ngx_flags if base in ("vk_dlss.cpp", "vk_ngx_msvc_rt.cpp") else []) +
                             (imgui_flags if base in imgui_users else []) +
                             (fsr_flags if base == "vk_fsr4.cpp" else []),
                             deps + (ngx_deps if base == "vk_dlss.cpp" else b"")))
+        if not LINUX and NGX_SDK and toolchain.mingw():
+            vk_jobs.append((cxx, os.path.join(vk, NGX_MSVC_RT), os.path.join(obj_dir, "vk_ngx_msvc_rt.o"),
+                            target() + CPU + ["-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DHOOKSHOT_NGX"], b""))
+            vk_jobs.append((cc, os.path.join(HOST, "mingw_msvc_shims.c"), os.path.join(obj_dir, "vk_mingw_msvc_shims.o"),
+                            target() + CPU + ["-O2", "-g0", "-Wno-everything"], b""))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
             cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
                                        "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
