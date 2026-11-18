@@ -96,7 +96,7 @@ jobs:
         run: echo "HOOKSHOT_MINGW=$(python -I scripts/release_parts.py llvm-mingw "$RUNNER_TEMP/llvm")" >> "$GITHUB_ENV"
       - name: NVIDIA's DLSS SDK (headers and nvsdk_ngx_s.lib)
         run: python -I scripts/ngx_sdk.py --platform windows --build-only --accept-nvidia-license "$RUNNER_TEMP/ngx-sdk"
-      - name: hookshot_vk.dll with NVIDIA DLSS
+      - name: mastersword_vk.dll with NVIDIA DLSS
         env:
           RX_VK_ONLY: '1'
           RX_RELEASE: '1'
@@ -109,9 +109,9 @@ jobs:
       # is loaded by NGX at run time from the game folder's ngx folder, and its core, _nvngx.dll, from the driver's)
       - name: Imports
         run: |
-          dll="$RUNNER_TEMP/vk-work/sa/build/hookshot_vk.dll"
+          dll="$RUNNER_TEMP/vk-work/sa/build/mastersword_vk.dll"
           "$HOOKSHOT_MINGW/bin/llvm-objdump" -p "$dll" | sed -n 's/^ *DLL Name: //p' | tr -d '\r' | sort -u | tee "$RUNNER_TEMP/imports.txt"
           if grep -viE '^(kernel32|user32|gdi32|advapi32)\.dll$|^api-ms-win-crt-[a-z0-9-]+\.dll$' "$RUNNER_TEMP/imports.txt"; then
-            echo "::error::hookshot_vk.dll with NVIDIA DLSS imports a DLL that is not Windows' own (above)"
+            echo "::error::mastersword_vk.dll with NVIDIA DLSS imports a DLL that is not Windows' own (above)"
             exit 1
           fi

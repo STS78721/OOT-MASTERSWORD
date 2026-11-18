@@ -21,10 +21,11 @@ PY=$DEPS/python/bin/python3
 
 # ---- the Vulkan back end, built here once (it needs no game) ----
 VKW=$B/vk-work
-rm -rf "$VKW/sa/build/hookshot_vk.so"
+rm -rf "$VKW/sa/build/mastersword_vk.so" "$VKW/sa/build/hookshot_vk.so"
 OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
-VK=$VKW/sa/build/hookshot_vk.so
-[ -f "$VK" ] || { echo "hookshot_vk.so was not built"; exit 1; }
+VK=$VKW/sa/build/mastersword_vk.so
+[ -f "$VK" ] || VK=$VKW/sa/build/hookshot_vk.so
+[ -f "$VK" ] || { echo "mastersword_vk.so was not built"; exit 1; }
 
 # ---- the tools' native helpers, built now: the AppImage is read-only. a64emit with its C++ runtime inside (the one this system
 # builds with is newer than older systems have), and the stamp build_emit.py checks, so it is not built again ----
@@ -69,6 +70,7 @@ cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" 
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
+cp "$VK" "$L/mastersword_vk.so"
 cp "$VK" "$L/hookshot_vk.so"
 cp "$DEPS/sdl2/libSDL2-2.0.so.0" "$L/libSDL2-2.0.so.0"
 cp -a "$DEPS/licenses" "$T/licenses"   # (LLVM, FFmpeg, dav1d, SDL2: what this AppImage carries besides Hookshot)
