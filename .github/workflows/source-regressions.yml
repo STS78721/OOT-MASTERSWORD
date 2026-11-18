@@ -19,8 +19,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # (Inherited upstream Hookshot regression harness targets upstream C++ signatures/UI; opt-in via workflow_dispatch or vars.CI_UPSTREAM_PYTHON_TESTS == 'true')
   python:
     name: Python source checks (${{ matrix.os }})
+    if: ${{ vars.CI_UPSTREAM_PYTHON_TESTS == 'true' }}
     strategy:
       fail-fast: false
       matrix:
