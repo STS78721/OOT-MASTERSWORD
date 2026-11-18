@@ -1578,7 +1578,7 @@ static bool span_has_nonzero(const uint8_t* s, size_t n) {
     if (probe64(s, p)) return true;
     if (n > 128 && probe64(s + (n / 2), 64)) return true;
     if (n > 64 && probe64(s + n - p, p)) return true;
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
     static const bool has_avx2 = []() {
         int r0[4]{}, r1[4]{}, r7[4]{};
         __cpuid(r0, 0);
@@ -1589,6 +1589,9 @@ static bool span_has_nonzero(const uint8_t* s, size_t n) {
         __cpuidex(r7, 7, 0);
         return (r7[1] & (1 << 5)) != 0;                                                   // AVX2
     }();
+    if (has_avx2) return span_has_nonzero_avx2(s, n);
+#elif !defined(_WIN32) && (defined(__x86_64__) || defined(__i386__)) && (defined(__clang__) || defined(__GNUC__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
     if (has_avx2) return span_has_nonzero_avx2(s, n);
 #endif
     size_t i = 0;
@@ -4516,7 +4519,7 @@ void texture_frame(uint64_t completed) {
               : known                ? std::min<uint64_t>(allowed / 10 * 7, 6144ull << 20)   // (hookshot: at most 6 GB)
                                      : 4096ull << 20;
         if (!getenv("RX_VK_VRAM_MB") && dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
-            own = std::min(own, 2560ull << 20);
+            own = std::min<uint64_t>(own, 2560ull << 20);
             static bool told = false;
             if (!told) told = true, logf("vk: an integrated GPU shares the system's RAM: textures at most 2560 MB (RX_VK_VRAM_MB=<MB>: other)");
         }

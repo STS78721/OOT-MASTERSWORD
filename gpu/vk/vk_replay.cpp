@@ -1550,11 +1550,12 @@ void par_worker_main() {
         const uint64_t reserved = host->reserved_cpus ? host->reserved_cpus() : 0;
         const uint64_t mask = (f.mask & ~reserved) ? f.mask & ~reserved : f.mask;
         if (!any && mask) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)mask);
-        THREAD_POWER_THROTTLING_STATE pt{};
-        pt.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
-        pt.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
-        pt.StateMask = 0;
-        SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &pt, sizeof pt);
+        struct { ULONG Version, ControlMask, StateMask; } pt{1, 1, 0};
+        using SetThreadInfoFn = BOOL(WINAPI*)(HANDLE, int, const void*, DWORD);
+        if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+            if (auto fn = reinterpret_cast<SetThreadInfoFn>(GetProcAddress(k32, "SetThreadInformation")))
+                fn(GetCurrentThread(), 4 /* ThreadPowerThrottling */, &pt, sizeof pt);
+        }
         static std::atomic<int> told{0};
         if (told++ == 0)
             logf("vk: parallel replay workers on logical processors %#llx%s", (unsigned long long)(mask && !any ? mask : ~0ull),

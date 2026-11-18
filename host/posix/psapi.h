@@ -32,4 +32,23 @@ static inline BOOL K32GetProcessMemoryInfo(HANDLE p, PROCESS_MEMORY_COUNTERS *ou
     return TRUE;
 }
 #define GetProcessMemoryInfo K32GetProcessMemoryInfo
+typedef struct {
+    ULONG_PTR NumberOfEntries;
+    ULONG_PTR WorkingSetInfo[1];
+} PSAPI_WORKING_SET_INFORMATION;
+typedef union {
+    ULONG_PTR Flags;
+    struct {
+        ULONG_PTR Protection : 5;
+        ULONG_PTR ShareCount : 3;
+        ULONG_PTR Shared : 1;
+        ULONG_PTR Reserved : 3;
+        ULONG_PTR VirtualPage : sizeof(ULONG_PTR) * 8 - 12;
+    };
+} PSAPI_WORKING_SET_BLOCK;
+static inline BOOL K32QueryWorkingSet(HANDLE h, void *pv, DWORD cb) {
+    (void)h, (void)pv, (void)cb;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+}
 #endif
