@@ -52,9 +52,9 @@ static int tag_order(const char *a, const char *b) {
 #include <stdlib.h>
 #include <string.h>
 
-#define UPDATE_HOST L"gitlab.com"
-#define UPDATE_PATH L"/api/v4/projects/steeltemplesaint-recomps%2FOOT-MASTERSWORD/releases/permalink/latest"
-#define RELEASES_PAGE L"https://gitlab.com/steeltemplesaint-recomps/OOT-MASTERSWORD/-/releases/permalink/latest"
+#define UPDATE_HOST L"api.github.com"
+#define UPDATE_PATH L"/repos/STS78721/OOT-MASTERSWORD/releases/latest"
+#define RELEASES_PAGE L"https://github.com/STS78721/OOT-MASTERSWORD/releases/latest"
 
 /* (a line "name=value" of a small text file, in UTF-8: its value, trimmed) */
 static int read_value(const wchar_t *path, const char *name, char *out, size_t cap) {
@@ -79,7 +79,7 @@ static int read_value(const wchar_t *path, const char *name, char *out, size_t c
     return found;
 }
 
-/* (the latest release's tag, from GitLab's API: "tag_name":"...") */
+/* (the latest release's tag, from GitHub's API: "tag_name":"...") */
 static int latest_tag(char *tag, size_t cap) {
     int ok = 0;
     HINTERNET s = WinHttpOpen(L"MasterSword-update-check", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -87,7 +87,7 @@ static int latest_tag(char *tag, size_t cap) {
     WinHttpSetTimeouts(s, 2500, 2500, 2500, 3000);
     HINTERNET c = WinHttpConnect(s, UPDATE_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
     HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", UPDATE_PATH, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : NULL;
-    if (r && WinHttpSendRequest(r, L"Accept: application/json\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+    if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
         WinHttpReceiveResponse(r, NULL)) {
         DWORD status = 0, size = sizeof status;
         WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
@@ -254,11 +254,11 @@ static int pipe_tag(const char *cmd, char *tag, size_t cap) {
 
 static int latest_tag(char *tag, size_t cap) {
     if (pipe_tag("curl -fsSL --max-time 4 --retry 2 -A MasterSword-update-check "
-                 "-H \"Accept: application/json\" "
-                 "https://gitlab.com/api/v4/projects/steeltemplesaint-recomps%2FOOT-MASTERSWORD/releases/permalink/latest 2>/dev/null", tag, cap))
+                 "-H \"Accept: application/vnd.github+json\" "
+                 "https://api.github.com/repos/STS78721/OOT-MASTERSWORD/releases/latest 2>/dev/null", tag, cap))
         return 1;
     return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A MasterSword-update-check "
-                    "https://gitlab.com/steeltemplesaint-recomps/OOT-MASTERSWORD/-/releases/permalink/latest 2>/dev/null", tag, cap);
+                    "https://github.com/STS78721/OOT-MASTERSWORD/releases/latest/download/mastersword-linux.txt 2>/dev/null", tag, cap);
 }
 
 /* the builder an update installed (builder/linux/linux_update.py): <data>/hookshot/builder/versions/<current>/AppRun. The
@@ -330,7 +330,7 @@ void hos_update_check(void) {
     if (strncmp(answer, "Update", 6)) return;
     if (!has_builder) {
         if (fork() == 0) {
-            execlp("xdg-open", "xdg-open", "https://gitlab.com/steeltemplesaint-recomps/OOT-MASTERSWORD/-/releases/permalink/latest", (char *)0);
+            execlp("xdg-open", "xdg-open", "https://github.com/STS78721/OOT-MASTERSWORD/releases/latest", (char *)0);
             _exit(127);
         }
         return;
