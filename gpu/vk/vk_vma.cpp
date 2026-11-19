@@ -9,8 +9,22 @@
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <vector>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace mkwvk {
 
@@ -159,9 +173,12 @@ bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes) {
 
 // ---- the textures' pool compacted: VMA's defragmentation context and its open pass ----
 namespace {
+std::mutex compact_mu;
 VmaDefragmentationContext compact_ctx = VK_NULL_HANDLE;
 VmaDefragmentationPassMoveInfo compact_pass{};
 bool compact_in_pass = false;
+std::vector<VmaAllocation> compact_busy;
+std::vector<std::pair<VkImage, VmaAllocation>> compact_deferred;
 bool compact_over(uint64_t* freed_bytes, uint32_t* freed_blocks) {
     VmaDefragmentationStats st{};
     vmaEndDefragmentation(vma, compact_ctx, &st);
@@ -172,6 +189,7 @@ bool compact_over(uint64_t* freed_bytes, uint32_t* freed_blocks) {
 }
 }
 bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass) {
+    std::lock_guard lk(compact_mu);
     if (compact_ctx || !texture_pool) return false;
     VmaDefragmentationInfo di{};
     di.pool = texture_pool;
@@ -179,29 +197,50 @@ bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass) {
     di.maxAllocationsPerPass = max_moves_a_pass;
     return vmaBeginDefragmentation(vma, &di, &compact_ctx) == VK_SUCCESS;
 }
-bool image_compact_active() { return compact_ctx != VK_NULL_HANDLE; }
+bool image_compact_active() {
+    std::lock_guard lk(compact_mu);
+    return compact_ctx != VK_NULL_HANDLE;
+}
 bool image_compact_pass(std::vector<ImageMove>& moves, uint64_t* freed_bytes, uint32_t* freed_blocks) {
     moves.clear();
+    std::lock_guard lk(compact_mu);
     if (!compact_ctx || compact_in_pass) return false;
     const VkResult r = vmaBeginDefragmentationPass(vma, compact_ctx, &compact_pass);
     if (r != VK_INCOMPLETE) return compact_over(freed_bytes, freed_blocks);   // (VK_SUCCESS: nothing left to move; or an error)
     compact_in_pass = true;
-    for (uint32_t i = 0; i < compact_pass.moveCount; i++) moves.push_back({compact_pass.pMoves[i].srcAllocation});
+    compact_busy.clear();
+    compact_busy.reserve(compact_pass.moveCount);
+    for (uint32_t i = 0; i < compact_pass.moveCount; i++) {
+        moves.push_back({compact_pass.pMoves[i].srcAllocation});
+        compact_busy.push_back(compact_pass.pMoves[i].srcAllocation);
+    }
+    std::sort(compact_busy.begin(), compact_busy.end());
     return true;
 }
 bool image_compact_bind(size_t i, VkImage image) {
+    std::lock_guard lk(compact_mu);
     return compact_in_pass && i < compact_pass.moveCount &&
            vmaBindImageMemory(vma, compact_pass.pMoves[i].dstTmpAllocation, image) == VK_SUCCESS;
 }
 void image_compact_ignore(size_t i) {
+    std::lock_guard lk(compact_mu);
     if (compact_in_pass && i < compact_pass.moveCount)
         compact_pass.pMoves[i].operation = VMA_DEFRAGMENTATION_MOVE_OPERATION_IGNORE;
 }
 bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks) {
-    if (!compact_ctx || !compact_in_pass) return false;
-    compact_in_pass = false;
-    if (vmaEndDefragmentationPass(vma, compact_ctx, &compact_pass) == VK_INCOMPLETE) return true;
-    return compact_over(freed_bytes, freed_blocks);
+    std::vector<std::pair<VkImage, VmaAllocation>> later;
+    bool more = false;
+    {
+        std::lock_guard lk(compact_mu);
+        if (!compact_ctx || !compact_in_pass) return false;
+        compact_in_pass = false;
+        more = vmaEndDefragmentationPass(vma, compact_ctx, &compact_pass) == VK_INCOMPLETE;
+        if (!more) compact_over(freed_bytes, freed_blocks);
+        compact_busy.clear();
+        later.swap(compact_deferred);
+    }
+    for (auto& [img, a] : later) destroy_image(img, a);
+    return more;
 }
 
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
@@ -243,8 +282,58 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     if (told++ < 4) logf("vk: VRAM full: a %ux%u image (format %d) in system memory", ci.extent.width, ci.extent.height, (int)ci.format);
     return true;
 }
-void destroy_image(VkImage image, VmaAllocation allocation) {
+namespace {
+std::mutex reap_mu;
+std::condition_variable reap_cv;
+std::vector<std::function<void()>> reap_queue;   // (in FIFO order, e.g. views before their image)
+void destroy_or_defer(VkImage image, VmaAllocation allocation) {
+    std::lock_guard lk(compact_mu);
+    if (allocation && compact_in_pass && std::binary_search(compact_busy.begin(), compact_busy.end(), allocation)) {
+        compact_deferred.push_back({image, allocation});
+        return;
+    }
     vmaDestroyImage(vma, image, allocation);
+}
+bool reap_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_REAP");
+        if (e && atoi(e) == 0) return false;
+        std::thread([] {
+#ifdef _WIN32
+            SetThreadDescription(GetCurrentThread(), L"mkw_vk reaper");
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+            std::vector<std::function<void()>> batch;
+            for (;;) {
+                {
+                    std::unique_lock lk(reap_mu);
+                    reap_cv.wait(lk, [] { return !reap_queue.empty(); });
+                    batch.swap(reap_queue);
+                }
+                for (auto& fn : batch) fn();
+                batch.clear();
+            }
+        }).detach();
+        logf("vk: driver cleanup & images destroyed on a thread of their own (RX_VK_REAP=0: on the caller's)");
+        return true;
+    }();
+    return on;
+}
+} // namespace
+void reap(std::function<void()> fn) {
+    if (!reap_on()) {
+        fn();
+        return;
+    }
+    {
+        std::lock_guard lk(reap_mu);
+        reap_queue.push_back(std::move(fn));
+    }
+    reap_cv.notify_one();
+}
+void destroy_image(VkImage image, VmaAllocation allocation) {
+    if (!image && !allocation) return;
+    reap([image, allocation] { destroy_or_defer(image, allocation); });
 }
 uint64_t allocation_size(VmaAllocation allocation) {
     VmaAllocationInfo info{};

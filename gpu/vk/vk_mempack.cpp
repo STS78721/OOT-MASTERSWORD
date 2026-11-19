@@ -1040,7 +1040,7 @@ void slate_save() {
         Temper3& st = t3_state();
         std::lock_guard tk(st.mu);
         if (!st.shade_learned.empty()) {
-            const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 3;   // (3: learned with counts above the default)
+            const uint32_t tag = 0x45444853u /* "SHDE" */, ver = 5;   // (5: P-core NORMAL-priority async workers)
             const uint32_t count = (uint32_t)std::min<size_t>(st.shade_learned.size(), 64);
             uint32_t len_zero = 0;
             put(&tag, 4);
@@ -1171,7 +1171,7 @@ void slate_load() {
         };
         uint32_t ver = 0, count = 0;
         if (takes(&ver, 4)) {
-            if (ver == 3 && takes(&count, 4)) {
+            if (ver == 5 && takes(&count, 4)) {
                 if (count > 64) count = 64;
                 Temper3& st = t3_state();
                 std::lock_guard tk(st.mu);
@@ -1180,7 +1180,7 @@ void slate_load() {
                     if (!takes(&sd, sizeof sd)) break;
                     st.shade_learned[sd.pic_sig] = {sd.threads, sd.seg, sd.base_ms, sd.best_ms, sd.flags, sd.reserved};
                 }
-            } else if (ver != 3) {
+            } else if (ver != 5) {
                 logf("vk: MasterSword Hero's Shade: ignoring v%u table (re-learning, now with up to %d workers)", (unsigned)ver,
                      par_threads_max_public());
             }
@@ -1298,7 +1298,7 @@ void resident_floor() {
     if (!GlobalMemoryStatusEx(&ms)) return;
     const uint64_t total_mb = ms.ullTotalPhys >> 20;
     const int want = env_int("RX_MEM_RESIDENT_MB", -1);
-    uint64_t floor_mb = want >= 0 ? (uint64_t)want : std::min<uint64_t>(total_mb * 55 / 100, 18 * 1024);
+    uint64_t floor_mb = want >= 0 ? (uint64_t)want : std::min<uint64_t>(total_mb * 40 / 100, 12 * 1024);
     if (!floor_mb) {
         logf("vk: resident floor off (RX_MEM_RESIDENT_MB=0)");
         return;
@@ -1421,10 +1421,8 @@ void census_run() {
 void mempack_tick(uint64_t frame_no) {
     static bool floor_done = false;
     if (!floor_done) floor_done = true, resident_floor();
-    // (Temper 1: a census cost 360-375 ms of a worker and ~90 MB for a moment, every minute: now once at 600 frames, then
-    // every RX_MEM_CENSUS frames (18000: 5 minutes at 60 fps), and once more after a memory-pressure line, at most a minute
-    // after the last)
-    static const int every = env_int("RX_MEM_CENSUS", 18000);
+    // (every RX_MEM_CENSUS frames (0: off by default so K32QueryWorkingSet never stalls a worker 300-400 ms in play))
+    static const int every = env_int("RX_MEM_CENSUS", 0);
     static uint64_t last_census = 0;
     const bool due = every > 0 && frame_no >= 600 &&
                      (!last_census || frame_no - last_census >= (uint64_t)std::max(every, 600) ||

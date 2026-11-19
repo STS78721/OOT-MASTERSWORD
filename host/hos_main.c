@@ -69,6 +69,16 @@ static void no_power_throttling(void) {
         set(GetCurrentProcess(), 4, &s, sizeof s);
     }
 }
+
+/* (MasterSword) HOS_PROCESS_PRIORITY=0 normal, 1 above normal (default), 2 high: the process's own priority class while it runs (Windows puts
+   it back when it exits). Prevents 40-90 ms foreground scheduling stalls when other desktop apps wake up. */
+static void process_priority(void) {
+    const char *e = getenv("HOS_PROCESS_PRIORITY");
+    const int level = e ? atoi(e) : 1;
+    const DWORD cls = level >= 2 ? HIGH_PRIORITY_CLASS : level == 1 ? ABOVE_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS;
+    if (level > 0 && SetPriorityClass(GetCurrentProcess(), cls))
+        hos_log("process priority class: %s", level >= 2 ? "high" : "above normal");
+}
 #endif
 
 int hos_game_is_mkw(void) { return !strcmp(hos_main_build_id, "d00e4f399e411d0613aa8d26b1c02fef"); }
@@ -1491,6 +1501,7 @@ static int game_main(int argc, char **argv) {
 #ifdef _WIN32
     timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
     no_power_throttling();
+    process_priority();
 #endif
     void hos_display_start(void);
     hos_display_start();  /* the game's window; HOS_HEADLESS=1 for none */

@@ -1150,12 +1150,19 @@ int hos_nvn_event_value(uint64_t guest_event, uint32_t *v) {
     return 1;
 }
 NV(nvnEventGetValue) {
-    {   /* (hookshot, experiment) HOS_PRESENT_NOWAIT=1: OoT's present poll (hos_thread.c present_poll) sees its frame's
-           event signalled at once: the replay reads memory as submitted, so the game may go on to the next frame
-           while this one is replayed, as far as the window's textures and the replay's queue let it */
+    {   /* (longshot #588) HOS_PRESENT_NOWAIT or the render thread (0x4D5301 -> vk_replay.cpp async_on): OoT's present poll
+           sees its frame's event signalled at once instead of sleeping until the GPU finishes the replay; the render thread
+           paces presents via RX_VK_PRESENTS_AHEAD and waits for the frame's CPU signal before handing the present over.
+           rx_option returns -1 before vk starts, and 0 on older DLLs without 0x4D5301. */
+        int rx_option(int id, int otherwise);
         static int nowait = -1;
-        if (nowait < 0) nowait = getenv("HOS_PRESENT_NOWAIT") && atoi(getenv("HOS_PRESENT_NOWAIT")) != 0;
-        if (nowait && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
+        int now = nowait;
+        if (now < 0) {
+            const char *e = getenv("HOS_PRESENT_NOWAIT");
+            now = e ? atoi(e) != 0 : rx_option(0x4D5301, -1);
+            if (now >= 0) nowait = now = now != 0;
+        }
+        if (now > 0 && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
     }
     uint32_t v = 0; nvn_gpu_read(((const nvn_event *)P(0))->gpu, &v, 4); RET(v);
     if (sync_log()) hos_log("nvn: EventGetValue %p = %u (lr %#llx)", P(0), v, (unsigned long long)c->x[30]);

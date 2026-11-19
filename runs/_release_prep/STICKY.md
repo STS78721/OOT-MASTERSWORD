@@ -10,6 +10,7 @@ Plan mode before restore/rebuild strategy
 ```
 
 Golden: `C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b\mastersword_vk.dll.bak_4x50`
-Smoke: `C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b\`
+Smoke: `C:\Games\Ocarina of Time PC\Hookshot Test - smoke_0.1.3b\` (`user\save\5a3c9e1f0b7d24680000000000000001\`, Slate 3 Step 1+2 + `RX_HEROS_SHADE=1` live)
+Headless A/B bench method & route baselines: `runs/_release_prep/HEADLESS_BENCH_METHOD.md` — **wait for user go-ahead before running headless**; isolate via `--user <copy>` + `HOS_ENV_FILE`.
 
 Upstream perf watch: tell me when NotRexed/Hookshot lands FPS/pacing/CPU-GPU/cache/VRAM work we have not ported (see `.cursor/rules/upstream-perf-watch.mdc`).

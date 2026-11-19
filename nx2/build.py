@@ -795,6 +795,17 @@ def main():
         vk_jobs.append((cc, zstd_src, os.path.join(obj_dir, "vk_zstd.o"),
                         target() + CPU + (["-fPIC"] if LINUX else []) +
                         ["-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-I" + zbic], zstd_deps))
+        # RX_VK_PGO=gen: the Vulkan back end's own files (not Eden's recompiler, sirit, or vk_shader.cpp)
+        # count their branches, and host/pgo_rt.c in the DLL writes them (RX_VK_PGO_FILE=<path>, .reset / .dump);
+        # RX_VK_PGO=<merged .profdata>: built with that profile. Keeps HOOKSHOT_SHADER_STAMP and the 7.4 GB cache untouched.
+        vk_pgo = os.environ.get("RX_VK_PGO", "")
+        vk_pgo_flags = []
+        if vk_pgo == "gen":
+            vk_pgo_flags = ["-fprofile-instr-generate", "-mllvm", "-disable-vp=true"]
+        elif vk_pgo:
+            with open(vk_pgo, "rb") as f:
+                vk_pgo_flags = ["-fprofile-instr-use=" + vk_pgo, "-DRX_VK_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
+            print("the Vulkan back end: built with the profile %s" % vk_pgo, flush=True)
         for src in vk_sources():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
@@ -802,7 +813,8 @@ def main():
             deps = vk_lib_deps if lib else vdeps + (logo_text if base in imgui_users else b"") + \
                    (imgui_deps if base in imgui_users else b"")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([stamp_def] if base == "vk_menu.cpp" else []) +
+                            vflags + ([] if (lib or base == "vk_shader.cpp") else vk_pgo_flags) +
+                            ([stamp_def] if base == "vk_menu.cpp" else []) +
                             (ngx_flags if base in ("vk_dlss.cpp", "vk_ngx_msvc_rt.cpp") else []) +
                             (imgui_flags if base in imgui_users else []) +
                             (fsr_flags if base == "vk_fsr4.cpp" else []),
@@ -812,6 +824,9 @@ def main():
                             target() + CPU + ["-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DHOOKSHOT_NGX"], b""))
             vk_jobs.append((cc, os.path.join(HOST, "mingw_msvc_shims.c"), os.path.join(obj_dir, "vk_mingw_msvc_shims.o"),
                             target() + CPU + ["-O2", "-g0", "-Wno-everything"], b""))
+        if vk_pgo == "gen":   # (the counters' writer, the DLL's own copy: its sections are the DLL's)
+            vk_jobs.append((cc, os.path.join(HOST, "pgo_rt.c"), os.path.join(obj_dir, "vk_pgo_rt.o"),
+                            target() + (["-fPIC"] if LINUX else []) + ["-O2", "-g0", "-Wno-everything", '-DPGO_ENV="RX_VK_PGO_FILE"'], b""))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
             cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
                                        "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
@@ -963,7 +978,9 @@ def main():
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32", "-ladvapi32"] + \
+                (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw()) + \
+                ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if vk_pgo == "gen" else [])
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

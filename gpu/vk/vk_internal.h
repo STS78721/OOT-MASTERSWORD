@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <array>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -133,6 +134,9 @@ struct BufferRef {
     VkBuffer buffer = VK_NULL_HANDLE;
     uint64_t offset = 0, size = 0;
     VkDeviceAddress address = 0;
+    // The binding aliases CPU-writable guest memory. Unlike a VRAM mirror, its
+    // bytes can change after command recording and before the GPU reads them.
+    bool direct = false;
     explicit operator bool() const {
         return buffer != VK_NULL_HANDLE;
     }
@@ -166,6 +170,7 @@ bool probe_serial();
 void probe_dump_all(const char* why);
 void probe_log(uint64_t frame);
 void memory_end_submission(VkCommandBuffer cmd, uint64_t part = 0);   // (part: the recording cmd is, for the pages it writes back)
+void memory_flush_writebacks(VkCommandBuffer cmd, uint64_t part = 0);   // (flush pending mirror write-backs before parallel segments)
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
@@ -244,6 +249,11 @@ void memory_capture_submit();
 /// The replay of the next submit: its capture (false: none, the pages are collected now as before)
 bool memory_take_capture(uint64_t value, uint64_t completed);
 bool memory_capture_now(uint64_t value, uint64_t completed);   // (hookshot: made and taken at once)
+bool memory_capture_enabled();
+void memory_note_ui_buffer(uint64_t gpu, uint64_t size);
+extern thread_local uint64_t ui_note_max;   // (the largest buffer noted on this thread, 64 KB unless a dispatch narrows it)
+extern thread_local bool ui_note_rb_only;   // (only buffers on a page the game reads GPU results in)
+void memory_note_read_range(uint64_t guest, uint64_t size);   // (the game is about to read GPU results there)
 /// The submission the replay records next (bindings note it: a pool's mirror is in use until it is done)
 void memory_recording_value(uint64_t value, uint64_t completed);
 // (hookshot) The recording being made, as vk_replay.cpp numbers them (Recording::part), and the newest of them in which
@@ -295,6 +305,7 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 uint64_t vk_timeline_completed();
 uint64_t vk_retirement_value();   // (longshot #442/#788) a timeline value that follows every recording currently alive
 void vk_timeline_wait(uint64_t v);
+bool vk_timeline_wait_for(uint64_t v, uint32_t ms);
 /// (hookshot #2633) A capture write-back part: 1 done, 0 submitted, -1 unknown. Wait returns true when known (done or timed out).
 int vk_part_state(uint64_t part);
 bool vk_part_wait(uint64_t part);
@@ -342,6 +353,7 @@ void image_compact_ignore(size_t i);
 /// the last one; then *freed_bytes and *freed_blocks say what went back to the driver in all
 bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks);
 void destroy_image(VkImage image, VmaAllocation allocation);
+void reap(std::function<void()> fn);   // (driver cleanup on the reaper thread, in FIFO order)
 void vma_log_image_blocks();
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
 uint64_t allocation_size(VmaAllocation allocation);

@@ -8,6 +8,7 @@
 #include "../gpu/vk/compat/hookshot_env.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   /* (older Windows SDKs lack it: Windows 10 1803 and later take it) */
@@ -756,17 +757,20 @@ uint64_t hos_cache_cpus(void) {
     return mask;
 }
 /* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
-static uint64_t last_fastest_core(int *cores) {
+static uint64_t last_fastest_core(int *cores, int *fast_cores, int *usable_logical) {
     static uint64_t masks[256];
     static unsigned char classes[256];
     DWORD len = 0;
     int n = 0;
     *cores = 0;
+    *fast_cores = 0;
+    *usable_logical = 0;
     GROUP_AFFINITY ga;
     const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
     if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
         return 0;
     char *buf = (char *)malloc(len);
+    int best = -1, nfast = 0, logical = 0;
     if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
         for (DWORD at = 0; at < len && n < 256;) {
             const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
@@ -774,12 +778,21 @@ static uint64_t last_fastest_core(int *cores) {
             if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group) {
                 masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
                 classes[n] = e->Processor.EfficiencyClass;
+                logical += __builtin_popcountll(masks[n]);
+                if ((int)classes[n] > best) best = classes[n], nfast = 1;
+                else if ((int)classes[n] == best) nfast++;
                 n++;
             }
             at += e->Size;
         }
     free(buf);
+    DWORD_PTR proc = 0, sys = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && proc)
+        *usable_logical = __builtin_popcountll((uint64_t)proc);
+    else
+        *usable_logical = logical;
     *cores = n;
+    *fast_cores = nfast;
     return pick_reserved_core(masks, classes, n);
 }
 /* (0.1.9c) The cores of the fastest kind on a hybrid CPU (Intel's P-cores beside E-cores): their logical processors, or 0 on a
@@ -834,11 +847,32 @@ uint64_t hos_reserved_cpus(void) {
        then took 9.8-10.0 ms a frame but the frame rate stayed at 56.9-57.4; with the 8 shared, 10.1-10.5 ms and 59.9 fps.
        HOS_RESERVE_CORE=1: the last core of the fastest kind is kept all the same, as on other CPUs. That is normally a core of
        the other CCD, not the cache core of the 9.8-10.0 ms above, and the game's threads then have all of the cache cores */
-    if (hos_cache_cpus() && !(getenv("HOS_RESERVE_CORE") && atoi(getenv("HOS_RESERVE_CORE")))) return mask;
+    const int force_reserve = getenv("HOS_RESERVE_CORE") && atoi(getenv("HOS_RESERVE_CORE")) != 0;
+    if (hos_cache_cpus() && !force_reserve) return mask;
     {
-        int cores = 0;
-        const uint64_t fast = last_fastest_core(&cores);
-        if (cores) return mask = fast;
+        int cores = 0, fast_cores = 0, usable_logical = 0;
+        const uint64_t fast = last_fastest_core(&cores, &fast_cores, &usable_logical);
+        if (cores) {
+            if (!force_reserve && fast_cores > 0 && fast_cores <= 8) {
+                const char *as = getenv("RX_VK_ASYNC");
+                const char *rt = getenv("RX_VK_RENDER_THREAD");
+                const int unsafe = (getenv("RX_VK_CAPTURE") && atoi(getenv("RX_VK_CAPTURE")) == 0) ||
+                                   (getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0) ||
+                                   (getenv("RX_VK_DUMP") && *getenv("RX_VK_DUMP") && strcmp(getenv("RX_VK_DUMP"), "0")) ||
+                                   getenv("RX_VK_BENCH") != NULL;
+                int rt_on = 0;
+                if (as) rt_on = atoi(as) != 0;
+                else if (rt && (!_stricmp(rt, "1") || !_stricmp(rt, "on") || !_stricmp(rt, "true"))) rt_on = 1;
+                else if (rt && (!_stricmp(rt, "0") || !_stricmp(rt, "off") || !_stricmp(rt, "false"))) rt_on = 0;
+                else rt_on = !unsafe && usable_logical >= 12;
+                if (rt_on) {
+                    hos_log("threads: %d fast cores with the render thread: all %d shared with the game's threads "
+                            "(HOS_RESERVE_CORE=1 reserves one)", fast_cores, fast_cores);
+                    return mask;
+                }
+            }
+            return mask = fast;
+        }
     }
 #endif
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
@@ -977,10 +1011,12 @@ void hos_thread_pin(void *h, const char *name) {
         SetThreadPriority(h, levels[p->value + 2]);
     else if (strstr(name, "OptimizeChange") && !getenv("HOS_OCB_NORMAL")) {
         /* (OoT's OptimizeChangeBank (guest priority 27, a background thread) walks every placed object of the
-           area by name, again and again (Kokiri: ~344 names, ~250k lookups a second). On the console it only gets the
-           time nothing more important wants; at the host's normal priority it took the renderer's and the driver's
-           cores and the frame waited (Kokiri, RX 6600 + 5600G: 17-20 fps; lowest: 21-28). HOS_OCB_NORMAL=1: as before) */
-        SetThreadPriority(h, THREAD_PRIORITY_LOWEST);
+           area by name, again and again. BELOW_NORMAL keeps it strictly below game/renderer/worker threads while
+           preventing 200-350 ms Windows priority-inversion stalls when a higher-priority guest thread kicks its vcore.
+           HOS_OCB_LOWEST=1: THREAD_PRIORITY_LOWEST; HOS_OCB_NORMAL=1: normal) */
+        SetThreadPriority(h, getenv("HOS_OCB_LOWEST") && atoi(getenv("HOS_OCB_LOWEST"))
+                                 ? THREAD_PRIORITY_LOWEST
+                                 : THREAD_PRIORITY_BELOW_NORMAL);
     }
 #if defined(_WIN32) && !defined(__EMSCRIPTEN__)
     else if (hos_mmcss_on()) {
@@ -1556,7 +1592,7 @@ static int vc_free_for(HosThread *t) {
 }
 static void vc_take(HosThread *t, int c) {
     vc_owner[c] = t;
-    t->vc_held = c + 1;
+    __atomic_store_n(&t->vc_held, c + 1, __ATOMIC_RELEASE);
     t->vc_last = c + 1;
     t->vc_kick = 0;
     t->vc_starved = 0;
@@ -1595,11 +1631,14 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
     return (e ? atoll(e) : us) * 1000;
 }
 static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int64_t slice, int64_t starve) {   /* (vc_lock held) */
+    static int spin_on = -1;
+    if (spin_on < 0) spin_on = !(getenv("HOS_NO_VCORE_SPIN") && atoi(getenv("HOS_NO_VCORE_SPIN")) != 0);
     const int64_t t0 = hos_now_ns();
     t->vc_since = t0;
     t->vc_queued = 1;
     if (vc_nq < 1024) vc_queue[vc_nq++] = t;
     vc_st.waits++;
+    int spun = 0;
     for (;;) {
         /* the worst holder worse than t on a core t may use gives it up at its next checkpoint; after
            HOS_VCORE_SLICE_US (2000) of waiting, a holder as good as t does too (a time slice: Horizon would leave
@@ -1611,8 +1650,8 @@ static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int
             HosThread *h = vc_owner[k];
             if ((m >> k & 1) && h && h->priority > t->priority && (!worst || h->priority > worst->priority)) worst = h;
         }
-        const int64_t now = hos_now_ns();
-        const int64_t elapsed = now - t0;
+        int64_t now = hos_now_ns();
+        int64_t elapsed = now - t0;
         if (!worst && elapsed > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
@@ -1627,9 +1666,28 @@ static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
         }
-        const int64_t esc_lim = worst ? esc_better : esc_eq;
+        const int had_worst = worst != NULL;
+        if (!spun && spin_on && had_worst) {
+            spun = 1;
+            ReleaseSRWLockExclusive(&vc_lock);
+            for (int s = 0; s < 96; s++) {
+                if (__atomic_load_n(&t->vc_held, __ATOMIC_ACQUIRE)) break;
+                _mm_pause();
+            }
+            AcquireSRWLockExclusive(&vc_lock);
+            if (t->vc_held) break;
+            int c0;
+            if ((c0 = vc_free_for(t)) >= 0) {
+                vc_dequeue(t);
+                vc_take(t, c0);
+                break;
+            }
+            now = hos_now_ns();
+            elapsed = now - t0;
+        }
+        const int64_t esc_lim = had_worst ? esc_better : esc_eq;
         const int64_t rem_esc_ms = esc_lim > elapsed ? (esc_lim - elapsed + 999999LL) / 1000000LL : 1;
-        int64_t wait_ms = worst ? 4 : (slice > elapsed ? (slice - elapsed + 999999LL) / 1000000LL : 1);
+        int64_t wait_ms = had_worst ? 1 : (slice > elapsed ? (slice - elapsed + 999999LL) / 1000000LL : 1);
         if (wait_ms < 1) wait_ms = 1;
         if (wait_ms > 4) wait_ms = 4;
         if (wait_ms > rem_esc_ms) wait_ms = rem_esc_ms;
@@ -1643,7 +1701,7 @@ static void vc_wait_locked(HosThread *t, int64_t esc_better, int64_t esc_eq, int
         }
         const int64_t waited = hos_now_ns() - t0;
         if (starve > 0 && waited > starve) t->vc_starved = 1;
-        if (waited > (worst ? esc_better : esc_eq)) {
+        if (waited > esc_lim) {
             vc_dequeue(t);
             t->vc_starved = 0;
             t->vc_escaped = 1;
@@ -1696,7 +1754,7 @@ static void vc_release(HosThread *t) {
     AcquireSRWLockExclusive(&vc_lock);
     const int c = t->vc_held - 1;
     vc_owner[c] = NULL;
-    t->vc_held = 0;
+    __atomic_store_n(&t->vc_held, 0, __ATOMIC_RELEASE);
     t->vc_kick = 0;
     vc_grant(c);
     ReleaseSRWLockExclusive(&vc_lock);
@@ -1720,7 +1778,7 @@ static void vc_yield(HosThread *t, int strict) {
     }
     vc_st.yields++;
     vc_owner[c] = NULL;
-    t->vc_held = 0;
+    __atomic_store_n(&t->vc_held, 0, __ATOMIC_RELEASE);
     vc_grant(c);
     vc_st.takes++;
     const int nc = vc_free_for(t);

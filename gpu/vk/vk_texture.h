@@ -19,6 +19,16 @@
 
 namespace mkwvk {
 
+struct TexAliveSlot {
+    uint32_t idx = 0;
+    uint64_t token = 0;
+    TexAliveSlot() = default;
+    TexAliveSlot(const TexAliveSlot&) = delete;
+    TexAliveSlot& operator=(const TexAliveSlot&) = delete;
+    ~TexAliveSlot();
+};
+bool texture_alive_ok(uint32_t idx, uint64_t token);
+
 struct Texture {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation allocation = nullptr;
@@ -101,6 +111,7 @@ struct Texture {
         uint32_t level;
     };
     std::vector<BlockAttachment> block_attachments;
+    TexAliveSlot alive;
 };
 
 /// Makes texels [x, x + w) x [y, y + h) of level `level`, layers [first, first + count), of a sparse texture resident

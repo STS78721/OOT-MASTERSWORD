@@ -9,9 +9,11 @@
 
 namespace mkwvk::target_pool {
 
-inline constexpr uint64_t kMinMB = 256, kMaxMB = 768;
+inline constexpr uint64_t kMinMB = 256, kMaxMB = 384;
 // How long an image waits in the pool for the next target of its shape, in presents (RX_VK_POOL_IDLE).
-inline constexpr uint64_t kIdlePresents = 8;
+// 24 presents (~0.4 s) covers frame-to-frame dynamic-resolution transitions without hoarding 750+ MB of stale sizes
+// and pushing total VRAM past the 90% driver budget cliff.
+inline constexpr uint64_t kIdlePresents = 24;
 
 /// The default bound in MB for a driver allowance of `allowed` bytes (0: not known, the minimum)
 inline uint64_t default_mb(uint64_t allowed) {

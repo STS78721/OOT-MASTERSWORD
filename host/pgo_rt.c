@@ -83,7 +83,11 @@ static DWORD WINAPI pgo_thread(void *arg) {
     return 0;
 }
 
+/* (MasterSword) the Vulkan back end's own copy (nx2/build.py, RX_VK_PGO=gen) reads another variable: -DPGO_ENV="RX_VK_PGO_FILE" */
+#ifndef PGO_ENV
+#define PGO_ENV "HOS_PGO"
+#endif
 __attribute__((constructor)) static void pgo_start(void) {
-    const char *e = getenv("HOS_PGO");
+    const char *e = getenv(PGO_ENV);
     if (e) CreateThread(NULL, 0, pgo_thread, _strdup(e), 0, NULL);
 }

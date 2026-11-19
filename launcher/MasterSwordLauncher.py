@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageDraw, ImageTk
 
-CURRENT_VERSION = "0.2.0"
+CURRENT_VERSION = "0.2.1"
 EDITION_NAME = "SteelTemple MasterSword Edition"
 APP_TITLE = "The Legend of Zelda: Ocarina of Time - PC Recompiled"
 VERSION_STRING = f"V {CURRENT_VERSION}"
