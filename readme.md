@@ -31,13 +31,19 @@ We aim for a **native, flagship PC experience**:
 
 ---
 
-## 🎮 What's in 0.2.1
+## 🎮 What's in 0.2.2
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
-### 🚀 0.2.1 — Vulkan PGO, Threaded Rendering, Selective Capture & RTX 50 Fix
+### ⚡ 0.2.2 — Fast Sync, HUD-Less FSR 3.1 FG, Job Barriers & High-FPS Gameplay Fixes
+* **Fast Sync (`RX_VK_FAST_SYNC=1`) & Memory Sync Overhaul** — adds sequence-tracked CPU/GPU write-back synchronization (`msync`), tile-based partial texture updates, render-target overlap tracking, and GPU capture throttling for lower CPU sync overhead with full visual fidelity.
+* **OS Job Barriers, Native Host Libc & Texture-Heap Throttling** — wakes worker barriers immediately on mask completion (`HOS_OOT_BARRIER_WAIT`), accelerates SDK `memcpy`/`memmove`/`memset`/`memcmp`/`strlen`/`strcmp` through pieced 256 KB host paths (`nx2/entry_hooks.py`), throttles texture-heap compaction to once per second (`HOS_TEX_COMPACT_MS`), and waits cleanly for in-flight save writes on window close.
+* **FSR 3.1 HUD-Less Frame Generation & Hidden-Mesh Temporal Stabilization** — keeps UI/HUD text razor sharp under FSR 3.1 FG (`RX_VK_FSR_FG_HUD`), stabilizes camera-inside-Link hidden-mesh depth under temporal upscalers, replaces GPU swapchain acquire blocking with CPU acquire fences, evicts 3/4 CPU-overwritten textures cleanly, and adds hardware fixes for Intel depth bias, external host memory types, RGB-to-RGBA alpha widening, and vertex attribute divisors.
+* **>60 FPS & <60 FPS Gameplay Accuracy** — fixes Epona fence jumps, Shadow Temple moving-barge carry, frozen Zora poses, 3× water ripple substeps, ocarina note advances, and Havok cloth timing.
+
+### 🚀 From 0.2.1 (still here) — Vulkan PGO, Threaded Rendering, Selective Capture & RTX 50 Fix
 * **Vulkan Renderer PGO (`mastersword_vk.dll`)** — compiled with a MasterSword-native Profile-Guided Optimization profile from live Castle Town & Hyrule Field play (`3,215` functions, `76.08B` block counts) while keeping `HOOKSHOT_SHADER_STAMP` (`0x4eae666d8f924912`) intact so existing shader/program caches never rebuild.
 * **Threaded Rendering (`Auto` on 12+ logical CPUs)** — decouples Vulkan recording and present pacing via `RX_VK_PRESENTS_AHEAD` for higher, steadier frame pacing on modern multi-core CPUs.
 * **Selective Submit-Time Capture (`RX_VK_CAPTURE=2`) & Shadow-Baseline Sync** — focuses submit captures on 2D/compute small buffers and readback ranges, paired with `RX_VK_SHADOW_BASELINE=1` sync, sky light accumulator resets, retired-mirror clean-page inheritance, and GPU-adaptive `p90` capture wait caps (`20 ms` baseline).
@@ -107,10 +113,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.2.1)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.2.2)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.2.1-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.1/SteelTemple-MasterSword-0.2.1-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.2.2-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.2/SteelTemple-MasterSword-0.2.2-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -130,11 +136,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.2.1-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.1/SteelTemple-MasterSword-0.2.1-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.2.1`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.2.2-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.2/SteelTemple-MasterSword-0.2.2-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.2.2`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.1/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.2/MasterSwordLauncher.exe)**
 
 ---
 
