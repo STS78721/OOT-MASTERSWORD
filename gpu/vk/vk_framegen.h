@@ -11,6 +11,11 @@ bool framegen_on();
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]);
 /// The first frame the last framegen_record made (null when it made none), w x h, GENERAL
 VkImage framegen_made_image(uint32_t* w, uint32_t* h);
+/// The gameplay upscale's picture (its output, at level), recorded right after the upscale wrote it, before the game draws
+/// its HUD into it: copied while AMD FSR 3.1's frame interpolation is asked for, so that framegen_record can mark the HUD
+/// for it (what the game drew over the picture since). Anything else (null, another format or shape) is left alone
+struct Texture;
+void framegen_hud_before(VkCommandBuffer cmd, Texture* picture, uint32_t level);
 /// After that recording's submit (value): the display thread shows its frames
 void framegen_queue(uint64_t value);
 /// The window's present of an image (GENERAL, w x h; crop as above or null), vk_replay.cpp: the display thread's

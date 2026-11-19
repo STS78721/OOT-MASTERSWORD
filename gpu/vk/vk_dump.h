@@ -8,8 +8,9 @@
 
 namespace mkwvk {
 
-/// The frame being recorded is dumped
-bool dump_on();
+extern bool dump_armed;
+/// The frame being recorded is dumped (inline read: checked on every texture of every draw)
+inline bool dump_on() { return dump_armed; }
 /// The number the next step's dump gets (draws logged before it are in it)
 int dump_seq();
 /// A present (the count so far): arms the dump of the frame after it, or ends the one before

@@ -100,9 +100,9 @@ void slate_close();
 void pipeline_cache_play();   // (the start-up done: what play makes goes into play files of its own)
 
 /// The stream's uniform updates (UPDATE_UB, vk_replay.cpp) that overlap [addr, addr + n) and may not be in guest
-/// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc returns in the
-/// recording's stream (mapped at base), or UINT64_MAX when none overlaps
-uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc);
+/// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc(n, align) returns in
+/// the recording's stream (mapped at base), or UINT64_MAX when none overlaps
+uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, uint64_t (*alloc)(uint64_t n, uint64_t align), uint64_t align);
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);

@@ -191,7 +191,8 @@ struct Constants {
     uint32_t back_buffer_transfer_function;
     float min_max_luminance[2];
     float tan_half_fov;
-    int32_t pad1;
+    /// AMD's _pad1: the made frame's place between the frame before (0) and this one (1), read by the patched shader
+    float interpolation_t;
     float jitter[2];
     float motion_vector_scale[2];
 };
@@ -232,6 +233,10 @@ static_assert(sizeof(OfSpdConstants) == 32, "cbOF_SPD must match the SDK's layou
 // ---- state ----
 
 constexpr uint32_t kMaxMade = 1;        ///< one midpoint frame between two of the game's (vk_fsr3fi.h)
+/// cbFI's dispatchFlags bit the patched interpolation reads: the HUD kept where it is. AMD's own bits are 0 to 2.
+constexpr uint32_t kKeepStatic = 1u << 16;
+/// And the bit that says the colour's alpha marks the HUD (Inputs::hud_mask): the HUD known, not guessed
+constexpr uint32_t kHudMask = 1u << 17;
 constexpr uint32_t kOfLevels = 7;       ///< advancedAlgorithmIterations in ffx_opticalflow.cpp
 constexpr uint32_t kOfBlockSize = 8;    ///< opticalFlowBlockSize, likewise
 constexpr uint32_t kPyramidMips = 13;   ///< the mip UAVs the two inpainting pyramid passes declare
@@ -658,6 +663,15 @@ void clear_images(VkCommandBuffer cmd, std::initializer_list<const Image*> image
             vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ALL_LEVELS);
 }
 
+/// kKeepStatic, unless RX_VK_FSR_FG_HUD=0 (HUD moved with scene for A/B)
+uint32_t keep_static_flag() {
+    static const bool off = []() {
+        const char* e = getenv("RX_VK_FSR_FG_HUD");
+        return e && *e && atoi(e) == 0;
+    }();
+    return off ? 0u : kKeepStatic;
+}
+
 } // namespace
 
 /// What this device can do, which cannot change while it runs: asked once and kept.
@@ -865,7 +879,8 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
     // luma pixels into the UV motion the vector field packs.
     k.optical_flow_scale[0] = 1.0f / (float)uw, k.optical_flow_scale[1] = 1.0f / (float)uh;
     k.optical_flow_block_size = (int32_t)kOfBlockSize;
-    k.dispatch_flags = 0;            // (no debug view, no debug bar)
+    // (no debug view, no debug bar; the HUD kept where it is: marked in the colour's alpha, or else guessed)
+    k.dispatch_flags = keep_static_flag() | (keep_static_flag() && in.hud_mask ? kHudMask : 0u);
     k.max_render_size[0] = rw, k.max_render_size[1] = rh;
     k.optical_flow_half_res_mode = 0;
     k.num_instances = 1;
@@ -879,6 +894,7 @@ bool generate(VkCommandBuffer cmd, const Inputs& in) {
     // fTanHalfFOV is the *horizontal* half angle's tangent, as ffxFrameInterpolationDispatch builds it from the vertical
     // field of view and the render aspect: 1 / p[0][0] of the scene's projection (fsr3_math.h)
     k.tan_half_fov = in.camera.tan_half_fov_x;
+    k.interpolation_t = 0.5f;   // (midpoint between the frame before and this one)
     k.jitter[0] = in.jitter[0], k.jitter[1] = in.jitter[1];
     k.motion_vector_scale[0] = in.motion_scale[0] / (float)rw;
     k.motion_vector_scale[1] = in.motion_scale[1] / (float)rh;

@@ -50,6 +50,7 @@
 #include "dlss_actor.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "hidden_mesh.h"
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
@@ -856,6 +857,28 @@ void temporal_idle() {
     s.last_frame = 0;   // (a new history when it comes back)
     free_dead(false);
     s.holding = !s.dead.empty();
+}
+
+// ---- the depth draws of hidden meshes (vk_draw.cpp hidden_depth_draw) ----
+int temporal_hidden_mesh_mode() {
+    static const int mode = [] {
+        const bool rule = env_switch("RX_VK_DLSS_FADED") != 0;          // (unset: on)
+        const bool detail = env_switch("RX_VK_DLSS_FADED_LOG") == 1;   // (unset: off)
+        if (rule)
+            logf("vk: upscaler: faded: while a temporal upscaler or frame generation draws, the depth draws of a skinned mesh "
+                 "that had colour and has had none for %u frames are left out until its colour is back (RX_VK_DLSS_FADED=0 "
+                 "draws them)", hidden_mesh::kHiddenAfter);
+        else
+            logf("vk: upscaler: faded: RX_VK_DLSS_FADED=0: hidden meshes' depth draws are drawn");
+        return (rule ? 1 : 0) | (detail ? 2 : 0);
+    }();
+    return mode;
+}
+
+bool temporal_scene_depth_is(const Texture* depth) {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    return depth && s.cam.valid && s.cam.depth == depth && s.cam.frame == texture_frame_no();
 }
 
 void temporal_note_skinned_draw(const SkinnedDraw& k) {

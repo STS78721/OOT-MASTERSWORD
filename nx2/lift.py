@@ -29,6 +29,7 @@ import kit
 import nso2  # noqa: F401  (DT_RELR)
 import insn
 import lift_fixes
+import entry_hooks
 import suyu_rt_fixes
 import chunks
 import standalone
@@ -43,6 +44,7 @@ import a64_rtgen
 
 insn.install()
 lift_fixes.install()
+entry_hooks.install()   # (host/*.c's ENTRY_HOOK_SYM hooks at the entry of their SDK functions: add() below)
 suyu_rt_fixes.install()
 
 
@@ -160,6 +162,8 @@ def main():
         print("ADR / ADRP+ADD code addresses outside the %d unwind-covered functions: %d, %d of them new entries" % (
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
+    if a.standalone:   # (hookshot) the host's memcpy, memset, ... first, the SDK's own kept behind them (nx2/entry_hooks.py)
+        entry_hooks.add(L, img)
     if a.standalone:   # (hookshot) widescreen and ultrawide: C after a few of the game's instructions
         import oot_wide
         oot_wide.install(L, img)
@@ -199,6 +203,8 @@ def main():
             standalone.write_nvn_exports(gen, nvn)
             print("standalone: nvn2_exports.c (%d sdk NVN functions routed to host/nvn2.c)" % len(nvn))
         L.report()
+        if a.standalone:   # (nx2/entry_hooks.py: one per hook the lift found a function for)
+            print("entry hooks spliced: %d" % L.stats["entry_hooks"])
         print("interrupt polls: %d loop headers in %d functions" % (poll.stats["polls"], poll.stats["functions"]))
         print("wrote %d code files to %s (%.0fs)" % (len(files), gen, time.time() - t0))
     print("done (%.0fs)" % (time.time() - t0))

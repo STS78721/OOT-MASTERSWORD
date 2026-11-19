@@ -73,6 +73,7 @@ struct Device {
     uint32_t subgroup_size = 32, subgroup_max = 32;   // (the lanes a stage not pinned runs at, and the most it can have)
     VkDriverId driver_id{};
     uint32_t max_push_descriptors = 0;
+    uint32_t max_vertex_divisor = 0;   // (maxVertexAttribDivisor, with dev.vertex_divisor)
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;
     // the window
@@ -291,6 +292,29 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr);
+/// (RX_VK_LATE_SEQ) write-backs this thread noted since its last submit belong to seq on the recordings' timeline
+void memory_wb_seq_assign(uint64_t seq);
+uint64_t vk_rec_completed();                 // (vk_replay.cpp: the GPU's progress on the recordings' timeline)
+bool vk_rec_wait(uint64_t seq, uint32_t ms); // (and a wait for one of its numbers; true when the GPU is past it)
+bool vk_on_present_thread();                 // (vk_replay.cpp: whether the calling game thread is the one calling present)
+/// (RX_VK_METER_ZERO / RX_VK_METER_HOLD) the exposure meter's block start and whether guest is one
+void memory_meter_range(uint64_t guest, uint64_t size);
+bool memory_is_meter(uint64_t guest);
+/// Fast sync: avoid blocking captures on the GPU's full frame where safe. RX_VK_FAST_SYNC=0 turns off all four parts:
+///   RX_VK_METER_ZERO       clear the exposure meter's sums on the GPU right before their dispatches
+///   RX_VK_METER_HOLD       hold the last non-zero exposure result if a read sees its own zeros
+///   RX_VK_LATE_SEQ         wait on each page's write-back recording seq instead of the whole submission's last part
+///   RX_VK_CAPTURE_WAIT_WHO (2 with fast sync) skip capture waits on the presenting game thread once meter is seen
+inline bool fast_sync_all() {
+    static const bool all = getenv("RX_VK_FAST_SYNC") ? atoi(getenv("RX_VK_FAST_SYNC")) != 0 : true;
+    return all;
+}
+inline bool fast_sync_part(const char* name) {
+    if (const char* e = getenv(name)) return atoi(e) != 0;
+    return fast_sync_all();
+}
+/// (RX_VK_LATE_SEQ) pages whose GPU-written sums are cleared on the GPU before use wait for no write-back in captures
+void memory_no_late(uint64_t guest, uint64_t size);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 void memory_note_cpu_read(uint64_t guest, uint64_t size);   // (invalidate) a CPU read: a large binding over it keeps its write-back
 void memory_note_cpu_access(uint64_t guest, uint64_t size, bool write);   // (and a CPU write a mirror sync copies: wb_learn.h)

@@ -38,6 +38,8 @@
 #include "vk_jobs.h"
 #include "vk_dlss.h"
 #include "vk_temporal.h"
+#include "vk_framegen.h"      // (framegen_hud_before: a gameplay upscale's picture, for FSR 3.1 FG HUD mask)
+#include "vk_fsr3fi.h"        // (frames_wanted)
 #include "vk_fsr3.h"          // (AMD FSR 3.1 in the gameplay upscale's place)
 #include "vk_fsr3_inputs.h"
 #include "reactive_policy.h"
@@ -45,6 +47,7 @@
 #include "vk_reactive.h"      // (the upscalers' reactive mask: the scene copied before its transparent draws)
 #include "dlss_actor.h"
 #include "dlss_checks.h"
+#include "hidden_mesh.h"      // (hidden-mesh depth exclusion, hidden_depth_draw)
 #include "vk_menu.h"
 #include "vk_mvec.h"
 #include "vk_shader.h"
@@ -2200,7 +2203,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
             static std::atomic<int> logged{0};
             if (logged++ < 8)
                 logf("vk: vertex stream %u divisor %u%s", b, s.vstream[b].divisor, dev.vertex_divisor ? "" : " (not supported: 1)");
-            if (dev.vertex_divisor) vdivs.push_back({b, s.vstream[b].divisor});
+            if (dev.vertex_divisor) vdivs.push_back({b, std::min(s.vstream[b].divisor, dev.max_vertex_divisor)});
         }
     {   // (each NVN vertex format once: what the game draws with)
         static std::mutex mu;
@@ -2365,14 +2368,18 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
                                       ? VK_NULL_HANDLE
                                       : (pcache ? pcache : kAppCacheSentinel);
     VkResult r = graphics_with(cache, &ci, &pl);
-    // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on.
-    if (dev.props.vendorID == 0x1002 && !p.mesh && part < 0 && r == VK_ERROR_UNKNOWN &&
+    // A pipeline the driver's compiler fails on (e.g. AMD proprietary compiler returning -13 or SEH fault -77)
+    // is built once more without optimization so draws are rendered instead of skipped (skip memory errors).
+    if (r != VK_SUCCESS && r != VK_ERROR_OUT_OF_HOST_MEMORY && r != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
         !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+        const VkResult first = r;
         ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         pl = VK_NULL_HANDLE;
         r = graphics_with(cache, &ci, &pl);
-        if (r == VK_SUCCESS)
-            logf("vk: graphics pipeline for %016llx recovered with optimization disabled", (unsigned long long)p.key);
+        static std::atomic<int> told{0};
+        if (told++ < 20)
+            logf("vk: %s %016llx failed (%d) with the driver's optimizer: %s", part >= 0 ? "a library of" : "graphics pipeline for",
+                 (unsigned long long)p.key, (int)first, r == VK_SUCCESS ? "made without it" : "not made without it either");
     }
     if (part >= 0) {
         if (r != VK_SUCCESS) {
@@ -2585,28 +2592,29 @@ uint64_t sampler_state_generation() {
     return mix(sampler_registrations_generation(),
                (uint64_t)(uint32_t)(opts.upscale * 257 + opts.resolution * 17 + opts.dlss_quality)) | 1ull;
 }
-/// compare: the shader reads depth with a reference (a sampler without one cannot compare)
-VkSampler sampler_make(int id, bool compare);
+/// compare: the shader reads depth with a reference (a sampler without one cannot compare). one_level: the image bound with it
+/// has a single level, and the Anisotropic filtering row's anisotropy is not added (the game's own stays)
+VkSampler sampler_make(int id, bool compare, bool one_level);
 // (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
-// ~48000 times a frame at 3000 draws. Now a thread's table by id and compare, good while no sampler registration's contents
-// changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0 turns off both this table and the parameters' cache inside
+// ~48000 times a frame at 3000 draws. Now a thread's table by id, compare and one_level, good while no sampler registration's
+// contents changed (sampler_state_generation). RX_VK_SAMPLER_CACHE=0 turns off both this table and the parameters' cache inside
 // sampler_make; =1 or the Sampler cache row turns the parameters' cache on (this table stays on, as it is without the option)
 bool sampler_cache_on();   // (hookshot, RX_VK_SAMPLER_CACHE and the Sampler cache row: defined below with the descriptor fingerprint's)
-VkSampler sampler_for(int id, bool compare) {
+VkSampler sampler_for(int id, bool compare, bool one_level) {
     static const bool on = !getenv("RX_VK_SAMPLER_CACHE") || atoi(getenv("RX_VK_SAMPLER_CACHE")) != 0;
-    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare);
+    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare, one_level);
     struct Entry { uint64_t gen; VkSampler s; uint64_t frame; };
-    static thread_local Entry table[2][4096];   // (gen 0: never filled; the generation starts at 1)
+    static thread_local Entry table[2][2][4096];   // (gen 0: never filled; the generation starts at 1)
     const uint64_t gen = sampler_state_generation();   // (read first: a registration after it makes the next call miss)
-    // (longshot #442: near the device's sampler limit, an entry lasts a present so the book sees active samplers)
+    // (near the device's sampler limit, an entry lasts a present so the book sees active samplers)
     const uint64_t frame = sampler_book.watching.load(std::memory_order_relaxed) ? texture_frame_no() : 0;
-    Entry& e = table[compare ? 1 : 0][id];
+    Entry& e = table[compare ? 1 : 0][one_level ? 1 : 0][id];
     if (e.gen == gen && e.frame == frame) return e.s;
-    const VkSampler made = sampler_make(id, compare);
+    const VkSampler made = sampler_make(id, compare, one_level);
     if (made) e = {gen, made, frame};   // (a failed creation is retryable without a new registration)
     return made;
 }
-VkSampler sampler_make(int id, bool compare) {
+VkSampler sampler_make(int id, bool compare, bool one_level) {
     nvn_samp_par p{};
     bool known = false;
     if (sampler_cache_on()) {   // (hookshot: what an id holds stays cached with its version on this thread: resolving an id
@@ -2624,7 +2632,9 @@ VkSampler sampler_make(int id, bool compare) {
     const float up_bias = p.lod_bias < 0.0f ? upscale_lod_bias() : 0.0f;   // (the game's upscaled materials only)
     uint32_t up_bits;
     std::memcpy(&up_bits, &up_bias, sizeof up_bits);
-    uint64_t key = mix(mix(compare ? 0xC0 : 0xAB, aniso_override()), up_bits);
+    // (one_level: the row's anisotropy is not added, so it is not part of the key either)
+    const uint32_t row_aniso = one_level ? 0u : aniso_override();
+    uint64_t key = mix(mix(compare ? 0xC0 : 0xAB, row_aniso), up_bits);
     const uint8_t* b = reinterpret_cast<const uint8_t*>(&p);
     for (size_t i = 0; i < sizeof p; i += 8) {
         uint64_t w = 0;
@@ -2668,18 +2678,26 @@ VkSampler sampler_make(int id, bool compare) {
     ci.addressModeU = wrap(p.ws), ci.addressModeV = wrap(p.wt), ci.addressModeW = wrap(p.wr);
     ci.mipLodBias = std::clamp(p.lod_bias + up_bias, -dev.props.limits.maxSamplerLodBias, dev.props.limits.maxSamplerLodBias);
     float aniso = p.aniso;
-    {   // (RX_VK_ANISO: what the game asks for is told once for each value, 16 at most: what it sets is not known otherwise)
+    {   // (what the game asks for is told once for each anisotropy, filter, LOD bias and one level or not, 16 at most: not known
+        // otherwise. one_level is in the key: a sampler kind first bound with an image of one level would else tell 0 for all)
         static std::mutex am;
-        static std::unordered_set<uint32_t> asked;
-        uint32_t bits;
+        static std::unordered_set<uint64_t> asked;
+        uint32_t bits, bias;
         std::memcpy(&bits, &p.aniso, sizeof bits);
+        std::memcpy(&bias, &p.lod_bias, sizeof bias);
         std::lock_guard ag(am);
-        if (asked.size() < 16 && asked.insert(bits).second)
-            logf("vk: sampler anisotropy: the game asks for %g (min filter %u, mip filter %s; RX_VK_ANISO=%u)", (double)p.aniso, (unsigned)p.minf,
-                 ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest", aniso_override());
+        if (asked.size() < 16 && asked.insert((uint64_t)bits << 32 ^ (uint64_t)bias << 3 ^ p.minf ^ (uint64_t)one_level << 63).second)
+            logf("vk: sampler anisotropy: the game asks for %g (min filter %u, mip filter %s, LOD bias %g; made with %u%s)", (double)p.aniso,
+                 (unsigned)p.minf, ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR ? "linear" : "nearest", (double)p.lod_bias, row_aniso,
+                 one_level ? ", an image of one level: not the row's" : "");
     }
-    if (aniso_override() && ci.minFilter == VK_FILTER_LINEAR && ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
-        aniso = std::max(aniso, (float)aniso_override());
+    // (a linear filter with mip levels, linear or nearest between them: OoT asks for both, 2x with linear levels and 1x with
+    // nearest ones, its world's materials with a LOD bias of -0.5 either way. Not for an image of one level: the game's own
+    // pictures it reads back (a half-size fog and particle layer, the scene's depth), where a 2x2 block of pixels across an
+    // object's edge has texture coordinates far apart. An anisotropic filter then takes texels along that whole span, from
+    // the sky behind a mountain's ridge into the ridge: dashed bright lines along every edge on AMD's RX 7900 XTX)
+    if (row_aniso && ci.minFilter == VK_FILTER_LINEAR && p.minf != NVN_MIN_FILTER_LINEAR)
+        aniso = std::max(aniso, (float)row_aniso);
     ci.anisotropyEnable = aniso > 1.0f && dev.features.samplerAnisotropy;
     ci.maxAnisotropy = std::clamp(aniso, 1.0f, dev.props.limits.maxSamplerAnisotropy);
     ci.compareEnable = compare && p.cmp_mode != 0;
@@ -3085,8 +3103,7 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
-            if (const uint64_t at = ub_overlay(u.addr, n, cur->mapped, [&](uint64_t bytes) { return stream_alloc(bytes, align); });
-                at != UINT64_MAX) {
+            if (const uint64_t at = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align); at != UINT64_MAX) {
                 FINE_N(FC_UBO_OVERLAY, 1);
                 return {cur->stream, at, n};
             }
@@ -3097,7 +3114,7 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         static const mkwvk::direct_ub::Mode snapshot = mkwvk::direct_ub::mode(getenv("RX_VK_UB_SNAPSHOT"));
         BufferRef b = snapshot == mkwvk::direct_ub::Mode::forced ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
         const bool keep_copy = mkwvk::direct_ub::should_snapshot(snapshot, b.direct);
-        if (b && b.offset % align == 0 && !keep_copy) return {b.buffer, b.offset, n};
+        if (b && !(b.offset & (align - 1)) && !keep_copy) return {b.buffer, b.offset, n};
         const uint64_t generation = ub_generation(), capture_view = memory_capture_view();
         if (keep_copy) {
             static std::atomic_flag told = ATOMIC_FLAG_INIT;
@@ -3358,10 +3375,12 @@ struct SkySums {
     VkDeviceSize offset, size;
 };
 thread_local SkySums sky_sums{};
+thread_local SkySums meter_out{};   // (RX_VK_METER_ZERO: where an exposure program's sums were bound)
 constexpr uint64_t kSkySumsProgram = 0x499dbfd0721d2858ull, kSkyRgblProgram = 0xab7699ee7f536755ull;
 
 void build_descriptors(const NvnState& s, const Program& p) {
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (bound again below)
+    if (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) meter_out = {};
     DescWriter& out = dw();   // (once from here: the accessor is a call and a thread-local read)
     out.reset();
     dw().prog = &p;   // (keep exact pattern for test_mesh_fallback.py)
@@ -3510,10 +3529,19 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 const bool plausible = d.count == 1 || (size && size <= (256ull << 20) && host->gpu_guest(base));
                 BufferRef b = addr && plausible ? gpu_buffer_bind(base, n, d.is_written && !bare) : BufferRef{};
                 if ((ui_draw_now || compute_now) && b && d.count == 1) memory_note_ui_buffer(base, n);   // (the HUD's records, a compute pass's blocks)
+                // (exposure meter: where its two programs bind their sums block)
+                if ((p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) && d.is_written && b && n == 0x1040) {
+                    memory_meter_range(host->gpu_guest(base), n);
+                    meter_out = SkySums{b.buffer, b.offset + (addr - base), n - (addr - base)};
+                    if (fast_sync_part("RX_VK_METER_ZERO")) memory_no_late(host->gpu_guest(base), n);
+                }
                 // (MasterSword) OoT's sky light accumulators: where they were bound, for the dispatch's reset (kSkySumsProgram)
                 if (((p.key == kSkySumsProgram && d.cbuf_offset == 0x20) || (p.key == kSkyRgblProgram && d.cbuf_offset == 0x30)) &&
                     d.cbuf_index == 0 && d.count == 1)
                     sky_sums = b ? SkySums{b.buffer, b.offset + (addr - base), n - (addr - base)} : SkySums{};
+                if (((p.key == kSkySumsProgram && d.cbuf_offset == 0x20) || (p.key == kSkyRgblProgram && d.cbuf_offset == 0x30)) &&
+                    d.cbuf_index == 0 && d.count == 1 && b && !getenv("RX_VK_NO_SKY_ZERO"))
+                    memory_no_late(host->gpu_guest(base) + (addr - base), std::min<uint64_t>(n - (addr - base), 0x100));
                 // (AyyBeeDee20738, PR 138) a table entry's region that does not fit its pool this moment bound nothing, and the next
                 // frame bound it again: its reads flipped between the data and 0, the picture between bright and dark. Smaller,
                 // down to 1 MB, rather than nothing (and past what is bound the shaders' search now goes on to the page table)
@@ -3780,7 +3808,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
                 desc_alive_note(view && tex ? tex : nullptr);
-                out.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
+                // (an image of one level: no anisotropy of the row's, sampler_make)
+                out.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1), view,
+                                    VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &out.imgs[first];
             out.writes.push_back(w);
@@ -4039,6 +4069,7 @@ const char* checkpoint_kind(char c) {
     return c == 'd' ? "draw of program" : c == 'c' ? "dispatch of program" : c == 'i' ? "INDIRECT dispatch of program"
          : c == 'm' ? "mirror sync of pool"
          : c == 'b' ? "write-back of pool" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
+         : c == 's' ? "mirror syncs' pass, chunk count"
          : "?";
 }
 
@@ -4703,11 +4734,7 @@ bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t
     if (nf <= 0 || nu <= 0 || nb <= 0) return false;
     for (int i = 0; i < nf; i++)
         if (fp[i] != cfp[i]) return false;
-    for (int i = 0; i < nu; i++)
-        if (up[i] != cup[i]) return false;
-    for (int i = 0; i < nb; i++)
-        if (raw[i] != craw[i]) return false;
-    return true;
+    return !std::memcmp(up, cup, (size_t)nu * sizeof *up) && !std::memcmp(raw, craw, (size_t)nb);
 }
 constexpr int kDynF = 13, kDynU = 35;
 struct DynFast {
@@ -4849,8 +4876,16 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     {   // (hookshot) A colour pass after a depth pass tests EQUAL against what another program wrote. Intel's compiler does not give two
         // programs the same position to the last bit, and the ground came out in holes: the sky through them, a white forest.
         // A small margin towards the camera instead. RX_VK_EQ_BIAS=<units>, 0: as the game asks
+        // Not for a draw that blends: the game keeps such a draw where the depth is exactly its own, and LESS_OR_EQUAL drew
+        // the whole sheet over the mountain behind on Intel; the prepass's colour passes do not blend (or use ONE, ZERO).
         static const float eq_bias = getenv("RX_VK_EQ_BIAS") ? (float)atof(getenv("RX_VK_EQ_BIAS")) : dev.props.vendorID == 0x8086 ? 64.0f : 0.0f;
-        if (eq_bias > 0 && d.dt && !d.dw && d.dop == VK_COMPARE_OP_EQUAL) {
+        bool blends = false;
+        for (int i = 0; i < at.n && !blends; i++) {
+            const nvn_blend_st& b = s.blend[i];
+            blends = (s.color.blend_en >> i & 1) && at.color_format[i] && (!cur_program || target_write_mask(*cur_program, s, i)) &&
+                     (blend_factor(b.src_rgb) != VK_BLEND_FACTOR_ONE || blend_factor(b.dst_rgb) != VK_BLEND_FACTOR_ZERO);
+        }
+        if (eq_bias > 0 && d.dt && !d.dw && d.dop == VK_COMPARE_OP_EQUAL && !blends) {
             d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
             d.bias_en = VK_TRUE;
             d.bias[0] = -eq_bias, d.bias[1] = 0.0f, d.bias[2] = 0.0f;
@@ -5724,7 +5759,7 @@ void log_dump_draw(const NvnState& s, const Program& p, const DrawArgs& d) {
         const nvn_p_bind_buf& u = s.ubo[0][i];
         if (!u.addr) continue;
         float f[16] = {};
-        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t) { return (uint64_t)0; }) != UINT64_MAX;
+        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t, uint64_t) { return (uint64_t)0; }, 0) != UINT64_MAX;
         if (!upd) host->gpu_read(u.addr, f, sizeof f);
         n += snprintf(line + n, sizeof line - n, " C%d%s %#llx+%#llx [", i + 3, upd ? "*" : "", (unsigned long long)u.addr,
                       (unsigned long long)u.size);
@@ -5752,7 +5787,7 @@ void log_dump_draw(const NvnState& s, const Program& p, const DrawArgs& d) {
         if (!u.addr) continue;
         float f[16] = {};
         // (as the draw reads it: guest memory with the stream's uniform updates over it; '*': updated)
-        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t) { return (uint64_t)0; }) != UINT64_MAX;
+        const bool upd = ub_overlay(u.addr, sizeof f, (uint8_t*)f, [](uint64_t, uint64_t) { return (uint64_t)0; }, 0) != UINT64_MAX;
         if (!upd) host->gpu_read(u.addr, f, sizeof f);
         n += snprintf(line + n, sizeof line - n, " c%d%s %#llx+%#llx [", i + 3, upd ? "*" : "", (unsigned long long)u.addr,
                       (unsigned long long)u.size);
@@ -6862,6 +6897,28 @@ int mask_radius_env() {
     static const int r = std::clamp(getenv("RX_VK_MASK_RADIUS") ? atoi(getenv("RX_VK_MASK_RADIUS")) : 0, 0, 4);
     return r;
 }
+struct MaskOld {
+    VkImage image;
+    VmaAllocation mem;
+    VkImageView view;
+    uint64_t frame;
+};
+std::vector<MaskOld> mask_old;
+void mask_retire(VkImage& image, VmaAllocation& mem, VkImageView& view, uint64_t frame) {
+    if (image || view) mask_old.push_back({image, mem, view, frame});
+    image = VK_NULL_HANDLE, mem = nullptr, view = VK_NULL_HANDLE;
+}
+void mask_reap(uint64_t frame) {
+    for (size_t i = 0; i < mask_old.size();) {
+        if (frame - mask_old[i].frame < 120) {
+            i++;
+            continue;
+        }
+        if (mask_old[i].view) vkDestroyImageView(dev.device, mask_old[i].view, nullptr);
+        if (mask_old[i].image) destroy_image(mask_old[i].image, mask_old[i].mem);
+        mask_old.erase(mask_old.begin() + (ptrdiff_t)i);
+    }
+}
 void mask_stabilize(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t layer, float weight) {
     if (!tex || !tex->image || tex->format != VK_FORMAT_R8G8B8A8_UNORM || !(tex->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return;
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return;
@@ -6897,6 +6954,17 @@ void mask_stabilize(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t 
     if (!pipe) return;
     const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
     static std::map<std::tuple<VkImage, uint32_t, uint32_t>, VkImageView> views;
+    static uint64_t views_gen = 0;
+    mask_reap(texture_frame_no());
+    if (views_gen != texture_destroy_generation()) {   // (a texture went: every view is given back, the ones still wanted made again)
+        for (auto& kv : views) {
+            VkImage none = VK_NULL_HANDLE;
+            VmaAllocation no_mem = nullptr;
+            mask_retire(none, no_mem, kv.second, texture_frame_no());
+        }
+        views.clear();
+        views_gen = texture_destroy_generation();
+    }
     VkImageView& mv = views[{tex->image, level, layer}];
     if (!mv) {
         VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -6909,7 +6977,9 @@ void mask_stabilize(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t 
     static VkImageView hist_view[2] = {};
     static uint32_t hist_w = 0, hist_h = 0, cur = 0;
     static uint64_t hist_frame = 0;
+    end_pass(cmd); // History image transitions must be outside dynamic rendering.
     if (hist_w != w || hist_h != h) {
+        for (int i = 0; i < 2; i++) mask_retire(hist[i], hist_mem[i], hist_view[i], texture_frame_no());   // (the old size's, given back later)
         for (int i = 0; i < 2; i++) {
             VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
             ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -6986,7 +7056,10 @@ static void skin_rejected(const NvnState& s, const Program& p, const DrawArgs& d
          d.mesh ? "mesh " : "", d.instances, s.nvattr, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], bones.size / 48);
 }
 
-static void temporal_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
+/// A skinned draw into the scene, described in `k` (its depth set; left empty otherwise); draw() gives it to actor motion
+/// only after hidden_depth_draw (a draw left out there has no motion to draw again)
+static void temporal_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at, SkinnedDraw& k) {
+    k = SkinnedDraw{};
     if (!temporal_wanted() && !(dlss_fg_runs() && opts.framegen >= 2)) return;
     if (d.mesh || !d.indexed || d.indirect || d.instances != 1) return skin_rejected(s, p, d, at, "draw kind");
     if (!at.n || !at.color[0] || !at.depth || !at.width || !at.height || !temporal_scene_size(at.width, at.height)) return;
@@ -6998,7 +7071,6 @@ static void temporal_skin_check(const NvnState& s, const Program& p, const DrawA
         return skin_rejected(s, p, d, at, "position format");
     const nvn_p_bind_buf& bones = s.ubo[0][3];
     if (!bones.addr || bones.size < 48 || bones.size % 48) return;
-    SkinnedDraw k;
     k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
     for (int set = 0; set < 2 && 6 + set < s.nvattr; set++) {
         const nvn_va_st w = attr(4 + set), j = attr(6 + set);
@@ -7036,7 +7108,101 @@ static void temporal_skin_check(const NvnState& s, const Program& p, const DrawA
     k.ibuf = d.ibuf, k.itype = d.itype, k.count = d.count, k.base_vertex = d.base_vertex;
     k.bones = bones.addr, k.bones_size = bones.size, k.object = s.ubo[0][1].addr, k.object_size = s.ubo[0][1].size;
     k.program = p.key;
-    temporal_note_skinned_draw(k);
+}
+
+// ---- the temporal upscalers' depth with a hidden character: a hidden mesh's depth draws are left out ----
+namespace {
+struct HiddenMeshes {
+    hidden_mesh::Tracker t;
+    bool said_first = false, said_out = false, said_query = false, said_gone = false;   // (the detailed lines, once a run)
+    uint64_t stretch_start = 0, stretch_last = 0, stretch_draws = 0, stretch_key = 0, stretch_program = 0;
+    uint64_t stretch_stencil = 0, stretch_back = 0;
+    uint32_t stretch_frames = 0, stretch_most = 0;
+    int stretches = 0;
+};
+constexpr int kHiddenStretches = 300;
+constexpr uint64_t kHiddenStretch = 600;
+std::mutex hidden_mu;
+std::atomic<bool> hidden_active{false};
+HiddenMeshes* hidden_meshes_one = nullptr;   // (made at the first skinned draw; guarded by hidden_mu)
+} // namespace
+
+static void hidden_meshes_log(HiddenMeshes& h, const hidden_mesh::Summary& s, int mode) {
+    if (!s.f) return;
+    const hidden_mesh::Frame& f = *s.f;
+    if (f.left_out) {
+        if (!h.stretch_draws) h.stretch_start = f.frame, h.stretch_key = f.out_key, h.stretch_program = f.out_program;
+        h.stretch_draws += f.left_out, h.stretch_frames++, h.stretch_last = f.frame;
+        h.stretch_most = std::max(h.stretch_most, f.left_out);
+        h.stretch_stencil += f.stencil, h.stretch_back += f.back;
+    }
+    if (h.stretch_draws && f.frame - h.stretch_start >= kHiddenStretch) {
+        if (h.stretches < kHiddenStretches)
+            logf("vk: upscaler: faded: frames %llu to %llu: %llu depth draws of hidden meshes left out, in %u frames, %u in a "
+                 "frame at most, %llu of them with a stencil test; %llu times a mesh's colour came back in a frame with them "
+                 "left out; the first of vertex buffer %llx, program %016llx%s",
+                 (unsigned long long)h.stretch_start, (unsigned long long)h.stretch_last, (unsigned long long)h.stretch_draws,
+                 h.stretch_frames, h.stretch_most, (unsigned long long)h.stretch_stencil, (unsigned long long)h.stretch_back,
+                 (unsigned long long)h.stretch_key, (unsigned long long)h.stretch_program,
+                 ++h.stretches == kHiddenStretches ? " (the last of these lines for this run)" : "");
+        h.stretch_draws = 0, h.stretch_frames = 0, h.stretch_most = 0, h.stretch_stencil = 0, h.stretch_back = 0;
+    }
+    if (!(mode & 2)) return;
+    const bool first = !h.said_first && (s.meshes || s.colour_only), first_out = !h.said_out && f.left_out;
+    if (first || first_out) {
+        h.said_first = true, h.said_out |= f.left_out != 0;
+        logf("vk: upscaler: faded: frame %llu: %u meshes with %u depth draws into the scene; %u of them got colour in the frame "
+             "(%u colour draws on the scene's depth target, %u on others), %u got none, %u of those hidden in the next frame; "
+             "%u more meshes had colour and no depth draw; %u depth draws left out, %u drawn for a query; %u draws of more "
+             "meshes than the table holds; one %s: vertex buffer %llx, program %016llx",
+             (unsigned long long)f.frame, s.meshes, f.depth_draws, s.coloured, f.scene_colour, f.other_colour, s.bare, s.hidden,
+             s.colour_only, f.left_out, f.kept_query, f.over, s.hidden ? "hidden" : "without colour",
+             (unsigned long long)(s.one ? s.one->key : 0), (unsigned long long)(s.one ? s.one->program : 0));
+    }
+    if ((mode & 1) && s.inherited && !f.left_out) {
+        if (f.kept_query && !h.said_query) {
+            h.said_query = true;
+            logf("vk: upscaler: faded: frame %llu: %u meshes were hidden, and no depth draw of theirs was left out: %u were "
+                 "drawn because the game asks about them with an occlusion query",
+                 (unsigned long long)f.frame, s.inherited, f.kept_query);
+        } else if (!f.kept_query && !h.said_gone) {
+            h.said_gone = true;
+            logf("vk: upscaler: faded: frame %llu: %u meshes were hidden, and no depth draw of theirs was left out: none of "
+                 "them had a depth draw into the scene in it", (unsigned long long)f.frame, s.inherited);
+        }
+    }
+}
+
+static bool hidden_depth_draw(const Program& p, const NvnState& s, const DrawArgs& d, const Targets& at, bool skinned) {
+    static const int mode = temporal_hidden_mesh_mode();   // (bit 0: leave out; bit 1: the detailed lines; 0: nothing runs)
+    if (!mode) return false;
+    if (!skinned && !hidden_active.load(std::memory_order_relaxed)) return false;
+    hidden_mesh::Draw x;
+    bool reads_stream0 = false;
+    for (int i = 0; i < s.nvattr && i < 16 && !reads_stream0; i++) {
+        const nvn_va_st a = *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]);
+        reads_stream0 = a.fmt && a.stream == 0;
+    }
+    x.key = !d.mesh && reads_stream0 ? s.vbuf[0].address : 0;
+    if (!x.key) return false;
+    x.program = p.key;
+    x.target = (uint64_t)(uintptr_t)at.depth;
+    x.skinned = skinned;
+    for (int i = 0; i < at.n && !x.colour; i++) x.colour = target_write_mask(p, s, i) != 0;
+    x.depth_write = at.depth && s.ds.dw;
+    x.stencil = at.depth && has_stencil(at.depth_format) && s.ds.st;
+    x.query = d.occ_pool != VK_NULL_HANDLE;
+    std::lock_guard lk(hidden_mu);
+    if (!skinned && (!hidden_meshes_one || !hidden_meshes_one->t.active())) return false;
+    if (!hidden_meshes_one) hidden_meshes_one = new HiddenMeshes();   // (kept for the run)
+    HiddenMeshes& h = *hidden_meshes_one;
+    const uint64_t frame = texture_frame_no();
+    if (h.t.now.frame != frame) hidden_meshes_log(h, h.t.begin(frame), mode);
+    const bool skip = h.t.draw(x, (mode & 1) != 0, [](uint64_t target) {
+        return temporal_scene_depth_is(reinterpret_cast<const Texture*>((uintptr_t)target));
+    });
+    hidden_active.store(h.t.active(), std::memory_order_relaxed);
+    return skip;
 }
 
 static bool writes_memory(const Program& p) {
@@ -7227,7 +7393,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     cur_program = &p;
     sheikah_sensor(p);   // (MasterSword Sheikah Sensor: what play really draws, vk_mempack.cpp)
     const int64_t fine_skin_t0 = g_fine ? prof_now() : 0;
-    temporal_skin_check(s, p, d, at);
+    SkinnedDraw skinned;
+    temporal_skin_check(s, p, d, at, skinned);
+    // A hidden mesh's depth draw is left out here: before actor motion takes it and before its descriptors
+    if (hidden_depth_draw(p, s, d, at, skinned.depth != nullptr)) SKIP_HERE();
+    if (skinned.depth) temporal_note_skinned_draw(skinned);
     // (after OoT's tree-shadow pass has drawn its mask: the mask evened out over frames, at this draw's end: mask_stabilize)
     struct MaskGuard {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -7904,7 +8074,9 @@ static bool movie_keep_all_networks() {
 static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageView output_view,
                           Texture* out, uint32_t level, uint64_t key, const char* keys, bool temporal);
 
+thread_local Texture* stub_picture = nullptr;   // (upscale_stub's output, when it is the scene's format: framegen_hud_before)
 bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
+    stub_picture = nullptr;
     static const bool off = getenv("RX_VK_NO_UPSCALE_STUB") != nullptr;
     if (off) return false;
     nvn_tex out{}, in{};
@@ -7947,6 +8119,7 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     if (!src || !dst || !src->image || !dst->image || (src->aspect | dst->aspect) != VK_IMAGE_ASPECT_COLOR_BIT || src->bc ||
         dst->bc || src->samples != VK_SAMPLE_COUNT_1_BIT || dst->samples != VK_SAMPLE_COUNT_1_BIT)
         return false;
+    if (src->format == dst->format) stub_picture = dst;
     // Cooperative-matrix networks left out without coopmat: offer temporal upscaler first.
     if ((temporal_wanted() || temporal_off()) && temporal_rejected_network(cmd, key, src, &in, dst, &out)) return true;
     VkFormatProperties fs{}, fd{};
@@ -8249,6 +8422,34 @@ bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p)
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
     vertex_set.on = false, last_ib.on = false;
     return done;
+}
+
+/// The picture a gameplay upscale writes (its output, found as temporal_stand_in finds it), for FSR 3.1 FG's HUD mark
+/// (copied once the upscale wrote it, whichever drew it). Null unless FSR 3.1 FG is asked for, or for any other dispatch
+static Texture* upscale_picture(const NvnState& s, const Program& p, uint32_t* level) {
+    if (p.stages.empty() || !fsr3fi::frames_wanted()) return nullptr;
+    const Stage& st = p.stages[0];
+    const bool known = gameplay_network(p.key);
+    if (!known && !(st.info.uses_cooperative_matrix && st.info.texture_descriptors.size() == 1 &&
+                    st.info.image_descriptors.size() == 1))
+        return nullptr;
+    if (st.info.texture_descriptors.empty() || st.info.image_descriptors.empty()) return nullptr;
+    Texture* in = nullptr;
+    const uint32_t in_handle = handle_of(s, st, st.info.texture_descriptors[0], 0);
+    if (in_handle) texture_view_of(in_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &in);
+    const auto& od = st.info.image_descriptors[0];
+    Texture* out = nullptr;
+    const uint32_t out_handle = handle_of(s, st, od, 0);
+    if (out_handle) texture_view_of(out_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, level);
+    if (!in || !out) return nullptr;
+    const bool in_ok = in->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || in->format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ||
+                       in->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    const bool out_ok = out->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || out->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!in_ok || !out_ok) return nullptr;
+    // At 100% render resolution the known gameplay pass writes the picture at the scene's own size.
+    const uint32_t width = out->width >> *level;
+    if (width <= in->width && !(known && width == in->width && (out->height >> *level) == in->height)) return nullptr;
+    return out;
 }
 
 bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
@@ -8816,7 +9017,10 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                                   cp->stages[0].info.uses_cooperative_matrix, gameplay_network(cp->key)) ||
                                (force_stub && cp->stages[0].info.uses_cooperative_matrix &&
                                 (force_stub >= 2 || !gameplay_network(cp->key))));
-    if ((!cp || cp->failed || slow_network) && upscale_stub(cmd, s, compute_code_key(s))) return void(st_dispatches++);
+    if ((!cp || cp->failed || slow_network) && upscale_stub(cmd, s, compute_code_key(s))) {
+        if (stub_picture && fsr3fi::frames_wanted()) framegen_hud_before(cmd, stub_picture, 0);
+        return void(st_dispatches++);
+    }
     if (slow_network) SKIP_HERE();   // (an earlier pass of the network: the stub is its last pass)
     if (!cp || !cp->ready.load(std::memory_order_acquire) || cp->failed) SKIP_HERE();
     {   // (hookshot, RX_VK_SKIP_PROG=<key prefix,...>: those programs' dispatches left out, for diagnosis)
@@ -8837,15 +9041,17 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     {   // (hookshot, RX_VK_LOG_PUSH=<key prefix>: once, that program's push constants and the c0 words it reads)
         static const char* want = getenv("RX_VK_LOG_PUSH");
         static bool done;
-        char hex[24];
-        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)cp->key);
-        if (want && !done && !strncmp(hex, want, strlen(want))) {
-            done = true;
-            char line[1600];
-            int n = snprintf(line, sizeof line, "vk: program %s: %u bytes pushed; c0:", hex, s.cs_push_n);
-            for (uint32_t off = 0; off < 0x100 && n < (int)sizeof line - 16; off += 4)
-                n += snprintf(line + n, sizeof line - n, " %08x", driver_bank_word(s, 0, 5, off));
-            logf("%s", line);
+        if (want && !done) {
+            char hex[24];
+            snprintf(hex, sizeof hex, "%016llx", (unsigned long long)cp->key);
+            if (!strncmp(hex, want, strlen(want))) {
+                done = true;
+                char line[1600];
+                int n = snprintf(line, sizeof line, "vk: program %s: %u bytes pushed; c0:", hex, s.cs_push_n);
+                for (uint32_t off = 0; off < 0x100 && n < (int)sizeof line - 16; off += 4)
+                    n += snprintf(line + n, sizeof line - n, " %08x", driver_bank_word(s, 0, 5, off));
+                logf("%s", line);
+            }
         }
     }
     Program& p = const_cast<Program&>(*cp);
@@ -9071,6 +9277,15 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
     }
     work_since_barrier = true;
+    {   // (RX_VK_METER_ZERO) clear the exposure meter's 16-byte sums in the mirror right before each dispatch so
+        // late CPU zeroes or write-backs cannot double brightness.
+        static const bool meter_zero = fast_sync_part("RX_VK_METER_ZERO");
+        if (meter_zero && (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) && meter_out.buffer && meter_out.size >= 16 &&
+            !(meter_out.offset & 3)) {
+            vkCmdFillBuffer(cmd, meter_out.buffer, meter_out.offset, 16, 0);
+            full_barrier(cmd);
+        }
+    }
     if ((p.key == kSkySumsProgram || p.key == kSkyRgblProgram) && sky_sums.buffer && !p.stages.empty()) {
         // (MasterSword) OoT's sky light accumulators: reset right before each dispatch so stale synced pages cannot double ambient light
         static const bool off = getenv("RX_VK_NO_SKY_ZERO") != nullptr;
@@ -9099,9 +9314,12 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             logf("%s", line);
         }
     }
-    if (fsr3_stand_in(cmd, s, p)) return void(st_dispatches++);
-    if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
-    if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
+    // (a gameplay upscale's picture, copied for FSR 3.1 FG's HUD mark once written, whoever writes it)
+    uint32_t picture_level = 0;
+    Texture* const picture = upscale_picture(s, p, &picture_level);
+    if (fsr3_stand_in(cmd, s, p)) return framegen_hud_before(cmd, picture, picture_level), void(st_dispatches++);
+    if (temporal_stand_in(cmd, s, p)) return framegen_hud_before(cmd, picture, picture_level), void(st_dispatches++);
+    if (taau_stand_in(cmd, s, p)) return framegen_hud_before(cmd, picture, picture_level), void(st_dispatches++);
     if (!p.dispatched.exchange(true, std::memory_order_relaxed)) compute_note(p.key);
     const VkPipeline pipe = cpipe();
     if (!pipe) SKIP_HERE();
@@ -9182,6 +9400,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
         last_cs_cmd = cmd, last_cs_epoch = work_epoch.load(std::memory_order_relaxed);
     }
+    framegen_hud_before(cmd, picture, picture_level);   // (the game's own network drew the gameplay upscale)
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
     if (gprof_on()) {
         char label[96];

@@ -19,7 +19,45 @@
    fps); 4 steps a 60 fps frame would be 0 above 240. A moving platform (the stone one under the spikes in the Deku Tree)
    then slides out from under Link (issue 1798). While the step is under 1 the count is rounded up instead, so a solver step
    never covers more time than at 60 fps, give or take 10% (the frame time's jitter, so a steady rate keeps a steady count),
-   and it is at least 1 and never under the game's. A step of 1 or more (a frame slower than 60 fps) keeps the game's count. */
+   and it is at least 1 and never under the game's. A step of 1 or more (a frame slower than 60 fps) keeps the game's count.
+
+   A horse's jump (f_82c59eb0, the horse's jump state machine, s10 its step): while a horse gets ready to jump an obstacle (its
+   JumpReady animation), the state machine sets each frame the blend frames of the move into that animation (an animation
+   variable, here 16), so the blend ends at takeoff. With a step under 1 it takes another branch: last frame's blend frames plus
+   the step (a step under 1 is slow motion at 60 fps). Above 60 fps every step is under 1, so the blend frames grew by the step
+   each frame (25 at 60 fps, 100 to 1500 above), the blend into the jump hardly started, and Epona galloped through the fence
+   while her body went over it (more often the higher the frame rate; around 60 to 90 fps, only when no frame's step reached
+   1). The step is compared with this frame's own step instead (the game's time object, +0x10: 1 at 60 fps): a step that is
+   the whole frame's is not slow motion, and a step under it still takes the game's branch. At a cap of 60, and on a frame
+   slower than 60 fps, the game's own test decides.
+
+   A moving floor's carry (f_80159dc0, f_8015d490 and f_838baa40, three characters' update modules): a character standing on a
+   moving floor is carried by the floor's velocity, but each module first tests the physics time object's 1/dt (+0x28) and,
+   above 100 (a frame under 10 ms: at 60 fps, time slowed below 0.6 of real time), carries the character by a tenth of it.
+   Above 100 fps every frame is under 10 ms: on the Shadow Temple's barge Link and the enemies kept a tenth of its velocity and
+   slid to its back. Above a cap of 60, on a frame shorter than a 60 fps one, 1/dt times the frame's step (the game's time
+   object, +0x10: 0.5 at 120 fps) is tested instead: the game's test as it would be at 60 fps, so time slowed below 0.6 still
+   takes the tenth. At a cap of 60, and on a frame of a 60 fps one or longer, the game's own test decides.
+
+   Below 60 fps, the game's Havok cloth (Link's cap, the .bphcl files in romfs Phive/Cloth): the simulate operator's per-frame
+   setup (f_81b3aa48, the instance's frame-time mode: its fixed 1/60 mode, f_81b3a964, is left as it is) takes the frame's time
+   from its step context (+8) and splits it into the context's count (+24) x the config's subSteps x the operator's own count of
+   substeps. That time is a 60th of a second whatever the frame, so below 60 fps the cloth ran at fps / 60 of real time while Link
+   moved at the game's. While the game's frame step (the float f_83b6ea90 writes, 60 / its frame rate) is over 1, the context's
+   time is multiplied by it (oot_cloth_seconds): the cloth keeps the clock with the same number of solves, each substep that much
+   longer. Above 60 fps (a step under 1) that path keeps the game's 1/60 unless HOS_FPS_CLOTH_60=1 is enabled below.
+
+   Above 60 fps, with HOS_FPS_CLOTH_60=1 (off by default for now), the cloth is solved at most 60 times a second. Its solve runs
+   as a job on the game's job workers (f_81b47080, under the job runner f_8016b620), once a frame for each cloth near the camera.
+   On a frame whose step is under 1, the job solves only when the game clock (the double f_80706be0 adds each frame's step to,
+   in 60ths: hos_step_probe + 0xd58) has crossed a whole 60th since the frame before (oot_cloth_gate); otherwise it returns at once
+   with its own result, 0, before it saves anything, and the cloth keeps its last pose. Every job that sees one clock value makes
+   the same choice, so the cloth of one frame solves or holds together. A clock that went back (a load) solves and starts again.
+
+   A song's playback after the ocarina (f_832b2af0, the song just played; f_832b2dc0, the ocarina's other melody playback): each
+   update while the melody plays it asks f_832b7b50 whether the note flag is set, a word that the sound engine writes in the
+   sound job's phase 0 (set on the run where the melody reaches a note, else clear). Above 60 fps the job runs at 60 Hz, so a set
+   flag read again before the job has run again is the same note: the playback reads 0. At a cap of 60 the game's value stands. */
 #pragma once
 #include <math.h>
 #include <stdint.h>
@@ -83,4 +121,67 @@ static inline int32_t oot_solver_steps(int32_t game, uint32_t scaled_bits, uint3
     int32_t steps = (int32_t)ceilf(scaled - 0.1f);
     if (steps < 1) steps = 1;
     return steps > game ? steps : game;
+}
+
+/* A horse's jump: 1 when f_82c59eb0's step (step_bits) is under 1 only because the frame is short, so its branch for steps
+   under 1 (slow motion) is skipped; 0 when the game's own test (step < 1) decides. frame_step_bits: this frame's step from the
+   game's time object (0 when it has none). The step is the frame's own when within 0.1% of it */
+static inline int oot_horse_whole_step(uint32_t step_bits, uint32_t frame_step_bits, int timed) {
+    const float step = oot_bits_float(step_bits), frame = oot_bits_float(frame_step_bits);
+    if (!timed || !(frame > 0.0f) || !(frame < 1.0f) || !(step > 0.0f)) return 0;
+    return step >= frame * 0.999f;
+}
+
+/* A moving floor's carry: 1 when the modules' slow-time test stands (asked once the game's, 1/dt over 100, held), 0 when the
+   frame is short and not slow, so the floor's velocity carries in full. inv_dt_bits: the physics time object's 1/dt;
+   frame_step_bits: this frame's step from the game's time object (0 when it has none). On a frame of a 60 fps one or longer
+   (a step of 1 or more) 1/dt times the step is at least 1/dt: the game's verdict */
+static inline int oot_floor_carry_slow(uint32_t inv_dt_bits, uint32_t frame_step_bits, int timed) {
+    const float inv_dt = oot_bits_float(inv_dt_bits), step = oot_bits_float(frame_step_bits);
+    if (!timed || !(step > 0.0f)) return 1;   /* (the game's own test decides) */
+    return inv_dt * step > 100.0f;
+}
+
+/* The cloth's time: seconds_bits (the step context's time, a float), step_bits (the game's frame step, a float), on (HOS_FPS_CLOTH:
+   0 the game's). A step of 1 or less (60 fps and above), or not a number, 0, below 0 or over 8, keeps the game's */
+static inline uint32_t oot_cloth_seconds(uint32_t seconds_bits, uint32_t step_bits, int on) {
+    const float step = oot_bits_float(step_bits);
+    if (!on || !(step > 1.0f && step <= 8.0f)) return seconds_bits;   /* (the host's longest step is 4) */
+    return oot_float_bits(oot_bits_float(seconds_bits) * step);
+}
+
+typedef struct {
+    double clock;   /* (the game clock of the last frame seen, in 60ths) */
+    int solve;      /* (that frame's choice, for its other jobs) */
+    int have;       /* (0: no frame seen since the gate last stood aside) */
+} OotClothGate;
+#define OOT_CLOTH_GATE_INIT {0.0, 1, 0}
+
+/* 1: solve the cloth now, 0: hold it this frame. clock (the game clock, 60ths), step (the game's frame step), on
+   (HOS_FPS_CLOTH_60), timed (a cap above 60: the frame's own time given) */
+static inline int oot_cloth_gate(OotClothGate *g, double clock, float step, int on, int timed) {
+    if (!on || !timed || !(step > 0.0f && step < 1.0f) || !(clock == clock)) {   /* (as the game has it: every frame) */
+        g->have = 0;
+        return 1;
+    }
+    if (g->have && clock == g->clock) return g->solve;   /* (another job of the same frame) */
+    const int solve = !g->have || clock < g->clock || floor(clock) != floor(g->clock);
+    g->clock = clock;
+    g->solve = solve;
+    g->have = 1;
+    return solve;
+}
+
+typedef struct {
+    int set;          /* (the flag at the playback's last read) */
+    long long runs;   /* (the sound job's runs then) */
+} OotSongCue;
+
+/* The note flag a song's playback reads: set, the game's (1 set, 0 clear); runs, the sound job's runs so far. 1 when the
+   playback goes on a note */
+static inline int oot_song_cue(OotSongCue *s, int set, long long runs, int timed) {
+    const int again = timed && set && s->set && runs == s->runs;   /* (read before the job ran again: the same note) */
+    s->set = set;
+    s->runs = runs;
+    return set && !again;
 }

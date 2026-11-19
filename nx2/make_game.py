@@ -790,8 +790,10 @@ def lift_key(exefs, work, env):
     again); one it reads must be"""
     import kit  # noqa: F401  (a64-kit on the path, for standalone)
     import standalone
+    import entry_hooks
     h = hashlib.sha1(sys.version.encode())
     h.update(" ".join(sorted(standalone.implemented())).encode())
+    h.update((" entry hooks: " + " ".join(entry_hooks.hooked_symbols())).encode())   # (spliced in the lift: nx2/entry_hooks.py)
     # (each file named from its own base: the exefs and the work folder may be on another drive than the source, which relpath refuses)
     files = [(exefs, os.path.join(exefs, f)) for f in sorted(os.listdir(exefs))]
     for top in (HERE, os.path.join(ROOT, "third_party", "a64-kit")):

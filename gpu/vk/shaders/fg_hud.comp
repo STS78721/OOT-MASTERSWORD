@@ -1,0 +1,19 @@
+#version 450
+// Frame generation (vk_framegen.cpp hud_source): AMD FSR 3.1's interpolation source, the game's frame with its HUD marked
+// in the alpha. The game draws its HUD into the same picture as the scene, after its gameplay upscale; the renderer keeps
+// a copy of that picture from just after the upscale (framegen_hud_before), so whatever differs from it in the picture as
+// presented (the hearts, the minimap, the button prompts, their see-through parts and soft edges) is the HUD: alpha 0
+// there, 1 elsewhere. The patched interpolation (scripts/fsr3_shaders.py FI_PATCHES) keeps those pixels where they are.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D frame;    // the game's frame as fg_copy cropped it (RGBA8)
+layout(binding = 1) uniform sampler2D before;   // the picture as the upscale left it, before the HUD
+layout(binding = 2) uniform sampler2D after;    // the picture as presented, the HUD on it
+layout(binding = 3, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 offset; ivec2 size; } pc;   // (the crop's corner in the picture, and its size)
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    const ivec2 q = g + pc.offset;
+    const bool hud = any(notEqual(texelFetch(before, q, 0).rgb, texelFetch(after, q, 0).rgb));
+    imageStore(dst, g, vec4(texelFetch(frame, g, 0).rgb, hud ? 0.0 : 1.0));
+}

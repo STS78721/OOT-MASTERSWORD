@@ -34,6 +34,9 @@ struct Inputs {
     VkImageView color = VK_NULL_HANDLE;
     VkImage color_image = VK_NULL_HANDLE;
     VkFormat color_format = VK_FORMAT_UNDEFINED;
+    /// The colour's alpha marks the HUD, 0 where the game drew it over its picture after the upscale
+    /// (vk_framegen.cpp hud_source): the interpolation keeps those pixels where they are. False: guess from both frames
+    bool hud_mask = false;
     uint32_t width = 0, height = 0;
 
     VkImageView depth = VK_NULL_HANDLE;

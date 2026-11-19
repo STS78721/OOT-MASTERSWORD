@@ -27,7 +27,12 @@
    with its arguments in c; return 1 when it handled the call (the function then returns at once, x0 is the result),
    0 to run the function as usual. build.py splices the call into the lifted code (only that file recompiles). */
 #define ENTRY_HOOK(addr) int entry_##addr(Ctx *c)
+/* ENTRY_HOOK_SYM(sym) { ... }: the same at the entry of the SDK's definition of the symbol (found in the image's symbol table),
+   spliced in by the standalone lift (nx2/entry_hooks.py; a new one lifts again) */
 #define ENTRY_HOOK_SYM(sym) int entry_sym_##sym(Ctx *c)
+/* ENTRY_HOOK_SYM_FROM(sym, min) { ... }: the same, called only when x2 (the size argument) is min or more: the spliced line
+   tests it, so smaller calls stay in the lifted code without a call (the hook declines them too) */
+#define ENTRY_HOOK_SYM_FROM(sym, min) int entry_sym_##sym(Ctx *c)
 /* SPLICE_AFTER(0x0xxxxxxx, "text") { ... }: runs inside the lifted guest function at that address, right after the
    first line of its lifted C that contains the text (a game patch in the middle of a function: c holds the guest
    registers there). build.py splices the call in and stops the build if the text is not found. One per function. */

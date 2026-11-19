@@ -9,6 +9,7 @@
 #include <vk_mem_alloc.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <functional>
@@ -30,10 +31,32 @@ namespace mkwvk {
 
 VmaAllocator vma;
 
+// VMA gives an emptied block back to the driver with vkFreeMemory on the thread that emptied it, and the image pool's
+// defragmentation empties them on the render thread: queue the call on the reaper thread below (which already makes
+// the images' driver calls in FIFO order, so images destroyed before it are gone before the block is).
+// RX_VK_FREE_LATER=0: free on the caller's thread.
+void reap(std::function<void()> fn);
+thread_local bool on_reaper = false;
+VKAPI_ATTR void VKAPI_CALL free_memory_later(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb) {
+    static const bool later = !getenv("RX_VK_FREE_LATER") || atoi(getenv("RX_VK_FREE_LATER")) != 0;
+    const bool queued = later && !on_reaper;
+    const auto free_now = [device, memory, cb, queued] {
+        const auto t0 = std::chrono::steady_clock::now();
+        vkFreeMemory(device, memory, cb);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static std::atomic<int> logged{0};
+        if ((ms > 20.0 || logged.load() < 4) && logged++ < 24)
+            logf("vk: a memory block given back to the driver in %.2f ms%s", ms, queued ? ", off the thread that emptied it" : "");
+    };
+    if (!queued) return free_now();
+    reap(free_now);
+}
+
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
     f.vkGetInstanceProcAddr = gipa;
     f.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    f.vkFreeMemory = free_memory_later;   // (the others are fetched: VMA keeps the pointers it is given)
     VmaAllocatorCreateInfo ci{};
     ci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
                (dev.memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);
@@ -299,6 +322,7 @@ bool reap_on() {
         const char* e = getenv("RX_VK_REAP");
         if (e && atoi(e) == 0) return false;
         std::thread([] {
+            on_reaper = true;
 #ifdef _WIN32
             SetThreadDescription(GetCurrentThread(), L"mkw_vk reaper");
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);

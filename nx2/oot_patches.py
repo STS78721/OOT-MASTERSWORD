@@ -16,9 +16,16 @@ Each is a runtime switch where it can be, so the game's own path stays reachable
   before any recompute. So the fixed path kept the dynamic path's last scale (0.75 docked: 1536x864 at every setting). Flag 1 now
   also asks for the recompute, and on the fixed path the flags +0xe20 bits 3/4 (a hardcoded 0.75 / 0.5 in place of the scale)
   are not looked at.
+- Texture heap compaction throttling (host/oot_tex_compact.h): the manager's per-frame step (f_80797240) asks the
+  Compaction thread for a round whenever none runs; hos_oot_tex_compact_due throttles requests (HOS_TEX_COMPACT_MS: 1000 ms
+  by default, 0 for every frame).
+- Job-queue barrier waits (host/oot_barrier.h): three parallel-for jobs (f_800998a0, f_800738e0, f_8007e200) wait until a
+  polled mask word changes via hos_oot_barrier_wait / hos_oot_barrier_wake instead of sleeping 20 us per iteration
+  (HOS_OOT_BARRIER_WAIT=0 restores the game sleeps).
 """
 import glob
 import os
+import re
 import sys
 import whole_write   # (rewrites written beside and moved over: issue 1197)
 
@@ -218,6 +225,7 @@ WHOLE_SITES = (
      "    c->x[12]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@",
      "c->x[19] + 864"),
     ("void f_800672e0(Ctx *__restrict A64_NOESC c) {@",
+     "    c->x[8]=recomp_load32(c,c->x[19] + 76);@"
      "    c->x[9]=recomp_fp_to_int(c->vreg[0][0]&UINT64_C(0xffffffff),32,32,1,3,c->fpcr,&c->fpsr);@",
      "c->x[21]"),
     # (the cut with the store after it: the function cuts into x8 the same way once more, in the branch that sets
@@ -246,35 +254,55 @@ WHOLE_SITES = (
 WHOLE_SITES = tuple((h.replace("@", "\n"), o.replace("@", "\n"), k) for h, o, k in WHOLE_SITES)
 WHOLE_MARK = "/* (the step's whole frames: nx2/oot_patches.py) */"
 WHOLE_DECL = "extern uint32_t hos_frame_whole(uint64_t at, uint64_t amount_bits);\n"
+WHOLE_TIMES_DECL = "extern uint32_t hos_frame_whole_times(uint64_t at, uint32_t amount_bits, uint32_t times);\n"
+WHOLE_TIMES = {"void f_800672e0(Ctx *__restrict A64_NOESC c) {\n": "c->x[8]"}   # (the water's substeps)
 
 
-def whole_new(old, key):
-    """old with its cut to whole frames (the one recomp_fp_to_int) made hos_frame_whole's for the counter at key"""
+def whole_new(old, key, times=None):
+    """old with its cut to whole frames (the one recomp_fp_to_int) made hos_frame_whole's for the counter at key; with times
+    (the register of the substeps it multiplies by), hos_frame_whole_times's whole substeps, and the register 1"""
     lines = old.split("\n")
     for i, line in enumerate(lines):
         if "recomp_fp_to_int(c->vreg[0][0]" in line:
             reg = line.split("=", 1)[0]
-            lines[i] = "%s=hos_frame_whole(%s, (uint32_t)c->vreg[0][0]);   %s" % (reg, key, WHOLE_MARK)
+            if times:
+                lines[i] = "%s=hos_frame_whole_times(%s, (uint32_t)c->vreg[0][0], (uint32_t)%s); %s=1;   %s" % (
+                    reg, key, times.strip(), times.strip(), WHOLE_MARK)
+            else:
+                lines[i] = "%s=hos_frame_whole(%s, (uint32_t)c->vreg[0][0]);   %s" % (reg, key, WHOLE_MARK)
     return "\n".join(lines)
 
 
 def patch_whole_frames(s):
-    """The counters of WHOLE_SITES take hos_frame_whole's whole frames: (s, the sites patched here)."""
+    """The counters of WHOLE_SITES take hos_frame_whole's whole frames: (s, the sites patched here). A site of WHOLE_TIMES that an
+    earlier build patched with the whole frames alone takes the substeps now."""
     done = 0
+    times_done = 0
     for head_text, old, key in WHOLE_SITES:
         head = s.find(head_text)
         if head < 0:
             continue
         end = s.find("\n}\n", head)
         body = s[head:end if end >= 0 else len(s)]
-        new = whole_new(old, key)
-        if new in body or body.count(old) != 1:
+        times = WHOLE_TIMES.get(head_text)
+        new = whole_new(old, key, times)
+        if new in body:
             continue
-        at = head + body.index(old)
-        s = s[:at] + new + s[at + len(old):]
+        earlier = whole_new(old, key) if times else None
+        if body.count(old) == 1:
+            replaced = old
+        elif earlier and body.count(earlier) == 1:
+            replaced = earlier
+        else:
+            continue
+        at = head + body.index(replaced)
+        s = s[:at] + new + s[at + len(replaced):]
         done += 1
+        times_done += bool(times)
     if done and WHOLE_DECL not in s:
         s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + WHOLE_DECL, 1)
+    if times_done and WHOLE_TIMES_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + WHOLE_TIMES_DECL, 1)
     return s, done
 
 
@@ -354,6 +382,394 @@ def patch_solver_steps(s):
     if done and SOLVER_DECL not in s:
         s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SOLVER_DECL, 1)
     return s, done
+
+
+# The texture data heap's compaction, asked for once in a while (host/oot_tex_compact.h has why). f_80797240 is the texture data
+# manager's per-frame step: with no round asked for (+776) and its flag bit 1 set (+960, set once at its setup) it asks for one
+# (+776 = 1), and with one asked for it sends the Compaction thread its message. The second test also asks the host.
+TEXC_HEAD = "void f_80797240(Ctx *__restrict A64_NOESC c) {\n"
+TEXC_OLD = ("    c->x[8]=recomp_load8(c,c->x[19] + 960);\n"
+            "if (!((c->x[8] >> 1) & 1)) { goto L_80797288; }\n")
+TEXC_NEW = ("    c->x[8]=recomp_load8(c,c->x[19] + 960);\n"
+            "if (!((c->x[8] >> 1) & 1) || !hos_oot_tex_compact_due()) { goto L_80797288; }"
+            "   /* (nx2/oot_patches.py: the texture heap's compaction once in a while) */\n")
+TEXC_DECL = "extern int hos_oot_tex_compact_due(void);\n"
+
+
+def patch_tex_compact(s):
+    """The texture data manager's request for a compaction round through the host: (s, 1) when its step is in s with it (made
+    now or before), (s, 0) when it is not here or its code differs (another game version: left as it is)"""
+    at = _function(s, TEXC_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if body.count(TEXC_NEW) == 1:
+        return s, 1
+    if body.count(TEXC_OLD) != 1:
+        return s, 0
+    s = s[:head] + body.replace(TEXC_OLD, TEXC_NEW, 1) + s[end:]
+    if TEXC_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEXC_DECL, 1)
+    return s, 1
+
+
+# The game's job barriers waiting for their masks instead of sleeping 20 us (host/oot_barrier.h has the protocol and why;
+# HOS_OOT_BARRIER_WAIT, on by default).
+def _barrier_or(base, off, addr, value, between=""):
+    """(the lifted OR into P+off, its address made from register base into register addr; the same with the wake after it)"""
+    head = "    { uint64_t _a=c->x[%d], _b=%dULL; uint64_t _r=_a+_b; c->x[%d]=_r; }\n%s" % (base, off, addr, between)
+    rmw = ("{ uint64_t _a = c->x[%d]; uint32_t *_p = (uint32_t *)A64_PTR(_a); uint32_t _o = __atomic_fetch_or(_p, (uint32_t)c->x[%d], "
+           "__ATOMIC_SEQ_CST); A64_MARK(_a, 4); c->x[8] = (uint64_t)_o;" % (addr, value))
+    return (head + rmw + " }\n",
+            head + rmw + " if (hos_oot_barrier_on()) hos_oot_barrier_wake(_a - %dULL); }   /* (nx2/oot_patches.py: "
+                         "HOS_OOT_BARRIER_WAIT) */\n" % off)
+
+
+def _barrier_sleep(lr, then, wait):
+    """(the sleep at its return address and the lines after it; the same with the wait in front of it)"""
+    return ("c->x[30] = 0x%xULL; f_85106220(c);\n%s" % (lr, then),
+            "c->x[30] = 0x%xULL; if (!hos_oot_barrier_on() || !hos_oot_barrier_wait(%s)) f_85106220(c);"
+            "   /* (nx2/oot_patches.py: HOS_OOT_BARRIER_WAIT) */\n%s" % (lr, wait, then))
+
+
+BARRIER_SITES = (   # (the function's head, the marks its code must have, its places: (lifted text, the text in its place))
+    ("void f_800998a0(Ctx *__restrict A64_NOESC c) {\n",
+     ("    c->x[8]=recomp_load32(c,c->x[24] + 500);\n    recomp_barrier();\n"
+      "    { uint64_t _b=c->x[29]; int64_t _o=-100; c->x[22]=recomp_load32(c,(_b+_o)); }\n",
+      "L_8009a6f0:;\n    c->x[8]=recomp_load32(c,c->x[24] + 508);\n",
+      "L_8009a768:;\n    c->x[25]=recomp_load32(c,c->x[24] + 512);\n", "recomp_store32_sp(c,c->x[31] + 104,c->x[25]);",
+      "c->x[25]=recomp_load32(c,c->x[31] + 104);",
+      "L_8009aa1c:;\n    c->x[19]=recomp_load32(c,c->x[24] + 520);\n", "recomp_store32_sp(c,c->x[31] + 72,c->x[19]);",
+      "c->x[19]=recomp_load32(c,c->x[31] + 72);",
+      "c->x[30] = 0x8009afa4ULL; f_85106210(c);\n    { uint64_t _b=c->x[29]; int64_t _o=-100; c->x[8]=recomp_load32(c,(_b+_o)); }\n"),
+     (_barrier_sleep(0x8009a478, "{ A64_POLL(c); goto L_80099a00; }\n",
+                     "c->x[24], 500, (uint32_t)recomp_load32(c,c->x[24] + 500), 508, (uint32_t)recomp_load32(c,c->x[24] + 508), "
+                     "(uint32_t)c->x[22]"),
+      _barrier_sleep(0x8009b234, "    c->x[11] = 0x1ULL;\n    c->x[11] &= 0xFFFFFFFFULL;\n{ A64_POLL(c); goto L_8009a768; }\n",
+                     "c->x[24], 512, (uint32_t)c->x[25], 512, (uint32_t)c->x[25], (uint32_t)c->x[22]"),
+      _barrier_sleep(0x8009aff0, "{ A64_POLL(c); goto L_8009aa1c; }\n",
+                     "c->x[24], 520, (uint32_t)c->x[19], 520, (uint32_t)c->x[19], (uint32_t)recomp_load32(c,c->x[29] - 100)"),
+      _barrier_or(24, 500, 8, 23), _barrier_or(24, 508, 8, 23), _barrier_or(24, 512, 8, 23),
+      _barrier_or(24, 520, 8, 9, "    c->x[11] = 0x1ULL;\n    c->x[11] &= 0xFFFFFFFFULL;\n    c->x[9]=recomp_load32(c,c->x[31] + 112);\n"))),
+    ("void f_800738e0(Ctx *__restrict A64_NOESC c) {\n",
+     ("    { uint64_t _r = ((uint64_t)0 | ((c->x[0]) << 0)); c->x[19] = _r; }\n",
+      "L_80073e38:;\n    c->x[25]=recomp_load32(c,c->x[19] + 528);\n    recomp_barrier();\n    c->x[28]=recomp_load32(c,c->x[19] + 536);\n",
+      "recomp_store32_sp(c,c->x[31] + 16,c->x[8]);", "c->x[9]=recomp_load32(c,c->x[31] + 16);"),
+     (_barrier_sleep(0x800747ac, "{ A64_POLL(c); goto L_80073e38; }\n",
+                     "c->x[19], 528, (uint32_t)c->x[25], 536, (uint32_t)c->x[28], (uint32_t)recomp_load32(c,c->x[31] + 16)"),
+      _barrier_or(19, 528, 27, 26, "c->x[30] = 0x80073958ULL; f_80279140(c);\n    recomp_barrier();\n"),
+      _barrier_or(19, 536, 8, 9, "    { c->x[9]=(uint64_t)(uint32_t)((uint32_t)c->x[3]<<(c->x[21]&31)); }\n    recomp_barrier();\n"))),
+    ("void f_8007e200(Ctx *__restrict A64_NOESC c) {\n",
+     ("recomp_store32_sp(c,c->x[31] + 68,c->x[9]);",
+      "L_8007e6c0:;\n    c->x[21]=recomp_load32(c,c->x[26] + 544);\n",
+      "    c->x[28]=recomp_load32(c,c->x[31] + 68);\n",
+      "{ uint64_t _r = (c->x[21] ^ ((uint64_t)(uint32_t)(((uint32_t)(c->x[28])) << 0))); _r &= 0xFFFFFFFFULL; c->x[8] = _r; }"),
+     (_barrier_sleep(0x8007e90c, "{ A64_POLL(c); goto L_8007e6c0; }\n",
+                     "c->x[26], 544, (uint32_t)c->x[21], 544, (uint32_t)c->x[21], ~(uint32_t)c->x[28]"),
+      _barrier_or(26, 544, 8, 9, "    { c->x[9]=(uint64_t)(uint32_t)((uint32_t)c->x[23]<<(c->x[21]&31)); }\n    recomp_barrier();\n"))),
+)
+BARRIER_DECL = ("extern int hos_oot_barrier_on(void);\n"
+                "extern int hos_oot_barrier_wait(uint64_t p, uint32_t off1, uint32_t seen1, uint32_t off2, uint32_t seen2, "
+                "uint32_t full);\n"
+                "extern void hos_oot_barrier_wake(uint64_t p);\n")
+_BARRIER_MARKS = r"((?:    A64_MARK\(\(c->x\[\d+\] \+ \(uint64_t\)\(int64_t\)\(-?\d+\)\), \d+\);\n)*)"
+_BARRIER_POLLED = re.compile(r"\{ A64_POLL\(c\); (goto L_[0-9a-f]{8};) \}")
+
+
+class _BarrierText:
+    """A text of BARRIER_SITES as a pattern: its fixed pieces with a slot between two of them after each line end inside it
+    (group marks) and at each polled back-edge (the goto with or without its poll)"""
+
+    def __init__(self, text):
+        self.pieces, self.slots = [""], []
+        parts = _BARRIER_POLLED.split(text)
+        for k, part in enumerate(parts):
+            if k % 2:
+                goto = re.escape(part)
+                self.slots.append(r"(\{ A64_POLL\(c\); %s \}|%s)" % (goto, goto))
+                self.pieces.append("")
+                continue
+            lines = part.split("\n")
+            for i, line in enumerate(lines):
+                if i:
+                    self.pieces[-1] += "\n"
+                    if line or i < len(lines) - 1 or k < len(parts) - 1:
+                        self.slots.append(_BARRIER_MARKS)
+                        self.pieces.append("")
+                self.pieces[-1] += line
+        self.re = re.compile("".join(re.escape(p) + s for p, s in zip(self.pieces, self.slots + [""])))
+
+    def count(self, body):
+        return sum(1 for _ in self.re.finditer(body))
+
+    def put(self, body, old):
+        m = old.re.search(body)
+        if m is None:
+            return body
+        return body[:m.start()] + "".join(p + f for p, f in zip(self.pieces, m.groups() + ("",))) + body[m.end():]
+
+
+def _barrier_forms():
+    forms = []
+    for head_text, marks, places in BARRIER_SITES:
+        made = [(_BarrierText(old), _BarrierText(new)) for old, new in places]
+        if any(old.slots != new.slots for old, new in made):
+            raise ValueError("oot_patches: a barrier place and its hooked text differ in their lines or loops")
+        forms.append((head_text, [_BarrierText(m) for m in marks], made))
+    return tuple(forms)
+
+
+BARRIER_FORMS = _barrier_forms()
+
+
+def patch_barrier_wait(s):
+    """The job barriers' sleeps and ORs through the host: (s, how many of BARRIER_SITES' functions are in s with all their
+    places hooked, made now or before). A function whose code differs (another game version) is left as it is"""
+    done = 0
+    for head_text, marks, places in BARRIER_FORMS:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        if all(new.count(body) == 1 and not old.count(body) for old, new in places):
+            done += 1
+            continue
+        if not all(m.count(body) == 1 for m in marks) or not all(old.count(body) == 1 for old, _ in places):
+            continue
+        for old, new in places:
+            body = new.put(body, old)
+        s = s[:head] + body + s[end:]
+        done += 1
+    if done and BARRIER_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + BARRIER_DECL, 1)
+    return s, done
+
+
+# A horse's jump state machine, f_82c59eb0 (s10 its step): above 60 fps hos_oot_horse_whole_step skips the slow-motion branch when
+# the step is the whole frame's (host/oot_high_fps.h).
+HORSE_HEAD = "void f_82c59eb0(Ctx *__restrict A64_NOESC c) {\n"
+HORSE_TEST = "    a64_vset64(c->vreg[9],0x3f800000ULL);\n    { if (!a64_fcmp32(c,c->vreg[10],c->vreg[9])) "
+HORSE_BRANCH = "if (!c->n) { goto L_82c5ae48; }\n"
+HORSE_SKIP = ("    if (hos_oot_horse_whole_step((uint32_t)c->vreg[10][0], " + SOUND_SLOT + " + 2192)) { goto L_82c5ae48; }"
+              "   /* (nx2/oot_patches.py: a horse's jump blend above 60 fps) */\n")
+HORSE_DECL = "extern int hos_oot_horse_whole_step(uint32_t step_bits, uint64_t slot);\n"
+
+
+def patch_horse_jump(s):
+    """A horse's jump state machine's step test with the whole-frame one before it: (s, 1) when it is in s with it"""
+    at = _function(s, HORSE_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if body.count(HORSE_SKIP + HORSE_BRANCH) == 1:
+        return s, 1
+    if body.count(HORSE_TEST) != 1 or HORSE_SKIP in body:
+        return s, 0
+    line_end = body.find("\n", body.index(HORSE_TEST) + len(HORSE_TEST))
+    if line_end < 0 or not body.startswith(HORSE_BRANCH, line_end + 1):
+        return s, 0
+    body = body[:line_end + 1] + HORSE_SKIP + body[line_end + 1:]
+    s = s[:head] + body + s[end:]
+    if HORSE_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + HORSE_DECL, 1)
+    return s, 1
+
+
+# Looping animation of one frame or less (frozen Zoras in Zora's Domain): whole frames per animation entry in f_802cfca0
+# and loop start in f_80944aa0 above 60 fps (host/loop_step.h).
+LOOP_HEAD = "void f_802cfca0(Ctx *__restrict A64_NOESC c) {\n"
+LOOP_MUL = "    {uint64_t _a=0,_b=0,_z,_v;memcpy(&_a,c->vreg[8],4);memcpy(&_b,c->vreg[%d],4);_z=(_a^_b)&0x80000000ULL;\n"
+LOOP_SITES = (
+    ("if (((c->x[9] >> 3) & 1)) { goto L_802d077c; }\n", 1),
+    ("if (((c->x[9] >> 3) & 1)) { goto L_802d07f4; }\n", 0),
+)
+LOOP_MARK = "/* (nx2/oot_patches.py: a loop of one frame by whole frames) */"
+LOOP_DECL = "extern uint32_t hos_loop_step(uint64_t at, uint32_t step_bits, uint32_t start_bits, uint32_t end_bits);\n"
+
+
+def _loop_new(mul):
+    return mul.replace("memcpy(&_a,c->vreg[8],4);",
+                       "memcpy(&_a,c->vreg[8],4); _a=hos_loop_step(c->x[20], (uint32_t)_a, (uint32_t)recomp_load32(c,c->x[20] + 16), "
+                       "(uint32_t)recomp_load32(c,c->x[20] + 20));   " + LOOP_MARK + "\n    ", 1)
+
+
+def patch_loop_steps(s):
+    """(s, the sites in s with hos_loop_step): f_802cfca0's two clock advances"""
+    at = _function(s, LOOP_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    done = 0
+    for before, reg in LOOP_SITES:
+        old = before + LOOP_MUL % reg
+        new = before + _loop_new(LOOP_MUL % reg)
+        if new in body:
+            done += 1
+            continue
+        if body.count(old) != 1:
+            continue
+        offset = head + body.index(old)
+        s = s[:offset] + new + s[offset + len(old):]
+        at2 = _function(s, LOOP_HEAD)
+        head, end = at2
+        body = s[head:end]
+        done += 1
+    if done and LOOP_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + LOOP_DECL, 1)
+    return s, done
+
+
+POSE_HEAD = "void f_80944aa0(Ctx *__restrict A64_NOESC c) {\n"
+POSE_OLD = "    { { uint64_t _v=0; memcpy(&_v,&c->vreg[0][0],4); recomp_store32(c,(c->x[22]+0ULL),_v); } }\n"
+POSE_NEW = ("    { { uint64_t _v=0; memcpy(&_v,&c->vreg[0][0],4); _v=hos_loop_pose((uint32_t)_v, (uint32_t)recomp_load32(c,c->x[22] + 4), "
+            "(uint32_t)recomp_load32(c,c->x[22] + 8));   /* (nx2/oot_patches.py: a loop of one frame by its start) */ "
+            "recomp_store32(c,(c->x[22]+0ULL),_v); } }\n")
+POSE_DECL = "extern uint32_t hos_loop_pose(uint32_t time_bits, uint32_t start_bits, uint32_t end_bits);\n"
+
+
+def patch_loop_pose(s):
+    """(s, 1 if f_80944aa0 is in s with hos_loop_pose)"""
+    at = _function(s, POSE_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if POSE_NEW in body:
+        return s, 1
+    if body.count(POSE_OLD) != 1:
+        return s, 0
+    offset = head + body.index(POSE_OLD)
+    s = s[:offset] + POSE_NEW + s[offset + len(POSE_OLD):]
+    if POSE_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + POSE_DECL, 1)
+    return s, 1
+
+
+# Moving-floor carry in f_80159dc0, f_8015d490 and f_838baa40 above 100 fps (host/oot_high_fps.h).
+FLOOR_SITES = (("void f_80159dc0(Ctx *__restrict A64_NOESC c) {\n", "L_8015a39c"),
+               ("void f_8015d490(Ctx *__restrict A64_NOESC c) {\n", "L_8015dad4"),
+               ("void f_838baa40(Ctx *__restrict A64_NOESC c) {\n", "L_838baf24"))
+FLOOR_TEST = ("    { { uint64_t _v=recomp_load32(c,(c->x[8]+40ULL)); a64_vset64(c->vreg[0],_v); } }\n"
+              "    c->x[8] = 0x42c80000ULL;\n"
+              "    c->x[8] &= 0xFFFFFFFFULL;\n"
+              "    { a64_vset64(c->vreg[1],0); memcpy(&c->vreg[1][0],&c->x[8],4); }\n")
+FLOOR_FCMP = "    { if (!a64_fcmp32(c,c->vreg[0],c->vreg[1])) "
+FLOOR_BRANCH = "if ((c->n == c->v) && !c->z) { goto %s; }\n"
+FLOOR_NEW = ("if ((c->n == c->v) && !c->z && hos_oot_floor_carry_slow((uint32_t)c->vreg[0][0], " + SOUND_SLOT + " + 2192)) "
+             "{ goto %s; }   /* (nx2/oot_patches.py: a moving floor's carry above 60 fps) */\n")
+FLOOR_DECL = "extern int hos_oot_floor_carry_slow(uint32_t inv_dt_bits, uint64_t slot);\n"
+
+
+def patch_floor_carry(s):
+    """The floor carry's slow-time test through the host in the three modules: (s, sites found with it)"""
+    done = 0
+    for head_text, label in FLOOR_SITES:
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        old, new = FLOOR_BRANCH % label, FLOOR_NEW % label
+        if body.count(new) == 1 and old not in body:
+            done += 1
+            continue
+        if body.count(FLOOR_TEST) != 1 or body.count(old) != 1:
+            continue
+        fcmp = body.index(FLOOR_TEST) + len(FLOOR_TEST)
+        line_end = body.find("\n", fcmp)
+        if not body.startswith(FLOOR_FCMP, fcmp) or line_end < 0 or not body.startswith(old, line_end + 1):
+            continue
+        body = body[:line_end + 1] + new + body[line_end + 1 + len(old):]
+        s = s[:head] + body + s[end:]
+        done += 1
+    if done and FLOOR_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + FLOOR_DECL, 1)
+    return s, done
+
+
+# Ocarina song playback note flag once a note above 60 fps (host/oot_high_fps.h).
+SONG_CUE_SITES = (("void f_832b2af0(Ctx *__restrict A64_NOESC c) {\n", "c->x[30] = 0x832b2c84ULL; f_832b7b50(c);\n"),
+                  ("void f_832b2dc0(Ctx *__restrict A64_NOESC c) {\n", "c->x[30] = 0x832b2ed4ULL; f_832b7b50(c);\n"))
+SONG_CUE_NEW = ("    c->x[0] = hos_oot_song_cue(%d, c->x[0]);"
+                "   /* (nx2/oot_patches.py: the note flag once a note above 60 fps) */\n")
+SONG_CUE_DECL = "extern uint64_t hos_oot_song_cue(uint32_t site, uint64_t game);\n"
+
+
+def patch_song_cue(s):
+    """The song playbacks' note flag through the host: (s, calls in s with it)"""
+    done = 0
+    for site, (head_text, call) in enumerate(SONG_CUE_SITES):
+        at = _function(s, head_text)
+        if at is None:
+            continue
+        head, end = at
+        body = s[head:end]
+        new = call + SONG_CUE_NEW % site
+        if body.count(new) == 1:
+            done += 1
+        elif body.count(call) == 1:
+            s = s[:head] + body.replace(call, new, 1) + s[end:]
+            done += 1
+    if done and SONG_CUE_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + SONG_CUE_DECL, 1)
+    return s, done
+
+
+# Below 60 fps cloth time (f_81b3aa48) and above 60 fps cloth solve gate (f_81b47080, HOS_FPS_CLOTH_60=1).
+CLOTH_HEAD = "void f_81b3aa48(Ctx *__restrict A64_NOESC c) {\n"
+CLOTH_OLD = "    { { uint64_t _v=recomp_load64(c,(c->x[22]+8ULL)); a64_vset64(c->vreg[0],_v); } }\n"
+CLOTH_NEW = ("    { { uint64_t _v=recomp_load64(c,(c->x[22]+8ULL)); _v=(_v&0xffffffff00000000ULL)|hos_oot_cloth_seconds((uint32_t)_v, "
+             "(uint32_t)recomp_load32(c,g_module_base + 0x84d61fc8ULL)); a64_vset64(c->vreg[0],_v); } }"
+             "   /* (nx2/oot_patches.py: the cloth's time below 60 fps) */\n")
+CLOTH_DECL = "extern uint32_t hos_oot_cloth_seconds(uint32_t seconds_bits, uint32_t step_bits);\n"
+
+CLOTH_SOLVE_HEAD = "void f_81b47080(Ctx *__restrict A64_NOESC c) {\n"
+CLOTH_SOLVE_OLD = ("    { uint64_t _b=c->x[31]; int64_t _o=-128; { uint64_t _v=0; memcpy(&_v,&c->vreg[10][0],8); "
+                   "recomp_store64(c,(_b+_o),_v); } c->x[31]=_b+_o; }\n")
+CLOTH_SOLVE_NEW = ("    if (!hos_oot_cloth_solve((uint32_t)recomp_load32(c,g_module_base + 0x84d61fc8ULL))) { c->x[0] = 0; return; }"
+                   "   /* (nx2/oot_patches.py: the cloth's solves above 60 fps) */\n")
+CLOTH_SOLVE_DECL = "extern int hos_oot_cloth_solve(uint32_t step_bits);\n"
+
+
+def patch_cloth_time(s):
+    """The cloth setup's time through the host: (s, 1) when f_81b3aa48 is in s with it"""
+    at = _function(s, CLOTH_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if body.count(CLOTH_NEW) == 1:
+        return s, 1
+    if body.count(CLOTH_OLD) != 1:
+        return s, 0
+    s = s[:head] + body.replace(CLOTH_OLD, CLOTH_NEW, 1) + s[end:]
+    if CLOTH_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + CLOTH_DECL, 1)
+    return s, 1
+
+
+def patch_cloth_solve(s):
+    """The cloth's solve job gated through the host: (s, 1) when f_81b47080 is in s with it"""
+    at = _function(s, CLOTH_SOLVE_HEAD)
+    if at is None:
+        return s, 0
+    head, end = at
+    body = s[head:end]
+    if body.count(CLOTH_SOLVE_NEW) == 1:
+        return s, 1
+    if body.count(CLOTH_SOLVE_OLD) != 1:
+        return s, 0
+    first = body.index(CLOTH_SOLVE_OLD)
+    if body[:first].count("\n") > 2:   # (the first store is the job's own first line, after the head and a hint)
+        return s, 0
+    s = s[:head] + body[:first] + CLOTH_SOLVE_NEW + body[first:] + s[end:]
+    if CLOTH_SOLVE_DECL not in s:
+        s = s.replace('#include "a64.h"\n', '#include "a64.h"\n' + CLOTH_SOLVE_DECL, 1)
+    return s, 1
 
 
 # (from TomShafford/Hookshot 55d68e8cd6 and 65c1998222) f_804566e0's two calls of f_80522050, the GPU memory a model's material
@@ -479,7 +895,7 @@ def patch_names(s):
     m = lifted_c.HEAD.search(s, at + len(NAMES_HEAD))
     end = m.start() if m else len(s)
     body = s[at:end]
-    if NAMES_EDITS[0][1] in body:
+    if NAMES_EDITS[0][1] in body or "hos_names_lower(c)" in body:
         return None
     for anchor, call in NAMES_EDITS:
         if body.count(anchor) != 1:
@@ -506,6 +922,15 @@ def apply(gen, *, protect_hearts=False, required=False):
     whole_sites = 0
     sound_jobs = 0
     solver_sites = 0
+    texc_sites = 0
+    barrier_sites = 0
+    horse_sites = 0
+    loop_step_sites = 0
+    loop_pose_sites = 0
+    floor_sites = 0
+    song_cue_sites = 0
+    cloth_time_sites = 0
+    cloth_solve_sites = 0
     heap_sites = [0, 0]
     for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
@@ -587,6 +1012,51 @@ def apply(gen, *, protect_hearts=False, required=False):
         if solver != out:
             print("oot_patches: the solver steps rounded up above 60 fps in " + os.path.basename(path))
         out = solver
+        texc, found_texc = patch_tex_compact(out)
+        texc_sites += found_texc
+        if texc != out:
+            print("oot_patches: the texture heap's compaction asked for through the host in " + os.path.basename(path))
+        out = texc
+        barrier, found_barrier = patch_barrier_wait(out)
+        barrier_sites += found_barrier
+        if barrier != out:
+            print("oot_patches: the job barriers' sleeps and mask ORs through the host in " + os.path.basename(path))
+        out = barrier
+        horse, found_horse = patch_horse_jump(out)
+        horse_sites += found_horse
+        if horse != out:
+            print("oot_patches: a horse's jump blend above 60 fps in " + os.path.basename(path))
+        out = horse
+        loop_s, found_loop_s = patch_loop_steps(out)
+        loop_step_sites += found_loop_s
+        if loop_s != out:
+            print("oot_patches: %d animation clock(s) with whole frames for a loop of one frame in %s" % (found_loop_s, os.path.basename(path)))
+        out = loop_s
+        loop_p, found_loop_p = patch_loop_pose(out)
+        loop_pose_sites += found_loop_p
+        if loop_p != out:
+            print("oot_patches: the drawn time of a loop of one frame by its start in " + os.path.basename(path))
+        out = loop_p
+        floor, found_floor = patch_floor_carry(out)
+        floor_sites += found_floor
+        if floor != out:
+            print("oot_patches: a moving floor's carry above 60 fps in " + os.path.basename(path))
+        out = floor
+        cue, found_cue = patch_song_cue(out)
+        song_cue_sites += found_cue
+        if cue != out:
+            print("oot_patches: the song playbacks' note flag once a note above 60 fps in " + os.path.basename(path))
+        out = cue
+        cloth_t, found_cloth_t = patch_cloth_time(out)
+        cloth_time_sites += found_cloth_t
+        if cloth_t != out:
+            print("oot_patches: the cloth's time below 60 fps in " + os.path.basename(path))
+        out = cloth_t
+        cloth_s, found_cloth_s = patch_cloth_solve(out)
+        cloth_solve_sites += found_cloth_s
+        if cloth_s != out:
+            print("oot_patches: the cloth's solves above 60 fps in " + os.path.basename(path))
+        out = cloth_s
         heap, found_heap = patch_heap_retry(out) if protect_hearts else (out, [0, 0])
         heap_sites[0] += found_heap[0]
         heap_sites[1] += found_heap[1]
@@ -599,6 +1069,24 @@ def apply(gen, *, protect_hearts=False, required=False):
         print("oot_patches: WARNING: the sound job was found %d times, not once" % sound_jobs)
     if solver_sites != len(SOLVER_HEADS):
         print("oot_patches: WARNING: the solver step count was found at %d of %d places" % (solver_sites, len(SOLVER_HEADS)))
+    if texc_sites != 1:
+        print("oot_patches: WARNING: the texture heap's compaction request was found %d times, not once" % texc_sites)
+    if barrier_sites != len(BARRIER_SITES):
+        print("oot_patches: WARNING: the job barriers were found in %d of %d functions" % (barrier_sites, len(BARRIER_SITES)))
+    if horse_sites != 1:
+        print("oot_patches: WARNING: the horse's jump step test was found %d times, not once" % horse_sites)
+    if loop_step_sites != len(LOOP_SITES):
+        print("oot_patches: WARNING: the animation clock for a loop of one frame was found at %d of %d places" % (loop_step_sites, len(LOOP_SITES)))
+    if loop_pose_sites != 1:
+        print("oot_patches: WARNING: the drawn time of a loop of one frame was found %d times, not once" % loop_pose_sites)
+    if floor_sites != len(FLOOR_SITES):
+        print("oot_patches: WARNING: a moving floor's carry was found at %d of %d places" % (floor_sites, len(FLOOR_SITES)))
+    if song_cue_sites != len(SONG_CUE_SITES):
+        print("oot_patches: WARNING: the song playbacks' note flag was found at %d of %d places" % (song_cue_sites, len(SONG_CUE_SITES)))
+    if cloth_time_sites != 1:
+        print("oot_patches: WARNING: the cloth's time was found %d times, not once" % cloth_time_sites)
+    if cloth_solve_sites != 1:
+        print("oot_patches: WARNING: the cloth's solve job was found %d times, not once" % cloth_solve_sites)
     if protect_hearts and heap_sites != [len(GPU_ALLOC_SITES), len(HEAP_ALLOC_SITES)]:
         print("oot_patches: WARNING: the OptimizeChangeBank allocations were found %s times, not once each" % heap_sites)
     for what, n in done.items():
