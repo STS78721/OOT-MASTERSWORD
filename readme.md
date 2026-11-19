@@ -31,17 +31,33 @@ We aim for a **native, flagship PC experience**:
 
 ---
 
-## 🎮 What's in 0.1.9c
+## 🎮 What's in 0.2.1
 
 <p align="center">
   <img src="assets/launcher_showcase.png" alt="SteelTemple MasterSword Launcher" width="90%">
 </p>
 
-### ✨ MasterSword identity
-* Startup pipeline warmer, Insert menu, launcher, and updater all stamped **MasterSword 0.1.9c**
-* SteelTempSaint logo on the startup screen & safe 1080p vendor-neutral out-of-the-box defaults
+### 🚀 0.2.1 — Vulkan PGO, Threaded Rendering, Selective Capture & RTX 50 Fix
+* **Vulkan Renderer PGO (`mastersword_vk.dll`)** — compiled with a MasterSword-native Profile-Guided Optimization profile from live Castle Town & Hyrule Field play (`3,215` functions, `76.08B` block counts) while keeping `HOOKSHOT_SHADER_STAMP` (`0x4eae666d8f924912`) intact so existing shader/program caches never rebuild.
+* **Threaded Rendering (`Auto` on 12+ logical CPUs)** — decouples Vulkan recording and present pacing via `RX_VK_PRESENTS_AHEAD` for higher, steadier frame pacing on modern multi-core CPUs.
+* **Selective Submit-Time Capture (`RX_VK_CAPTURE=2`) & Shadow-Baseline Sync** — focuses submit captures on 2D/compute small buffers and readback ranges, paired with `RX_VK_SHADOW_BASELINE=1` sync, sky light accumulator resets, retired-mirror clean-page inheritance, and GPU-adaptive `p90` capture wait caps (`20 ms` baseline).
+* **Native Host Zstd & Name-Search Loops** — runs `f_801102e0` zstd sequence decoding and `f_805aeea0` sorted-container name searches natively with cooperative virtual-core polling and stuck-load diagnostics.
+* **Off-Thread Resource Reaper & Shared Pipeline Locks** — offloads FIFO Vulkan view/image/buffer/sparse cleanup to a dedicated reaper thread, adds shared reader-lock pipeline cache lookup (`RX_VK_PIPE_SHARED=1`), per-program pipeline ownership, direct uniform buffer snapshotting, lockless `queue_flush()` fast path, finalized GPU-drawn texture retention (`RX_VK_KEEP_DRAWN=1`), AMD 85% idle import reclamation, 512 MB managed-pagefile reserve, and Windows `ABOVE_NORMAL_PRIORITY_CLASS` (`HOS_PROCESS_PRIORITY=1`).
+* **NVIDIA RTX 50 Series Water Hang & White-Link Fix** — safely skips broken half-size HDR 3D-volume box draws on RTX 50 GPUs (`RX_VK_FOG_BOXES=1` opt-out) and aligns launcher/updater checks directly to GitHub Releases.
 
-### 🚀 0.1.9c — Smooth play on hybrid CPUs
+### ⚡ From 0.2.0 (still here) — Performance, VRAM & Sync Overhaul
+* **Dynamic Render Target Pool & Per-Present Target Sweep** — scales pool cap to 1/12 of VRAM (`256–768 MB`, 8-present idle trim) and sweeps overwritten transient targets every present while keeping MasterSword's 3-frame safety margin and 96 MB low-VRAM floor.
+* **Character Shadow-Map Storage Bucketing (`HOS_SHADOW_BUCKET=384`)** — keeps downstream render-target addresses steady as character shadow maps resize dynamically in Castle Town.
+* **Re-visited Area ASTC Texture Reuse & Flat Per-Draw Caches** — copies matching finalized ASTC textures directly on the GPU (`RX_VK_ASTC_REUSE`), removes per-draw hash/env locks, uses a 64 KB lock-free `wrote_regions` bitmap, partial vertex-buffer binds, and LRU sampler retirement.
+* **AMD & Low-VRAM Stability** — `past_allowance` detects AMD's Windows driver reporting `allowed ≈ used` and reclaims textures before paging; BC decode scratch trimmed to `20–36 MB` (`1` layer default); `2 s` staging burst retention; timed-out readback & sparse-bind retry safety.
+* **Sync, Audio, Movie & Icon Polish** — fixes met-wait dark lighting/Link flashes and capture/write-watch page races, enforces GPU command-order inline buffer writes/clears, bounds unbounded import scans (`import_reach`), adds 1 s virtual-core starvation boost, paces cutscenes cleanly at 240 fps during 60 fps play, fixes multi-channel DAC 5.1 mask detection, and ships clean transparent icons.
+
+### 🔨 From 0.1.9d — Biggoron's Forge, Triforce & Sheikah Slate
+* **Biggoron's Forge V1 & Capture Copy Split** — compiles the 699 busiest lifted functions from a real Castle Town profile at `-O2` with inlined float fast paths and splits per-submit memory snapshots (`~4%` Town speedup).
+* **Triforce Shader Delivery, Sheikah Slate 3 & Owl Statue** — persistent SPIR-V shader pack (`mastersword_spirv.pack`), adaptive hot shader memory, per-area shader warm-ahead (`mastersword_slate.bin`), and async background saving.
+* **Hardware Fixes** — accurate Scarecrow's Song and Deku Tree floor-web timing above 60 fps and version-tag ordering on update checks.
+
+### 🚀 From 0.1.9c — Smooth play on hybrid CPUs
 * **Intel Hybrid CPU Patch** (Insert / F1 menu → Graphics, **On (Recommended)** for 12th/13th/14th gen Core & Core Ultra) — the Switch 2 gives a game six identical cores. On Intel hybrid CPUs (12th gen+, Core Ultra) every game thread now runs on the **P-cores** and background work (shader builds) on the **E-cores**. On a Core Ultra 7 270K Plus frame pacing became far steadier and most graphical glitches went away.
 * **Parallel replay on by default** — each frame is recorded on several threads, the count picked from your CPU's fast cores (8 P-cores → 4 threads, under 6 → off).
 * **Renderer on its own P-core** — frame recording runs on a core kept free of the game's threads, then returns.
@@ -91,10 +107,10 @@ We aim for a **native, flagship PC experience**:
 
 ## 📥 Quick Start & Downloads
 
-Grab packages from the **[Latest Release (0.1.9c)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
+Grab packages from the **[Latest Release (0.2.1)](https://github.com/STS78721/OOT-MASTERSWORD/releases/latest)**:
 
 ### 🎮 New players — Portable
-👉 **[`SteelTemple-MasterSword-0.1.9c-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9c/SteelTemple-MasterSword-0.1.9c-Portable-StandAlone.zip)**
+👉 **[`SteelTemple-MasterSword-0.2.1-Portable-StandAlone.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.1/SteelTemple-MasterSword-0.2.1-Portable-StandAlone.zip)**
 1. Extract (e.g. `C:\Games\MasterSword`)
 2. Put **your** dump beside it: **`image.bin` + `romfs\`**
 3. Run **`MasterSwordLauncher.exe`** → SETTINGS → PLAY  
@@ -114,11 +130,11 @@ C:\Games\MasterSword\
 ```
 
 ### ⚡ Existing players — Update
-👉 **[`SteelTemple-MasterSword-0.1.9c-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9c/SteelTemple-MasterSword-0.1.9c-Update.zip)**  
-Open **`MasterSwordLauncher.exe`** and let it download & install **`0.1.9c`** automatically in 1 click — or extract the Update zip directly over your game folder.
+👉 **[`SteelTemple-MasterSword-0.2.1-Update.zip`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.1/SteelTemple-MasterSword-0.2.1-Update.zip)**  
+Open **`MasterSwordLauncher.exe`** and let it download & install **`0.2.1`** automatically in 1 click — or extract the Update zip directly over your game folder.
 
 ### 🖥️ Launcher only
-👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.1.9c/MasterSwordLauncher.exe)**
+👉 **[`MasterSwordLauncher.exe`](https://github.com/STS78721/OOT-MASTERSWORD/releases/download/0.2.1/MasterSwordLauncher.exe)**
 
 ---
 
