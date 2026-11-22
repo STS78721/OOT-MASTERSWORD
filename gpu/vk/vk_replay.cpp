@@ -27,6 +27,7 @@
 #include <unordered_set>
 
 #include "vk_draw.h"
+#include "mesh_conv.h"
 #include "vk_dump.h"
 #include "vk_gprof.h"
 #include "vk_color.h"
@@ -1377,7 +1378,39 @@ void op_fine_report(double frames) {
     logf("%s", line);
 }
 
+std::atomic<int64_t> st_mc_stops[mesh_conv::kStops];
+std::atomic<int64_t> st_mc_stop_ops[64];
+thread_local const uint8_t* mesh_rescan_at = nullptr;
+
+/// After a game barrier (or a stop-op that left indirect mesh draws after it), scan forward up to the next
+/// barrier, buffer-writing op, or stream end and batch-convert those draws' indirect args at once.
+void mesh_conv_at_barrier(VkCommandBuffer cmd, const uint8_t* next, const uint8_t* end, bool after_op = false) {
+    mesh_rescan_at = nullptr;
+    if (!mesh_conv_batching()) return mesh_conv_batch(cmd, nullptr, 0);
+    static constexpr uint32_t pass_ops[] = {
+        NOP_BEGIN, NOP_JUMP, NOP_CALL, NOP_UPDATE_UB, NOP_SET_RT, NOP_CLEAR_COLOR, NOP_CLEAR_DS, NOP_VIEWPORTS,
+        NOP_SCISSOR, NOP_DEPTH_RANGE, NOP_BIND_PROGRAM, NOP_BIND_STATE, NOP_BIND_VATTR, NOP_BIND_VSTREAM, NOP_BIND_VBUF,
+        NOP_BIND_UBO, NOP_BIND_SSBO, NOP_BIND_TEX, NOP_BIND_SAMP, NOP_STENCIL, NOP_POLY_OFFSET, NOP_DRAW, NOP_DRAW_IDX,
+        NOP_SET_TEX_POOL, NOP_SET_SAMP_POOL, NOP_COPY_STRIDE, NOP_BLEND_COLOR, NOP_BIND_IMG, NOP_RESET_COUNTER,
+        NOP_DEPTH_CLAMP, NOP_RENDER_ENABLE, NOP_RASTER_DISCARD, NOP_RENDER_COND, NOP_PRIMITIVE_RESTART, NOP_BIND_BUFS,
+        NOP_DRAW_INDIRECT, NOP_PUSH_CONST};
+    static_assert(NOP_COUNT_ <= mesh_conv::kOpTable, "mesh_conv.h kOpTable: an op past it would be Stop");
+    static constexpr mesh_conv::Ops ops =
+        mesh_conv::make_ops(NOP_END, NOP_BARRIER, NOP_DRAW_MESH, pass_ops, sizeof pass_ops / sizeof pass_ops[0]);
+    static thread_local std::vector<mesh_conv::Item> items;
+    static thread_local uint32_t cut_by = 0;
+    uint32_t stop_op = 0;
+    const uint8_t* at = nullptr;
+    // Cap each batch at 1 MB (a quarter of kMeshRing) and 256 draws so a batch never wraps onto itself.
+    const mesh_conv::Stop why = mesh_conv::scan(ops, next, end, items, 1ull << 20, 256, &stop_op, &at);
+    st_mc_stops[why].fetch_add(1, std::memory_order_relaxed);
+    if (after_op && !items.empty()) st_mc_stop_ops[cut_by & 63].fetch_add((int64_t)items.size(), std::memory_order_relaxed);
+    if (why == mesh_conv::kStopOp) mesh_rescan_at = at, cut_by = stop_op;
+    mesh_conv_batch(cmd, items.data(), items.size());
+}
+
 void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* end = nullptr) {
+    mesh_rescan_at = nullptr;
     const Mode mode = rmode;
     const bool dry = mode == Mode::Dry, worker = mode == Mode::Worker;
     for (;;) {
@@ -1829,6 +1862,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             end_pass(cmd);
             full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
             st_barriers++;
+            mesh_conv_at_barrier(cmd, p + h.size, end);
             break;
         // ---- work ----
         case NOP_CLEAR_COLOR:
@@ -1905,6 +1939,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 da.groups[0] = d.y, da.groups[1] = 1, da.groups[2] = 1;
                 if (d.kind == 0) da.first_task = d.x;   // (hookshot: the task programs add it, vk_draw.cpp's mesh_args)
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
+                da.op = p;
                 draw(cmd, s, da);
             }
             s.samples_passed += 16;
@@ -1931,6 +1966,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 maybe_split(cmd);
             }
         }
+        if (!dry && p == mesh_rescan_at) mesh_conv_at_barrier(cmd, p + h.size, end, true);
         p += h.size;
     }
 }
@@ -3009,6 +3045,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         memory_begin_submission();
         full_barrier(first.cmd, "barrier (recording start)");
         rec_cur = &first, rec_cur_value = tag, rec_parts = 0, part_work = 0;
+        temporal_prewarm(first.cmd);   // (longshot, RX_VK_DLSS_PREWARM: DLSS's feature in a light frame before the first 3D one)
     }
     VkCommandBuffer cmd = rec_cur->cmd;
     const uint8_t* stop = nullptr;
@@ -3856,6 +3893,8 @@ struct Frame {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE;
+    VkSemaphore retired_acquire = VK_NULL_HANDLE;
 };
 Frame frames[3];
 uint32_t frame_index = 0;
@@ -4052,6 +4091,7 @@ void log_frame_stats() {
         draw_stats(&d, &sk, &di, &pl);
         temper3_frame(total_ms, (cur_sub - prev_sub) / 1e6, cur_locks - prev_locks, (cur_wait - prev_wait) / 1e6,
                       (int)(d - prev_draws));
+        temporal_note_frame(d - prev_draws);   // (RX_VK_DLSS_PREWARM)
         prev_sub = cur_sub, prev_locks = cur_locks, prev_wait = cur_wait, prev_draws = d;
     }
     if (++fps_n == 120) {
@@ -4139,6 +4179,26 @@ void log_frame_stats() {
             logf("vk: a frame: the game's barriers by their NVN flags:%s", fl.c_str());
             st_barrier_flags.clear();
         }
+        {
+            int64_t mc[7];
+            mesh_conv_stats(mc);
+            int64_t stops[mesh_conv::kStops];
+            for (int i = 0; i < mesh_conv::kStops; i++) stops[i] = st_mc_stops[i].exchange(0, std::memory_order_relaxed);
+            std::string cut;
+            for (int o = 0; o < 64; o++)
+                if (const int64_t n = st_mc_stop_ops[o].exchange(0, std::memory_order_relaxed)) {
+                    char b[32];
+                    snprintf(b, sizeof b, " %d: %.1f;", o, n / 120.0);
+                    cut += b;
+                }
+            if (mc[0] || mc[1] || mc[2] || mc[3] || mc[4] || mc[5] || mc[6]) {
+                logf("vk: a frame: indirect mesh draws' arguments (RX_VK_MESH_CONV=%d): %.1f single, %.1f from %.1f batches "
+                     "(%.1f batched; %.1f dropped, %.1f stale), %.1f unconverted; scans: barrier %.1f, op %.1f, end %.1f, full %.1f; rescans:%s",
+                     mesh_conv_mode(), mc[0] / 120.0, mc[1] / 120.0, mc[2] / 120.0, mc[3] / 120.0, mc[4] / 120.0, mc[5] / 120.0,
+                     mc[6] / 120.0, stops[mesh_conv::kStopBarrier] / 120.0, stops[mesh_conv::kStopOp] / 120.0,
+                     stops[mesh_conv::kStopEnd] / 120.0, stops[mesh_conv::kStopFull] / 120.0, cut.empty() ? " none" : cut.c_str());
+            }
+        }
         static int64_t l_gpu;
         static uint64_t l_made;
         logf("vk: GPU time %.1f ms a frame (the longest submission %.1f ms); %.1f textures made a frame",
@@ -4204,6 +4264,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                  t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.format : 0,
                  tex ? (tex->gpu_written ? "rendered" : "never rendered") : "no image");
         if (tex) src = tex->image, sw = tex->width, sh = tex->height;
+        if (t) temporal_note_present(t->d.width, t->d.height);   // (RX_VK_DLSS_PREWARM: the size its feature is made for)
         if (tex && !dev.offscreen &&
             (opts_spatial_upscale() || opts.sharpness || color_grade_active() || smaa_active() || mvec_on())) {
             // Keep the sampled view with the same cached image as the direct present, before advancing its age.
@@ -4718,6 +4779,9 @@ thread_local PendingPresent* present_defer_into = nullptr;
 // stalled the replay queue until the hang watch fired. Now vkAcquireNextImageKHR signals acquire_fence; if not ready within
 // kImageFreeNs the image is held and checked without blocking on subsequent presents until free.
 static VkFence acquire_fence = VK_NULL_HANDLE;
+static VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
+struct RetiredAcquire { VkFence fence; VkSemaphore semaphore; };
+static std::vector<RetiredAcquire> retired_acquires;
 struct HeldImage {
     bool held = false;
     uint32_t index = 0;
@@ -4735,19 +4799,72 @@ static bool image_free(uint64_t timeout_ns) {
     return true;
 }
 
+static std::vector<VkFence> fences_let_go;
 static void held_image_drop() {
     held_image.held = false;
+    if (acquire_semaphore) {
+        retired_acquires.push_back({acquire_fence, acquire_semaphore});
+        acquire_fence = VK_NULL_HANDLE;
+        acquire_semaphore = VK_NULL_HANDLE;
+        return;
+    }
     if (image_free(0)) return;
+    if (fences_let_go.size() < 8) fences_let_go.push_back(acquire_fence);
     acquire_fence = VK_NULL_HANDLE;
 }
 
 static bool acquire_fence_ready() {
+#ifdef _WIN32
+    // Streamline's NVIDIA acquire hook forwards a signal semaphore even for a fence-only acquire.
+    if (dev.props.vendorID == 0x10de && !acquire_semaphore) {
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        if (vkCreateSemaphore(dev.device, &si, nullptr, &acquire_semaphore) != VK_SUCCESS) return false;
+    }
+#endif
     if (acquire_fence) return true;
+    for (auto& retired : retired_acquires) {
+        if (!retired.fence) continue;
+        if (vkWaitForFences(dev.device, 1, &retired.fence, VK_TRUE, 0) != VK_SUCCESS) continue;
+        if (vkResetFences(dev.device, 1, &retired.fence) != VK_SUCCESS) continue;
+        acquire_fence = retired.fence;
+        retired.fence = VK_NULL_HANDLE;
+        return true;
+    }
+    for (auto it = fences_let_go.begin(); it != fences_let_go.end(); ++it) {
+        VkFence was = *it;
+        VkResult r;
+        while ((r = vkWaitForFences(dev.device, 1, &was, VK_TRUE, 0)) == VK_NOT_READY) continue;
+        if (r == VK_ERROR_DEVICE_LOST) device_lost();
+        if (r == VK_SUCCESS && vkResetFences(dev.device, 1, &was) == VK_SUCCESS) {
+            fences_let_go.erase(it);
+            acquire_fence = was;
+            return true;
+        }
+        break;
+    }
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence made = VK_NULL_HANDLE;
     if (vkCreateFence(dev.device, &fi, nullptr, &made) != VK_SUCCESS) return false;
     acquire_fence = made;
     return true;
+}
+
+// Consume one retired acquire semaphore per copy after its fence signals; destroy via f.retired_acquire once copy completes.
+static VkSemaphore take_retired_acquire() {
+    if (retired_acquires.empty()) return VK_NULL_HANDLE;
+    static size_t next = 0;
+    next %= retired_acquires.size();
+    const auto it = retired_acquires.begin() + next;
+    if (it->fence) {
+        const VkResult ready = vkWaitForFences(dev.device, 1, &it->fence, VK_TRUE, 0);
+        if (ready == VK_ERROR_DEVICE_LOST) device_lost();
+        if (ready != VK_SUCCESS) { ++next; return VK_NULL_HANDLE; }
+        if (fences_let_go.size() < 8) fences_let_go.push_back(it->fence);
+        else vkDestroyFence(dev.device, it->fence, nullptr);
+    }
+    const VkSemaphore semaphore = it->semaphore;
+    retired_acquires.erase(it);
+    return semaphore;
 }
 
 void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
@@ -4780,7 +4897,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     Frame& f = frames[frame_index];
     const int log_slot = frame_index;
     frame_index = (frame_index + 1) % 3;
-    vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX);
+    const VkResult copy_ready = vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX);
+    if (copy_ready == VK_ERROR_DEVICE_LOST) device_lost();
+    if (copy_ready != VK_SUCCESS) return;
+    if (f.retired_acquire) {
+        vkDestroySemaphore(dev.device, f.retired_acquire, nullptr);
+        f.retired_acquire = VK_NULL_HANDLE;
+    }
     framelog_collect(log_slot);
     uint32_t index = 0;
     // Finite acquire: an infinite wait hard-locks the presentation thread (and with Reflex, the game) when the
@@ -4793,7 +4916,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     if (!was_held && !acquire_fence_ready()) return;
     if (was_held) index = held_image.index;
     VkResult res = VK_SUCCESS;
-    if (!was_held) res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, VK_NULL_HANDLE, acquire_fence, &index);
+    if (!was_held) res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, acquire_semaphore, acquire_fence, &index);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
         if (!unseen) logf("vk: the window is not shown (no image back in 100 ms): frames are not shown until it is");
@@ -4908,9 +5031,19 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    vkEndCommandBuffer(f.cmd);
-    // (no wait: the image was free before the copy was recorded, image_free above. Not on the timeline either: one queue runs
-    // submits in order, and a wait for a value another thread had counted but not yet submitted blocked the queue for good)
+    if (vkEndCommandBuffer(f.cmd) == VK_ERROR_DEVICE_LOST) device_lost();
+    // The CPU fence already proved the image is free; consume any binary semaphore signaled by acquire/retired acquires.
+    std::swap(f.acquired, acquire_semaphore);
+    VkSemaphoreSubmitInfo acquire_waits[2]{};
+    uint32_t acquire_wait_count = 0;
+    f.retired_acquire = take_retired_acquire();
+    for (VkSemaphore semaphore : {f.acquired, f.retired_acquire}) {
+        if (!semaphore) continue;
+        auto& wait = acquire_waits[acquire_wait_count++];
+        wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        wait.semaphore = semaphore;
+        wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    }
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = dev.swap_rendered[index];
     signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -4919,6 +5052,8 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cb;
+    si.waitSemaphoreInfoCount = acquire_wait_count;
+    si.pWaitSemaphoreInfos = acquire_waits;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
     std::unique_lock qk(dev.present_mu);

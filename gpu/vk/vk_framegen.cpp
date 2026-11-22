@@ -99,9 +99,20 @@ int64_t now_ns() {
 }
 
 int multiplier() {
+    if (!opts_fg_on()) return 1;
     // The menu step for this engine (DLSS up to 6x, FSR 2x, MasterSword 8x). Not past what that engine allows.
     const int hi = std::min(kMaxMult, std::max(opts_fg_mult_max(), 1));
     return std::clamp(opts.framegen, 1, hi);
+}
+
+// (relink, 0.7.9.3) Pacing without interpolation. The game's frames reach the window as the replay finishes them, and a
+// frame whose work ran a few milliseconds over is shown that much late and the next one early: the picture repeats on the
+// display though the rate is 60. This gives the game's frames alone the same display thread and even pacing line with no
+// frame made: each is copied once (the luma, the flow and the made frames are left out) and shown at its place, at most
+// RX_VK_PACE_CUSHION_MS (10) after it was handed over. Not with Low latency on. RX_VK_PACE_ONLY=0: off, as before.
+bool pace_only() {
+    static const bool on = !getenv("RX_VK_PACE_ONLY") || atoi(getenv("RX_VK_PACE_ONLY")) != 0;
+    return on && opts.pace != 0 && !opts_fg_on() && opts.reflex == 0;
 }
 
 
@@ -424,7 +435,19 @@ void display_main() {
             int64_t due = sched > 0 ? sched : now;
             if (!ms_pace && due < now) due = now;
             if (due > j.at + interval + step) due = j.at + interval + step;
-            const bool slipped = ms_pace && sched > 0 && now > due;
+            int64_t steer = 0;
+            const bool pacing_only = (shown == 1 && pace_only());
+            if (pacing_only) {   // (pacing only: the cushion's most)
+                static const int64_t most = (int64_t)std::clamp(getenv("RX_VK_PACE_CUSHION_MS") ? atoi(getenv("RX_VK_PACE_CUSHION_MS")) : 10, 0, 40) * 1000000;
+                const int64_t cushion = std::min(most, interval / 5 * 3);   // (and three fifths of a frame: a high rate's frame is short)
+                if (due < now) due = now;
+                if (due > j.at + cushion) due = j.at + cushion;
+                // (the cushion is kept, not only made by the first late frame: the line is steered, a tenth of a millisecond a
+                // frame at most, so that a frame on time waits four fifths of the cushion. The first late frame of a run of
+                // them then fits too, and a line that drifted (the frame time is an average) comes back)
+                steer = std::clamp<int64_t>((cushion / 5 * 4 - (due - j.at)) / 16, -100000, 100000);
+            }
+            const bool slipped = ms_pace && !pacing_only && sched > 0 && now > due;
             if (slipped) due = now;   /* late: show now and aim the next step from here, no catch-up short frame */
             if (due - now > 1000000) wait_until_near(due - now - 1000000);
             while (now_ns() < due) SwitchToThread();
@@ -445,7 +468,7 @@ void display_main() {
                 hist[d < 7000000 ? 0 : d < 9000000 ? 1 : d < 12000000 ? 2 : d < 17000000 ? 3 : d < 25000000 ? 4 : 5]++;
             }
             shown_at = t;
-            next_show = ms_pace && pace ? (slipped ? t + step : due + step) : t + step;
+            next_show = (ms_pace && pace && !pacing_only) ? (slipped ? t + step : due + step) : t + step + steer;
             (t - due > 2000000 ? stat.late : stat.on_time)++;
         }
         std::lock_guard lk(fg.mu);
@@ -465,10 +488,11 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    // Engine Off → no FG. MasterSword (1) = Hookshot native. DLSS MFG / SMFG / FSR / XeSS = same interpolator
-    // as a stand-in until Streamline/vendor FG evaluates (do not run Hookshot when engine is Off).
-    return (opts_fg_hookshot() || opts_fg_vendor()) && framegen_wanted(opts.framegen, allow) && !dev.offscreen &&
-           !fg.failed;
+    // Engine Off → no FG, unless Frame pacing alone is active (pace_only). MasterSword (1) = Hookshot native.
+    // DLSS MFG / SMFG / FSR / XeSS = same interpolator as a stand-in until vendor FG evaluates.
+    return (((opts_fg_hookshot() || opts_fg_vendor()) && framegen_wanted(opts.framegen, allow)) ||
+            (allow && pace_only())) &&
+           !dev.offscreen && !fg.failed;
 }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
@@ -748,9 +772,9 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     full_barrier(cmd);
     const int32_t pc[4] = {x0, y0, w, h};
     pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
-    pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
+    if (m > 1) pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     // AMD FSR 3.1's source with the HUD marked, when it is asked: read by fsr3fi_frame below
-    hud_source(cmd, cur, sw, sh, x0, y0, uw, uh);
+    if (m > 1) hud_source(cmd, cur, sw, sh, x0, y0, uw, uh);
     set->made = 0;
     // (NVIDIA DLSS Frame Generation through NGX where it runs and DLSS MFG is selected, vk_dlss.cpp)
     if (m > 1) {
@@ -778,7 +802,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
                    VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     full_barrier(cmd);
-    fg.have_prev = true;
+    fg.have_prev = m > 1;
     fg.cur = prev;
     fg.recorded = set;
     fg.recorded_at = now;

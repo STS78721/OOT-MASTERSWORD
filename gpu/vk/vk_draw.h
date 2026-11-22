@@ -27,6 +27,10 @@ std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::
 #include "vk_internal.h"
 #include "vk_state.h"
 
+namespace mesh_conv {
+struct Item;
+}
+
 namespace mkwvk {
 
 struct DrawArgs {
@@ -45,6 +49,8 @@ struct DrawArgs {
     // (longshot) an occlusion query around the draw, inside its pass (vk_replay.cpp, RX_VK_OCC_QUERIES); none when null
     VkQueryPool occ_pool = VK_NULL_HANDLE;
     uint32_t occ_query = 0;
+    // Indirect mesh draw op pointer in the command stream for RX_VK_MESH_CONV=2 batch lookup.
+    const void* op = nullptr;
 };
 
 /// A recording starts (its slot's descriptor pool and upload stream are reset); value: the timeline value it signals
@@ -64,6 +70,11 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
 void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool depth_mask, uint32_t stencil,
                          uint32_t stencil_mask);
 void clear_stats(int64_t* clears, int64_t* masked);
+/// RX_VK_MESH_CONV batched indirect mesh conversion helpers (mesh_conv.h / vk_draw.cpp).
+bool mesh_conv_batching();
+int mesh_conv_mode();
+void mesh_conv_batch(VkCommandBuffer cmd, const mesh_conv::Item* items, size_t n);
+void mesh_conv_stats(int64_t out[7]);
 /// indirect: the workgroup counts' GPU address (x, y, z unused)
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect);
 void dry_mark_written(NvnState& s, bool compute, bool first);   // (hookshot: the parallel replay's dry pass)

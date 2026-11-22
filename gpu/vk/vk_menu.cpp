@@ -352,7 +352,7 @@ Row rows[] = {
     {TAB_GRAPHICS, "Flow scale", &opts.fg_flow, 10, 100, 5, tx_percent,
      "Nodix Flow / motion strength (shown with SMFG). Higher follows fast camera moves more aggressively."},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
-     "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
+     "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay (10 ms at most without Frame generation; not with Low latency on)."},
     {TAB_GRAPHICS, "Mastersword Pacer (Experimental)", &opts.ms_pacer, 0, 1, 1, tx_onoff,
      "Experimental. Holds the game's own frames to an even beat. A frame more than 2 ms late starts a new beat, so the next one is not held for a full extra frame. Off uses the previous start-time cap."},
     {TAB_GRAPHICS, "Intel Hybrid CPU Patch", &opts.hybrid_cpu, 0, 1, 1, tx_hybrid,
@@ -1499,6 +1499,8 @@ static void probe_upscalers_soon() {
     });
 }
 
+void upscalers_probe_start() { probe_upscalers_soon(); }
+
 void startup_screen(const StartupView* view) {
     if (!view) {
         startup_on.store(false, std::memory_order_release);
@@ -2057,7 +2059,12 @@ void menu_tick() {
     } else if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
-        if (open_now.load()) opts.pad_layout = detect_pad_layout();
+        if (open_now.load()) {
+            const int64_t t0 = prof_now();
+            opts.pad_layout = detect_pad_layout();
+            const int64_t dt = prof_now() - t0;
+            if (dt > 50000000LL) logf("menu: the opening took %.0f ms", (double)dt / 1e6);
+        }
     }
     if (open_now.load() && page == 5) {
         if (mouse) {

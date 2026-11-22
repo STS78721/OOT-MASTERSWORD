@@ -7,6 +7,7 @@
 //
 // Pipelines persist in a VkPipelineCache next to the executable (mkw_vk_pipelines.bin).
 #include <algorithm>
+#include <optional>
 #include <tuple>
 #include <filesystem>
 #include <atomic>
@@ -56,6 +57,7 @@
 #include "quick_pipe.h"   // (Longshot ae96bad3: quick pipelines)
 #include "prepare_workers.h"
 #include "direct_ub_snapshot.h"
+#include "mesh_conv.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -3378,6 +3380,107 @@ thread_local SkySums sky_sums{};
 thread_local SkySums meter_out{};   // (RX_VK_METER_ZERO: where an exposure program's sums were bound)
 constexpr uint64_t kSkySumsProgram = 0x499dbfd0721d2858ull, kSkyRgblProgram = 0xab7699ee7f536755ull;
 
+uint32_t handle_table_live(uint32_t count, uint32_t off0, uint32_t off1, uint64_t size, uint32_t n, uint32_t cap) {
+    if (off1 <= off0) return count;
+    const uint64_t record = off1 - off0;
+    if (record < 4 || off0 < 16 || off0 - 16 >= record) return count;
+    if (!cap || size < 16 || (size - 16) / record != cap || n > cap) return count;
+    return std::min(count, n);
+}
+bool handle_table_count_on() {
+    static const bool on = !getenv("RX_VK_HANDLE_TABLE_COUNT") || atoi(getenv("RX_VK_HANDLE_TABLE_COUNT")) != 0;
+    return on;
+}
+void stage_handles_counted(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint32_t* out, uint64_t key) {
+    if (program >= st.info.handle_programs.size()) {
+        std::fill(out, out + count, 0u);
+        return;
+    }
+    struct Word { uint32_t index, offset, value; };
+    std::array<Word, 16> words;
+    size_t num_words = 0;
+    const auto read_cbuf = [&](uint32_t index, uint32_t offset) -> uint32_t {
+        for (size_t w = 0; w < num_words; w++)
+            if (words[w].index == index && words[w].offset == offset) return words[w].value;
+        const uint32_t value = stage_cbuf_word(s, st, index, offset);
+        if (num_words < words.size()) words[num_words++] = {index, offset, value};
+        return value;
+    };
+    static const bool live_mem = getenv("RX_VK_HANDLES_LIVE") != nullptr;
+    auto read_mem32 = [&](uint64_t addr) -> uint32_t {
+        uint32_t v = 0;
+        if (addr) {
+            if (live_mem) host->gpu_read(addr, &v, 4);
+            else ub_read(addr, &v, 4);
+        }
+        return v;
+    };
+    static_assert(Shader::Info::MAX_SSBOS <= 64, "one bit a binding");
+    std::array<uint64_t, Shader::Info::MAX_SSBOS> bases{};
+    uint64_t known = 0;
+    const auto storage_base = [&](uint32_t binding) -> uint64_t {
+        if (binding >= st.info.storage_buffers_descriptors.size() || binding >= bases.size()) return 0;
+        if (!(known >> binding & 1)) {
+            const auto& d = st.info.storage_buffers_descriptors[binding];
+            bases[binding] = stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset) |
+                             (uint64_t)stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset + 4) << 32;
+            known |= uint64_t{1} << binding;
+        }
+        return bases[binding];
+    };
+    const auto read_storage = [&](uint32_t binding, uint32_t offset) -> uint32_t {
+        if (binding >= bases.size()) return 0u;
+        const uint64_t b = storage_base(binding);
+        return b ? read_mem32(b + offset) : 0u;
+    };
+    const auto& code = st.info.handle_programs[program];
+    uint32_t capacity = 0;
+    const uint32_t live = [&]() -> uint32_t {
+        if (count < 2 || !handle_table_count_on()) return count;
+        uint32_t table = ~0u, reads = 0;
+        const auto read_offset = [&](uint32_t binding, uint32_t offset) -> uint32_t {
+            table = binding, ++reads;
+            return offset;
+        };
+        const auto offset_of = [&](uint32_t k) -> std::optional<uint32_t> {
+            reads = 0;
+            const auto off = Shader::EvaluateHandleProgram(code, read_cbuf, read_offset, k);
+            return reads == 1 ? off : std::nullopt;
+        };
+        const auto first = offset_of(0), second = offset_of(1);
+        if (!first || !second || *second <= *first) return count;
+        const uint32_t off0 = *first, off1 = *second;
+        for (const uint32_t k : {2u, count - 1}) {
+            if (k < 2 || k >= count) continue;
+            const auto off = offset_of(k);
+            if (!off || *off != off0 + k * (off1 - off0)) return count;
+        }
+        if (table >= st.info.storage_buffers_descriptors.size() || table >= bases.size()) return count;
+        if (off0 < 16 || off0 - 16 >= off1 - off0) return count;
+        const uint64_t base = storage_base(table);
+        if (!base || (base & 15)) return count;
+        const auto& d = st.info.storage_buffers_descriptors[table];
+        const uint64_t size = read_cbuf(d.cbuf_index, d.cbuf_offset + 8);
+        uint32_t header[3]{};
+        if (!ub_read(base, header, sizeof header)) return count;
+        capacity = header[2];
+        return handle_table_live(count, off0, off1, size, header[0], capacity);
+    }();
+    for (uint32_t k = 0; k < live; k++) out[k] = Shader::EvaluateHandleProgram(code, read_cbuf, read_storage, k).value_or(0u);
+    if (live >= count) return;
+    std::fill(out + live, out + count, 0u);
+    static thread_local uint64_t last_told = ~0ULL;
+    if (key == last_told) return;
+    last_told = key;
+    static std::mutex told_mu;
+    static std::vector<uint64_t> told;
+    std::lock_guard lk(told_mu);
+    if (told.size() >= 64 || std::find(told.begin(), told.end(), key) != told.end()) return;
+    told.push_back(key);
+    logf("vk: handle table: program %016llx: %u of its %u elements are the game's (its table's count; capacity %u): the others "
+         "name nothing (RX_VK_HANDLE_TABLE_COUNT=0: every element)", (unsigned long long)key, live, count, capacity);
+}
+
 void build_descriptors(const NvnState& s, const Program& p) {
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (bound again below)
     if (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) meter_out = {};
@@ -3735,7 +3838,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
             // are read once
             static thread_local std::vector<uint32_t> table;
             const bool is_table = d.handle_program != ~0U && d.count > 1;
-            if (is_table) table.resize(d.count), stage_handles(s, st, d.handle_program, d.count, table.data());
+            if (is_table) table.resize(d.count), stage_handles_counted(s, st, d.handle_program, d.count, table.data(), p.key);
             uint32_t prev_handle = 0;
             VkImageView prev_view = VK_NULL_HANDLE;
             Texture* prev_tex = nullptr;
@@ -5314,8 +5417,13 @@ void draw_flush_recording(int slot) {
     }
 }
 
+namespace {
+void mesh_conv_begin_recording();
+} // namespace
+
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     rec_cmd = cmd;
+    mesh_conv_begin_recording();
     rec_value = value;
     RecordingRes* rp = nullptr;
     {
@@ -6481,20 +6589,106 @@ constexpr uint64_t kMeshRing = 4ull << 20;
 VkBuffer mesh_ring = VK_NULL_HANDLE;
 VmaAllocation mesh_ring_mem = nullptr;
 std::mutex mesh_ring_mu;
-uint64_t mesh_ring_at = 0;
+uint64_t mesh_ring_at = 0;   // Monotonic byte cursor (slots aligned to 48 bytes; wraps modulo kMeshRing).
+std::atomic<uint64_t> mesh_ring_pos{0};
+std::atomic<bool> mesh_ring_filled{false};   // Pre-filled with 1s once so copies only write count words.
 thread_local VkBuffer mesh_conv_buf = VK_NULL_HANDLE;   // (the converted records for the draw in progress)
 thread_local uint64_t mesh_conv_off = 0;
 thread_local uint32_t mesh_conv_n = 0;   // (how many records were converted: the draw asks for no more)
-bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
-    mesh_conv_buf = VK_NULL_HANDLE;
+thread_local int mesh_mode = 0;
+TLS_OBJECT(mesh_batch, mesh_conv::Batch)
+enum { kMcOne, kMcBatched, kMcBatches, kMcBatchItems, kMcDropped, kMcStale, kMcNoMesh, kMcCount };
+std::atomic<int64_t> st_mc[kMcCount];
+bool mesh_raw_mode() {
     static const bool raw = getenv("RX_VK_MESH_IND_RAW") && atoi(getenv("RX_VK_MESH_IND_RAW")) != 0;
+    return raw;
+}
+uint32_t mesh_count_word() {
     static const uint32_t word = getenv("RX_VK_MESH_IND_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_IND_COUNT_WORD")) & 3 : 0;
+    return word;
+}
+bool mesh_args_rewrite() {
     // (amd-fix: the rewrite with the firsts in the draw does it, RX_VK_MESH_ARGS; this one drew every draw from its first 0)
     static const bool rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
-    if (raw || rewrite || !d.mesh || !d.indirect) return false;
+    return rewrite;
+}
+/// Allocate the indirect mesh ring and pre-fill it once with 1s under a fenced submit. mesh_ring_mu held.
+bool mesh_ring_make() {
+    void* unused = nullptr;
+    if (!create_buffer(kMeshRing, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, mesh_ring,
+                       mesh_ring_mem, &unused))
+        return false;
+    VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpci.queueFamilyIndex = dev.queue_family;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (vkCreateCommandPool(dev.device, &cpci, nullptr, &pool) != VK_SUCCESS) return true;
+    VkCommandBufferAllocateInfo cba{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cba.commandPool = pool, cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, cba.commandBufferCount = 1;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    bool sent = false;
+    if (vkAllocateCommandBuffers(dev.device, &cba, &c) == VK_SUCCESS && vkCreateFence(dev.device, &fci, nullptr, &fence) == VK_SUCCESS) {
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(c, &bi);
+        vkCmdFillBuffer(c, mesh_ring, 0, VK_WHOLE_SIZE, 1u);
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(c, &di);
+        if (vkEndCommandBuffer(c) == VK_SUCCESS) {
+            VkCommandBufferSubmitInfo csi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+            csi.commandBuffer = c;
+            VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &csi;
+            std::lock_guard qk(dev.present_mu);
+            queue_flush_locked();
+            sent = vkQueueSubmit2(dev.queue, 1, &si, fence) == VK_SUCCESS;
+        }
+    }
+    const bool filled = sent && vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+    mesh_ring_filled.store(filled, std::memory_order_release);
+    if (filled || !sent) {
+        if (fence) vkDestroyFence(dev.device, fence, nullptr);
+        vkDestroyCommandPool(dev.device, pool, nullptr);
+    }
+    logf("vk: the indirect mesh draws' ring (%llu MB) %s", (unsigned long long)(kMeshRing >> 20),
+         filled ? "made and filled with 1s" : "made, but its fill did not complete: each draw fills its slot (RX_VK_MESH_CONV=0)");
+    return true;
+}
+bool mesh_ring_slot(uint32_t n, uint64_t* off, uint64_t* start) {
+    std::lock_guard lk(mesh_ring_mu);
+    if (!mesh_ring && !mesh_ring_make()) return false;
+    *off = mesh_conv::take(mesh_ring_at, kMeshRing, n, start);
+    mesh_ring_pos.store(mesh_ring_at, std::memory_order_relaxed);
+    return true;
+}
+bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
+    mesh_conv_buf = VK_NULL_HANDLE;
+    if (mesh_raw_mode() || mesh_args_rewrite() || !d.mesh || !d.indirect) return false;
+    const int mode = mesh_mode;
+    if (mode >= 1 && !dev.mesh_shader) {
+        st_mc[kMcNoMesh].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (mode >= 2 && mesh_ring_filled.load(std::memory_order_acquire)) {
+        if (const mesh_conv::Entry* e = mesh_batch().take(cmd, d.op)) {
+            if (mesh_conv::still_holds(mesh_ring_pos.load(std::memory_order_relaxed), e->start, kMeshRing)) {
+                st_mc[kMcBatched].fetch_add(1, std::memory_order_relaxed);
+                mesh_conv_buf = mesh_ring, mesh_conv_off = e->off;
+                mesh_conv_n = (uint32_t)std::clamp(d.max, 1, (int)mesh_conv::kMaxRecords);
+                return true;
+            }
+            st_mc[kMcStale].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     PROF_EXACT();   // (a pass ended and three barriers: not one of the cheap per-draw steps PROF_DRAW samples)
-    const uint32_t n = (uint32_t)std::clamp(d.max, 1, 4096);
-    if (d.max < 1 || d.max > 4096) {
+    const uint32_t word = mesh_count_word();
+    const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)mesh_conv::kMaxRecords);
+    if (d.max < 1 || d.max > (int)mesh_conv::kMaxRecords) {
         static std::atomic<int> told{0};
         if (told++ < 10)
             logf("vk: a mesh indirect draw of %d records: %u converted and drawn", d.max, n);
@@ -6502,41 +6696,99 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
     const uint32_t stride = d.stride > 0 ? (uint32_t)d.stride : 8;
     const BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)(n - 1) * stride + 4 * (word + 1), false);
     if (!args) return false;
-    uint64_t off;
-    {
-        std::lock_guard lk(mesh_ring_mu);
-        if (!mesh_ring) {
-            void* unused = nullptr;
-            if (!create_buffer(kMeshRing, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, mesh_ring,
-                               mesh_ring_mem, &unused))
-                return false;
-        }
-        const uint64_t bytes = ((uint64_t)n * 12 + 15) & ~15ull;
-        if (mesh_ring_at + bytes > kMeshRing) mesh_ring_at = 0;   // (4 MB: frames of draws before it comes round)
-        off = mesh_ring_at;
-        mesh_ring_at += bytes;
-    }
+    uint64_t off = 0, start = 0;
+    if (!mesh_ring_slot(n, &off, &start)) return false;
+    st_mc[kMcOne].fetch_add(1, std::memory_order_relaxed);
     end_pass(cmd);
-    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
-    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier2(cmd, &di);
-    vkCmdFillBuffer(cmd, mesh_ring, off, (uint64_t)n * 12, 1u);
-    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier2(cmd, &di);
-    std::vector<VkBufferCopy> regions(n);
-    for (uint32_t i = 0; i < n; i++) regions[i] = {args.offset + (uint64_t)i * stride + 4 * word, off + (uint64_t)i * 12, 4};
-    vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions.data());
-    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    mb.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, mb.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
-    vkCmdPipelineBarrier2(cmd, &di);
+    GprofSpan gp(cmd, "meshconv (an indirect mesh draw's arguments -> {count, 1, 1}, with its barriers)");
+    static thread_local std::vector<VkBufferCopy> regions;
+    regions.resize(n);
+    for (uint32_t i = 0; i < n; i++) regions[i] = {args.offset + (uint64_t)i * stride + 4 * word, off + (uint64_t)i * mesh_conv::kRecord, 4};
+    if (mode >= 1 && mesh_ring_filled.load(std::memory_order_acquire)) {
+        full_barrier(cmd, "barrier (before an indirect mesh draw's arguments)");
+        vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions.data());
+        full_barrier(cmd, "barrier (after an indirect mesh draw's arguments)");
+    } else {
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier2(cmd, &di);
+        vkCmdFillBuffer(cmd, mesh_ring, off, (uint64_t)n * mesh_conv::kRecord, 1u);
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier2(cmd, &di);
+        vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions.data());
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, mb.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
     mesh_conv_buf = mesh_ring, mesh_conv_off = off, mesh_conv_n = n;
     return true;
 }
+void mesh_batch_drop() {
+    if (!mesh_batch().live()) return;
+    st_mc[kMcDropped].fetch_add((int64_t)(mesh_batch().e.size() - mesh_batch().next), std::memory_order_relaxed);
+    mesh_batch().clear();
+}
+void mesh_conv_begin_recording() {
+    static const int env = getenv("RX_VK_MESH_CONV") ? std::clamp(atoi(getenv("RX_VK_MESH_CONV")), 0, 2) : 2;
+    mesh_mode = env;
+    mesh_batch().clear();
+}
 } // namespace
+bool mesh_conv_batching() { return mesh_mode >= 2 && dev.mesh_shader && !mesh_raw_mode() && !mesh_args_rewrite(); }
+int mesh_conv_mode() { return mesh_mode; }
+void mesh_conv_batch(VkCommandBuffer cmd, const mesh_conv::Item* items, size_t n) {
+    mesh_batch().clear();
+    if (!n || !mesh_conv_batching()) return;
+    {
+        std::lock_guard lk(mesh_ring_mu);
+        if (!mesh_ring && !mesh_ring_make()) return;
+    }
+    if (!mesh_ring_filled.load(std::memory_order_acquire)) return;
+    PROF_EXACT();
+    const uint32_t word = mesh_count_word();
+    struct Copy {
+        BufferRef args;
+        uint32_t n, stride;
+        uint64_t off, start;
+        const void* op;
+    };
+    static thread_local std::vector<Copy> copies;
+    copies.clear();
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t k = (uint32_t)std::clamp(items[i].max, 1, (int)mesh_conv::kMaxRecords);
+        const uint32_t stride = items[i].stride > 0 ? (uint32_t)items[i].stride : 8;
+        const BufferRef args = gpu_buffer_bind(items[i].indirect, (uint64_t)(k - 1) * stride + 4 * (word + 1), false);
+        if (args) copies.push_back({args, k, stride, 0, 0, items[i].op});
+    }
+    if (copies.empty()) return;
+    {
+        std::lock_guard lk(mesh_ring_mu);
+        for (Copy& c : copies) c.off = mesh_conv::take(mesh_ring_at, kMeshRing, c.n, &c.start);
+        mesh_ring_pos.store(mesh_ring_at, std::memory_order_relaxed);
+    }
+    end_pass(cmd);
+    GprofSpan gp(cmd, "meshconv batch (the indirect mesh draws' arguments after a barrier of the game's, with its barrier)");
+    full_barrier(cmd, "barrier (before the indirect mesh draws' arguments)");
+    static thread_local std::vector<VkBufferCopy> regions;
+    for (const Copy& c : copies) {
+        regions.resize(c.n);
+        for (uint32_t i = 0; i < c.n; i++)
+            regions[i] = {c.args.offset + (uint64_t)i * c.stride + 4 * word, c.off + (uint64_t)i * mesh_conv::kRecord, 4};
+        vkCmdCopyBuffer(cmd, c.args.buffer, mesh_ring, c.n, regions.data());
+        mesh_batch().e.push_back({c.op, c.off, c.start});
+    }
+    full_barrier(cmd, "barrier (after the indirect mesh draws' arguments)");
+    mesh_batch().cmd = cmd;
+    st_mc[kMcBatches].fetch_add(1, std::memory_order_relaxed);
+    st_mc[kMcBatchItems].fetch_add((int64_t)copies.size(), std::memory_order_relaxed);
+}
+void mesh_conv_stats(int64_t out[7]) {
+    for (int i = 0; i < kMcCount; i++) out[i] = st_mc[i].exchange(0, std::memory_order_relaxed);
+}
 // (hookshot) NVN's indirect mesh draws hold (count, first) and Vulkan's (x, y, z): given as they were, every one drew y = first = 0 workgroups,
 // with no error. They are most of the game's vegetation: the forest's trees, ferns and grass (GPU culling writes their counts, so they can only
 // be moved on the GPU): each count is copied into this buffer of (count, 1, 1) just before its draw. The GPU runs the copies and draws in
@@ -7391,6 +7643,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     const VkPipeline pl = pe->pipeline;
     if (!pl) SKIP_HERE();
     cur_program = &p;
+    if (mesh_batch().live() && writes_memory(p)) mesh_batch_drop();
     sheikah_sensor(p);   // (MasterSword Sheikah Sensor: what play really draws, vk_mempack.cpp)
     const int64_t fine_skin_t0 = g_fine ? prof_now() : 0;
     SkinnedDraw skinned;
@@ -8950,6 +9203,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
 
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     PROF_HOT(PROF_DISPATCH);
+    mesh_batch_drop();
     DispatchClock dclock;
     s.grid[0] = indirect ? 1 : x, s.grid[1] = indirect ? 1 : y, s.grid[2] = indirect ? 1 : z;
     if (indirect) {   // (the program may read its grid from c0: the counts as the GPU will see them, best effort)

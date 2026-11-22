@@ -73,6 +73,12 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
 /// costs one atomic load
 void temporal_idle();
 void temporal_reset_failure();
+/// (longshot, smoothness) RX_VK_DLSS_PREWARM (on by default; 0: off): DLSS's feature made before the game's first 3D frame.
+/// Also (vk_dlss.cpp prepare): DLSS at a full-size frame takes the scaled mode that holds it, not a DLAA-mode feature.
+bool temporal_prewarm_on();
+void temporal_prewarm(VkCommandBuffer cmd);
+void temporal_note_frame(int64_t draws);
+void temporal_note_present(uint32_t width, uint32_t height);
 
 /// For the renderer's status line (vk_replay.cpp status_tick): while an engine draws, its details since the last call into b
 /// ("; DLSS: jitter ..., actor motion ..., its images ... MB") and temporal_mode(); else 0 and b left alone
@@ -93,6 +99,7 @@ struct TemporalImage {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+    VkImageUsageFlags usage = 0;
 };
 /// One frame's evaluation. color: the scene as the network samples it (tonemapped, square-root encoded: LDR, RGBA16F);
 /// depth: R32F in [0, 1], not reversed (reversed, 1 - d, for an engine with fsr_depth where the projection puts the near

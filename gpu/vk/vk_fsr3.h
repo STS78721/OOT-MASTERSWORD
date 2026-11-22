@@ -42,6 +42,7 @@ struct Inputs {
     fsr3_math::Camera camera;     ///< device_to_view_depth (fsr3_math.h)
     float frame_time_ms = 16.667f;
     bool reset = false;
+    VkImageView output = VK_NULL_HANDLE;
 };
 
 /// Whether this device can run the passes: push descriptors enough for the widest pass, storage images in every format the
@@ -55,8 +56,8 @@ struct Inputs {
 /// passes cannot run here (for good). vk_fsr3.cpp's engine of the temporal chain calls it from its prepare
 [[nodiscard]] int prepare_sizes(uint32_t render_width, uint32_t render_height, uint32_t upscale_width, uint32_t upscale_height);
 
-/// Records one evaluation into output_image(), making the pipelines and the internal images at these sizes first (again
-/// when they change). False when something could not be made or the inputs are not usable
+/// Records one evaluation into in.output (or output_image() when null), making the pipelines and the internal images at these
+/// sizes first (again when they change). False when something could not be made or the inputs are not usable
 [[nodiscard]] bool upscale(VkCommandBuffer cmd, const Inputs& in);
 
 /// (hookshot) Lets the internal images go (freed once the GPU's uses of them are done); the next prepare_sizes or upscale makes

@@ -383,6 +383,8 @@ void vma_log_image_blocks();
 uint64_t allocation_size(VmaAllocation allocation);
 /// Device memory backing a VMA allocation (for Streamline/NGX Vulkan resource tags).
 bool allocation_device_memory(VmaAllocation allocation, VkDeviceMemory* memory, VkDeviceSize* offset = nullptr);
+/// Whether a VMA allocation landed in device-local VRAM (not host-visible system memory).
+bool allocation_in_vram(VmaAllocation allocation);
 /// (dedicated: its own memory object, not a share of a 64 MB block: for the 16 to 32 MB ones that fit two to a block and leave
 /// the rest of it free; RX_VK_BLOCK_BUFFERS=1: as before)
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,

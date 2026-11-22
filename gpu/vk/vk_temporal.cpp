@@ -116,8 +116,19 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
-    TemporalImage shown() const { return {image, view, format, width, height}; }
+    VkImageUsageFlags usage = 0;
+    TemporalImage shown() const { return {image, view, format, width, height, usage}; }
 };
+
+void stage_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                   VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src_stage, b.srcAccessMask = src_access;
+    b.dstStageMask = dst_stage, b.dstAccessMask = dst_access;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
 
 struct Camera {
     float current[16]{};      // (its view-projection)
@@ -218,6 +229,7 @@ struct State {
     struct Dead { uint64_t frame; uint64_t value; std::function<void()> free; };
     std::vector<Dead> dead;   // (what work in flight may still use: freed once frames and timeline pass)
     uint64_t asked = 0;       // (the frame an upscale last asked for an engine: temporal_idle)
+    std::atomic<uint64_t> asked_frame{0};
     std::atomic<bool> holding{false};   // (an engine's state, images or frees still to do: temporal_idle has something to let go)
 };
 State& st() {
@@ -302,7 +314,7 @@ bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uin
         destroy_image(im.image, im.memory);
         return im = {}, false;
     }
-    im.format = format, im.width = w, im.height = h;
+    im.format = format, im.width = w, im.height = h, im.usage = ic.usage;
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE, b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -640,7 +652,9 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     std::memcpy(head + 16, before, 64);
     head[32] = cam.jitter[0], head[33] = cam.jitter[1], head[34] = (float)rw, head[35] = (float)rh;
     flush_mapped(u.memory, dlss_actor::kHeadWords * 4);
-    full_barrier(cmd);   // (the poses copied)
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT);   // (the poses copied)
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     ca.imageView = s.motion.view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -857,6 +871,112 @@ void temporal_idle() {
     s.last_frame = 0;   // (a new history when it comes back)
     free_dead(false);
     s.holding = !s.dead.empty();
+}
+
+// ---- (longshot, smoothness) DLSS's feature made before the game's first 3D frame (vk_temporal.h temporal_prewarm_on) ----
+namespace {
+std::atomic<int64_t> prewarm_draws{1 << 30};   // (the last frame's draws: none known yet, not light)
+std::atomic<uint64_t> prewarm_present{0};      // (the game's last picture, width << 32 | height)
+}  // namespace
+
+bool temporal_prewarm_on() {
+    static const bool on = env_switch("RX_VK_DLSS_PREWARM") != 0;
+    return on;
+}
+void temporal_note_frame(int64_t draws) { prewarm_draws.store(draws, std::memory_order_relaxed); }
+void temporal_note_present(uint32_t width, uint32_t height) {
+    prewarm_present.store((uint64_t)width << 32 | height, std::memory_order_relaxed);
+}
+
+void temporal_prewarm(VkCommandBuffer cmd) {
+    static bool probed = false;   // (the replay thread's alone)
+    if (!probed) {
+        probed = true;
+        if (dev.offscreen && env_switch("RX_VK_PROBE_HEADLESS") != 0) {
+            logf("vk: upscaler: no window: the upscalers asked in the background as the start-up screen does "
+                 "(RX_VK_PROBE_HEADLESS=0: at the first upscale)");
+            upscalers_probe_start();
+        }
+    }
+    static bool done = false;
+    static int warmed_mode = -1, seen_mode = -1, warmed_n = 0;
+    static uint64_t warmed_pic = 0, seen_since = 0;
+    if (done || !cmd || !temporal_prewarm_on()) return;
+    State& s = st();
+    if (s.asked_frame.load(std::memory_order_relaxed)) {
+        done = true;
+        return;
+    }
+    const int mode = temporal_mode();
+    const uint64_t frame = texture_frame_no();
+    if (mode != seen_mode) seen_mode = mode, seen_since = frame;
+    if (prewarm_draws.load(std::memory_order_relaxed) >= 200) return;   // (a light frame: title, file select, loading screen)
+    if (!ur::is_dlss(mode) || frame - seen_since < 30) return;          // (another Upscaler now, or the row just changed)
+    const uint64_t pic = prewarm_present.load(std::memory_order_relaxed);
+    if (mode == warmed_mode && pic == warmed_pic) return;               // (made for this already)
+    const int ngx = dlss_ngx_ready();
+    if (ngx < 0) return;                                                // (NGX not started yet)
+    const uint32_t ow = (uint32_t)(pic >> 32), oh = (uint32_t)pic;
+    if (ngx == 0 || !ow || !oh) {
+        if (ngx == 0) done = true;
+        return;
+    }
+    std::lock_guard lk(s.mu);
+    if (s.asked || (s.drawing && warmed_mode < 0)) {
+        done = true;
+        return;
+    }
+    warmed_mode = mode, warmed_pic = pic;
+    if (++warmed_n >= 4) done = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    Engine& engine = engine_of(mode);
+    if (!engine.e || engine.failed) return;
+    if (!engine.started) engine.started = true, engine.ok = engine.e->start();
+    if (!engine.ok) return;
+    if (!make_pipelines()) return;
+    (void)make_actor_pipeline();
+    const bool native = ur::full_scale(mode);
+    const uint32_t rw = ow, rh = oh;
+    struct Disturbed {
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    full_barrier(cmd);
+    uint32_t iw = rw, ih = rh;
+    const char* why = nullptr;
+    const int ready = engine.e->prepare(cmd, rw, rh, native ? rw : ow, native ? rh : oh, &iw, &ih, &why);
+    if (ready <= 0) {
+        logf("vk: %s: not made ahead (%s)", name_of(mode), why ? why : "not now");
+        return;
+    }
+    s.drawing = engine.e;   // (temporal_idle lets it go if the row leaves DLSS before the game draws)
+    s.holding = true;
+    s.last_frame = 0;       // (the first gameplay frame starts a new history)
+    const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih, VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+        !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih, copied) ||
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied) ||
+        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, native ? rw : ow, native ? rh : oh,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        logf("vk: %s: made ahead, its images were not", name_of(mode));
+        return;
+    }
+    full_barrier(cmd);
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    for (const Image* im : {&s.color, &s.depth, &s.motion, &s.output})
+        vkCmdClearColorImage(cmd, im->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+    full_barrier(cmd);
+    TemporalFrame warm;
+    warm.color = s.color.shown(), warm.depth = s.depth.shown(), warm.motion = s.motion.shown(), warm.output = s.output.shown();
+    warm.render_w = rw, warm.render_h = rh;
+    warm.reset = true;
+    warm.jitter_phases = (uint32_t)dlss_jitter_phases(rw, rh, native ? rw : ow, native ? rh : oh);
+    const bool evaluated = engine.e->evaluate(cmd, warm);
+    full_barrier(cmd);
+    logf("vk: %s: its feature made ahead of the game's first 3D frame for %ux%u (%.1f ms of the replay's, a light frame%s; "
+         "RX_VK_DLSS_PREWARM)",
+         name_of(mode), ow, oh, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+         evaluated ? ", one evaluation" : ", its evaluation failed");
 }
 
 // ---- the depth draws of hidden meshes (vk_draw.cpp hidden_depth_draw) ----
@@ -1120,7 +1240,8 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
 
     Engine& engine = engine_of(mode);
     if (!engine.e || engine.failed) return fail("it failed earlier");
-    s.asked = texture_frame_no(), s.holding = true;   // (not after a failure: what it holds is let go, temporal_idle)
+    const uint64_t fno = texture_frame_no();
+    s.asked = fno, s.asked_frame.store(fno ? fno : 1, std::memory_order_relaxed), s.holding = true;   // (not after a failure: what it holds is let go, temporal_idle)
     if (!in || !in_view || !out || !out_view) return fail("no input or output view");
     if (!cam.valid || texture_frame_no() - cam.frame > 1) return fail("no scene camera this frame");
     if (cam.depth_gen != texture_destroy_generation()) return fail("the scene depth may be gone");
@@ -1225,16 +1346,30 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         vkCmdPushConstants(cmd, s.prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
     };
-    full_barrier(cmd);   // (the scene's colour and depth, written before)
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT);   // (the scene's colour, depth, and actor buffers, written before)
     prep();
-    full_barrier(cmd);
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT);
     // (what moves by itself: the skinned draws drawn again over the camera's motion, with their own)
     const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion);
-    if (actors) full_barrier(cmd);
+    if (actors)
+        stage_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     if (show_motion && actors) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = 4;
         prep();
-        full_barrier(cmd);
+        stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
@@ -1260,7 +1395,6 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         engine.failed = true;
         return false;   // (the network writes its output over whatever the evaluation did)
     }
-    full_barrier(cmd);
     {
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
         const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},

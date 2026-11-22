@@ -730,7 +730,7 @@ Staging staging(uint64_t n, uint64_t align = 256) {
 
 // ---- the GPU ASTC decoder (Eden's) ----
 struct AstcPush {
-    uint32_t block_dims[2], layer_stride, block_size, x_shift, block_height, block_height_mask, native_tiling;
+    uint32_t block_dims[2], layer_stride, block_size, x_shift, block_height, block_height_mask, native_tiling, blocks_x, blocks_y;
 };
 VkDescriptorSetLayout astc_set = VK_NULL_HANDLE;
 VkPipelineLayout astc_layout = VK_NULL_HANDLE;
@@ -839,6 +839,44 @@ uint32_t bc_layers() {
     static const uint32_t n = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
     return n;
 }
+constexpr uint32_t kBcSmallDim = 1024, kBcTinyDim = 256;
+uint32_t bc_small_px = kBcSmallDim;   // (the small scratch's side as it was made: bc_scratch_make, bc_mu held)
+bool bc_copy_per_layer() {
+    static const bool on = [] {
+        if (const char* e = getenv("RX_VK_BC_COPY_PER_LAYER")) return atoi(e) != 0;
+#ifdef _WIN32
+        return dev.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY;
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
+/// Small-scratch layers decoded/encoded per run (1024x1024, or 256x256 on <6 GB cards for single-layer BC3 mip groups).
+/// Defaults to 8 on NVIDIA, RADV, and AMD Windows (with per-layer non-4-aligned mip-tail copies) and 1 elsewhere.
+uint32_t bc_small_layers() {
+    static const uint32_t n = getenv("RX_VK_BC_SMALL_LAYERS")
+                                  ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_SMALL_LAYERS")), 1u, kBcLayers)
+                                  : (dev.driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY || dev.driver_id == VK_DRIVER_ID_MESA_RADV
+#ifdef _WIN32
+                                         || dev.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
+#endif
+                                         ? kBcLayers
+                                         : 1u);
+    return n;
+}
+bool bc_levels_on() {
+    static const bool on = !getenv("RX_VK_BC_LEVELS") || atoi(getenv("RX_VK_BC_LEVELS")) != 0;
+    return on;
+}
+bool low_vram_texture_mips() {
+    static const bool small = [] {
+        if (const char* e = getenv("RX_VK_ASTC_BC_ALL")) return e[0] == '1';
+        uint64_t used = 0, allowed = 0;
+        return vram_usage(&used, &allowed) && allowed && allowed < (6ull << 30);
+    }();
+    return small;
+}
 /// (hookshot) RX_VK_ASTC_BC7=1: big ASTC textures as BC7 instead of BC3. Both are 8 bits a texel; BC7's mode 6 keeps
 /// the colours' gradients and alpha much better (the encoder is host_shaders/bc7_encoder.comp).
 bool bc7_enabled() {
@@ -853,6 +891,10 @@ VmaAllocation bc_scratch_alloc = nullptr;
 VkImageView bc_scratch_view = VK_NULL_HANDLE;
 VkBuffer bc_out = VK_NULL_HANDLE;
 VmaAllocation bc_out_alloc = nullptr;
+VkImage bc_small = VK_NULL_HANDLE;
+VmaAllocation bc_small_alloc = nullptr;
+VkImageView bc_small_view = VK_NULL_HANDLE;
+VkImageView bc_small_layer[8] = {};
 bool bc_scratch_fresh = false;   // (its layout still to be set, in the next upload command buffer)
 // (hookshot-amd) a second scratch for textures re-encoded at another size (uneven block levels on AMD): the decoded level
 // is blitted into it, filtered, at the image's size, and encoded from there. Made when an upload of such a texture first
@@ -894,7 +936,52 @@ bool bc_scratch_make() {   // (bc_mu held)
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vi.format = VK_FORMAT_R8G8B8A8_UNORM;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bc_layers()};
-    const uint64_t out = (uint64_t)(kBcDim / 4) * (kBcDim / 4) * bc_layers() * 16;
+    const uint32_t slayers = bc_small_layers();
+    const bool tiny = low_vram_texture_mips() && bc_levels_on();
+    if (slayers > 1 && (!low_vram_texture_mips() || tiny)) {
+        bc_small_px = tiny ? kBcTinyDim : kBcSmallDim;
+        VkImageCreateInfo si = ii;
+        si.extent = {bc_small_px, bc_small_px, 1};
+        si.arrayLayers = slayers;
+        const char* why = nullptr;
+        if (!create_image(si, bc_small, bc_small_alloc, !pool)) why = "could not be made";
+        else if (!allocation_in_vram(bc_small_alloc)) why = "would land in system memory";
+        else {
+            VkImageViewCreateInfo sv = vi;
+            sv.image = bc_small;
+            sv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, slayers};
+            if (vkCreateImageView(dev.device, &sv, nullptr, &bc_small_view) != VK_SUCCESS) why = "has no view";
+            for (uint32_t l = 0; !why && bc_levels_on() && l < slayers; l++) {
+                sv.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, l, 1};
+                if (vkCreateImageView(dev.device, &sv, nullptr, &bc_small_layer[l]) != VK_SUCCESS) {
+                    for (VkImageView& v : bc_small_layer) {
+                        if (v) vkDestroyImageView(dev.device, v, nullptr);
+                        v = VK_NULL_HANDLE;
+                    }
+                    break;
+                }
+            }
+        }
+        if (why) {
+            for (VkImageView& v : bc_small_layer) {
+                if (v) vkDestroyImageView(dev.device, v, nullptr);
+                v = VK_NULL_HANDLE;
+            }
+            if (bc_small_view) vkDestroyImageView(dev.device, bc_small_view, nullptr);
+            if (bc_small) destroy_image(bc_small, bc_small_alloc);
+            bc_small = VK_NULL_HANDLE, bc_small_alloc = nullptr, bc_small_view = VK_NULL_HANDLE;
+            static std::atomic<int> told{0};
+            if (told++ < 2) logf("vk: the small BC3 scratch %s: its levels go one layer a run", why);
+        } else {
+            static std::atomic<int> told{0};
+            if (told++ < 1)
+                logf("vk: the small BC3 scratch: %u x %u, %u layers%s", bc_small_px, bc_small_px, slayers,
+                     tiny ? " (a card of small VRAM)" : "");
+        }
+    }
+    const uint64_t big_out = (uint64_t)(kBcDim / 4) * (kBcDim / 4) * bc_layers() * 16;
+    const uint64_t small_out = bc_small ? (uint64_t)(bc_small_px / 4) * (bc_small_px / 4) * slayers * 16 : 0;
+    const uint64_t out = std::max(big_out, small_out);
     const VkBufferUsageFlags out_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     const auto make_out = [&] {
         if (create_device_buffer(out, out_usage, bc_out, bc_out_alloc, !pool)) return true;
@@ -910,6 +997,13 @@ bool bc_scratch_make() {   // (bc_mu held)
         if (bc_scratch_view) vkDestroyImageView(dev.device, bc_scratch_view, nullptr);
         destroy_image(bc_scratch, bc_scratch_alloc);
         bc_scratch = VK_NULL_HANDLE, bc_scratch_view = VK_NULL_HANDLE;
+        for (VkImageView& v : bc_small_layer) {
+            if (v) vkDestroyImageView(dev.device, v, nullptr);
+            v = VK_NULL_HANDLE;
+        }
+        if (bc_small_view) vkDestroyImageView(dev.device, bc_small_view, nullptr);
+        if (bc_small) destroy_image(bc_small, bc_small_alloc);
+        bc_small = VK_NULL_HANDLE, bc_small_alloc = nullptr, bc_small_view = VK_NULL_HANDLE;
         return false;
     }
     bc_scratch_fresh = true;
@@ -1024,8 +1118,22 @@ void bc_encode_into(VkCommandBuffer cmd, uint32_t w, uint32_t h, uint32_t n, Tex
     vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (pc.blocks_x + 7) / 8, (pc.blocks_y + 7) / 8, n);
     full_barrier(cmd);
-    const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, n}, {dx, dy, 0}, {w, h, 1}};
-    vkCmdCopyBufferToImage(cmd, bc_out, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    if (bc_copy_per_layer() && n > 1 && ((w & 3) || (h & 3))) {
+        const uint64_t bpb = dst.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ? 8ull : 16ull;
+        const uint64_t layer_bytes = (uint64_t)pc.blocks_x * pc.blocks_y * bpb;
+        for (uint32_t i0 = 0; i0 < n;) {
+            VkBufferImageCopy regions[8];
+            const uint32_t m = n - i0 < 8 ? n - i0 : 8;
+            for (uint32_t j = 0; j < m; ++j)
+                regions[j] = {(uint64_t)(i0 + j) * layer_bytes, pc.blocks_x * 4, pc.blocks_y * 4,
+                              {VK_IMAGE_ASPECT_COLOR_BIT, level, layer + i0 + j, 1}, {dx, dy, 0}, {w, h, 1}};
+            vkCmdCopyBufferToImage(cmd, bc_out, dst.image, VK_IMAGE_LAYOUT_GENERAL, m, regions);
+            i0 += m;
+        }
+    } else {
+        const VkBufferImageCopy c{0, pc.blocks_x * 4, pc.blocks_y * 4, {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, n}, {dx, dy, 0}, {w, h, 1}};
+        vkCmdCopyBufferToImage(cmd, bc_out, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
     full_barrier(cmd);   // (the scratch and the buffer are the next part's)
 }
 
@@ -1071,17 +1179,24 @@ bool bc_scratch_layout(VkCommandBuffer cmd, bool resized = false) {
     }
     if (!bc_scratch_fresh) return true;
     bc_scratch_fresh = false;
-    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = bc_scratch;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, bc_layers()};
+    VkImageMemoryBarrier2 bars[2]{};
+    uint32_t nb = 0;
+    const auto add_bar = [&](VkImage img, uint32_t layers) {
+        VkImageMemoryBarrier2& b = bars[nb++];
+        b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    };
+    add_bar(bc_scratch, bc_layers());
+    if (bc_small) add_bar(bc_small, bc_small_layers());
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    di.imageMemoryBarrierCount = 1;
-    di.pImageMemoryBarriers = &b;
+    di.imageMemoryBarrierCount = nb;
+    di.pImageMemoryBarriers = bars;
     vkCmdPipelineBarrier2(cmd, &di);
     return true;
 }
@@ -1090,17 +1205,30 @@ void bc_scratch_idle() {
     if (!bc_have.load(std::memory_order_relaxed) || !bc_idle_s()) return;
     std::lock_guard lk(bc_mu);
     if (!bc_have || std::chrono::steady_clock::now() - bc_used_at < std::chrono::seconds(bc_idle_s())) return;
+    uint64_t freed = allocation_size(bc_scratch_alloc) + allocation_size(bc_out_alloc);
     Dead d{bc_last_value, bc_scratch, bc_scratch_alloc, {bc_scratch_view}, {}};
     d.buffer = bc_out, d.buffer_alloc = bc_out_alloc;
     dead.push_back(std::move(d));
     bc_scratch = VK_NULL_HANDLE, bc_scratch_alloc = nullptr, bc_scratch_view = VK_NULL_HANDLE, bc_out = VK_NULL_HANDLE, bc_out_alloc = nullptr;
     bc_have = false, bc_scratch_fresh = false;
+    if (bc_small) {
+        freed += allocation_size(bc_small_alloc);
+        Dead ds{bc_last_value, bc_small, bc_small_alloc, {bc_small_view}, {}};
+        for (VkImageView& v : bc_small_layer) {
+            if (v) ds.views.push_back(v);
+            v = VK_NULL_HANDLE;
+        }
+        dead.push_back(std::move(ds));
+        bc_small = VK_NULL_HANDLE, bc_small_alloc = nullptr, bc_small_view = VK_NULL_HANDLE;
+    }
     const bool second = bc_scratch2 != VK_NULL_HANDLE;
     if (second) {   // (hookshot-amd: the second scratch, 16 MB a layer, with it)
+        freed += allocation_size(bc_scratch2_alloc);
         dead.push_back(Dead{bc_last_value, bc_scratch2, bc_scratch2_alloc, {bc_scratch2_view}, {}});
         bc_scratch2 = VK_NULL_HANDLE, bc_scratch2_alloc = nullptr, bc_scratch2_view = VK_NULL_HANDLE, bc_scratch2_fresh = false;
     }
-    logf("vk: the BC3 scratch (%u MB%s) unused for %u s: given back", (second ? 36 : 20) * bc_layers(), second ? ", both" : "",
+    const uint64_t mb = freed ? (freed >> 20) : (uint64_t)(second ? 36 : 20) * bc_layers();
+    logf("vk: the BC3 scratch (%llu MB%s) unused for %u s: given back", (unsigned long long)mb, second ? ", all" : "",
          bc_idle_s());
 }
 
@@ -1372,11 +1500,56 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             astc_fail = "no memory for the BC3 scratch";
             return false;
         }
+        // Single-layer BC3 textures group up to bc_small_layers() small levels (plus one big level when
+        // capacity allows) into one decode phase, batched encode dispatches, and one vkCmdCopyBufferToImage.
+        struct GroupLevel { uint32_t level; VkImageView view; uint32_t w, h, off; };   // off: 8-byte uvec2 units in bc_out
+        std::vector<GroupLevel> group;
+        uint32_t group_off = 0, group_small = 0;
+        bool group_big = false;
+        const uint64_t group_cap = std::max<uint64_t>((uint64_t)(kBcDim / 4) * (kBcDim / 4) * bc_layers() * 16,
+                                                      (uint64_t)(bc_small_px / 4) * (bc_small_px / 4) * bc_small_layers() * 16) / 8;
+        const bool grouped = bc_levels_on() && tex.bc && !tex.bc_resized && !bc7_enabled() &&
+                             tex.format == VK_FORMAT_BC3_UNORM_BLOCK && bc_small && bc_small_layer[0] &&
+                             tex.layers == 1 && layers.size() == 1;
+        const auto group_flush = [&] {
+            if (group.empty()) return;
+            full_barrier(cmd);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_pipe);
+            std::vector<VkBufferImageCopy> copies;
+            copies.reserve(group.size());
+            for (const GroupLevel& q : group) {
+                VkDescriptorImageInfo qi{VK_NULL_HANDLE, q.view, VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorBufferInfo qb{bc_out, 0, VK_WHOLE_SIZE};
+                VkWriteDescriptorSet wr[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+                wr[0].dstBinding = 0, wr[0].descriptorCount = 1, wr[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                wr[0].pImageInfo = &qi;
+                wr[1].dstBinding = 1, wr[1].descriptorCount = 1, wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                wr[1].pBufferInfo = &qb;
+                vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bc_layout, 0, 2, wr);
+                const BcPush qp{(q.w + 3) / 4, (q.h + 3) / 4, q.w, q.h, 1, q.off};
+                vkCmdPushConstants(cmd, bc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof qp, &qp);
+                vkCmdDispatch(cmd, (qp.blocks_x + 7) / 8, (qp.blocks_y + 7) / 8, 1);
+                copies.push_back(VkBufferImageCopy{(VkDeviceSize)q.off * 8, qp.blocks_x * 4, qp.blocks_y * 4,
+                                                   {VK_IMAGE_ASPECT_COLOR_BIT, q.level, 0, 1}, {0, 0, 0}, {q.w, q.h, 1}});
+            }
+            descriptors_disturbed();
+            full_barrier(cmd);
+            vkCmdCopyBufferToImage(cmd, bc_out, tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)copies.size(), copies.data());
+            full_barrier(cmd);   // (the scratch and the buffer are the next group's)
+            group.clear(), group_off = 0, group_small = 0, group_big = false;
+        };
+        struct GroupFailureBarrier {
+            VkCommandBuffer& cmd;
+            decltype(group)& pending;
+            ~GroupFailureBarrier() { if (!pending.empty()) { note_work(); full_barrier(cmd); } }
+        } group_failure_barrier{cmd, group};
         for (uint32_t level = 0; level < tex.levels; level++) {
             const LevelGeo g = level_geo(tex, level);
             const uint64_t off = g.offset - tail0;
             if (g.offset < tail0 || off >= tail || (off % align)) continue;
             const uint32_t iw = std::max(1u, tex.width >> level), ih = std::max(1u, tex.height >> level);
+            const bool small = tex.bc && bc_small && !tex.bc_resized && g.w <= bc_small_px && g.h <= bc_small_px &&
+                               (bc_small_px == kBcSmallDim || grouped);
             // (hookshot-amd: a resized BC3 image: the level decodes at the game's size, g.w x g.h, and is encoded at iw x ih)
             AstcPush pc{};
             pc.block_dims[0] = (uint32_t)tex.block_w, pc.block_dims[1] = (uint32_t)tex.block_h;
@@ -1387,19 +1560,31 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             pc.block_height = g.tile_h;
             pc.block_height_mask = (1u << g.tile_h) - 1;
             pc.native_tiling = 1;
+            pc.blocks_x = g.tw, pc.blocks_y = g.th;
             for (size_t k0 = 0; k0 < layers.size();) {
                 size_t k1 = k0 + 1;
                 // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
                 // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
                 // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
                 // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run, the scratch's layers: bc_layers) (#956, #384)
-                const uint32_t run = bc_layers();
+                const uint32_t run = small ? bc_small_layers() : bc_layers();
                 while (k1 < layers.size() && k1 - k0 < run && layers[k1] == layers[k1 - 1] + 1) k1++;
                 const uint32_t n = (uint32_t)(k1 - k0);
+                const bool in_group = grouped && (small || (g.w <= kBcDim && g.h <= kBcDim));
+                if (in_group) {
+                    const uint64_t need = (uint64_t)((iw + 3) / 4) * ((ih + 3) / 4) * 2;
+                    if ((!small && group_big) || (!group.empty() && group_off + need > group_cap)) group_flush();
+                }
+                const VkImageView view = in_group ? (small ? bc_small_layer[group_small] : bc_scratch_view)
+                                                  : (small ? bc_small_view : bc_scratch_view);
+                if (!view) {
+                    astc_fail = "no view of a level";
+                    return false;
+                }
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
                 const uint64_t from = k0 * tail + off;
                 VkDescriptorBufferInfo bi{s.buffer, s.offset + from, staged - from};
-                VkDescriptorImageInfo ii{VK_NULL_HANDLE, bc_scratch_view, VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorImageInfo ii{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
                 VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
                 w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 w[0].pBufferInfo = &bi;
@@ -1408,13 +1593,21 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                 vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_layout, 0, 2, w);
                 vkCmdPushConstants(cmd, astc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
                 vkCmdDispatch(cmd, (g.tw + 7) / 8, (g.th + 7) / 8, n);
-                if (tex.bc_resized)
+                if (in_group) {
+                    group.push_back({level, view, iw, ih, group_off});
+                    group_off += ((iw + 3) / 4) * ((ih + 3) / 4) * 2;
+                    if (small) group_small++;
+                    else group_big = true;
+                    if (group_small >= bc_small_layers()) group_flush();
+                } else if (tex.bc_resized) {
                     bc_encode_resized(cmd, g.w, g.h, iw, ih, n, tex, level, layers[k0]);
-                else
-                    bc_encode_into(cmd, iw, ih, n, tex, level, layers[k0], 0, 0);
+                } else {
+                    bc_encode_into(cmd, iw, ih, n, tex, level, layers[k0], 0, 0, small ? bc_small_view : VK_NULL_HANDLE);
+                }
                 k0 = k1;
             }
         }
+        group_flush();
         st_astc++;
         return true;
     }
@@ -1431,6 +1624,7 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         pc.block_height = g.tile_h;
         pc.block_height_mask = (1u << g.tile_h) - 1;
         pc.native_tiling = 1;
+        pc.blocks_x = g.tw, pc.blocks_y = g.th;
         for (size_t k = 0; k < (all ? 1 : layers.size()); k++) {
             const VkImageView view = astc_level_view(&tex, level, all ? ~0u : layers[k]);
             if (!view) {

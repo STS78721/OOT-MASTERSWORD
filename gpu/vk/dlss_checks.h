@@ -44,6 +44,13 @@ inline int mode_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, const Mode
     return -1;
 }
 
+/// (longshot, RX_VK_DLSS_PREWARM: prefer_scaled) Whether prepare makes a DLAA-mode feature for a frame: DLAA asked (native_aa) at
+/// a full-size frame, always; DLSS at a full-size frame only with RX_VK_DLSS_PREWARM=0. With it DLSS takes the scaled mode whose range
+/// holds the full size (MaxQuality's at 2560x1440: 1280x720 to 2560x1440), DLAA's mode only where none does (mode_for's -1).
+/// The Render resolution's Auto starts each area at full size, and the DLAA-mode feature made then was made again 17 frames
+/// later once the size dropped (119 ms, then 29.5 ms)
+inline bool dlaa_feature(bool full, bool native_aa, bool prefer_scaled) { return full && (native_aa || !prefer_scaled); }
+
 /// Whether s is all ASCII: NGX's Linux library takes only such paths (vk_dlss.cpp wide())
 inline bool ascii(std::string_view s) {
     for (const char c : s)

@@ -649,6 +649,21 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         ci.pQueueFamilyIndices = sharing;
     }
     ci.clipped = VK_TRUE;
+    auto retire_swapchain = [&] {
+        if (!dev.swapchain) return;
+        device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
+        reflex_swapchain_destroyed();
+        swap_views_drop();
+        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
+        dev.swap_rendered.clear();
+        vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
+        dev.swapchain = VK_NULL_HANDLE;
+        dev.swap_spare = 0;
+    };
+#ifdef _WIN32
+    // Streamline can release the old swapchain's images inside its create hook; retire explicitly on NVIDIA first.
+    if (dev.props.vendorID == 0x10de) retire_swapchain();
+#endif
     ci.oldSwapchain = dev.swapchain;
     reflex_swapchain_info(ci);
     // An sRGB swapchain (some drivers list no UNORM format) made mutable when the driver can: Dear ImGui draws through
@@ -684,14 +699,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
             return false;
         }
     }
-    if (dev.swapchain) {
-        device_wait_idle_locked();   // (the present queue's presents of the old swapchain done too)
-        reflex_swapchain_destroyed();
-        swap_views_drop();
-        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
-        vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
-        dev.swap_spare = 0;
-    }
+    retire_swapchain();
     ++dev.swapchain_generation;
     dev.swapchain = sc;
     dev.swap_rendered = std::move(rendered);

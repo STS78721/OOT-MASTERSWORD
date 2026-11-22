@@ -693,7 +693,7 @@ bool upscale(VkCommandBuffer cmd, const Inputs& in) {
     run(P_ACCUMULATE,
         {exposure, tex(g.dilated_reactive_masks), tex(g.dilated_motion_vectors), tex(g.internal_upscaled[p]),
          tex(g.lanczos_lut), tex(g.farthest_depth_mip1), current_luma, tex(g.farthest_depth), color,
-         tex(g.internal_upscaled[q]), tex(g.output), tex(g.new_locks), cb_fsr},
+         tex(g.internal_upscaled[q]), in.output ? Resource{in.output} : tex(g.output), tex(g.new_locks), cb_fsr},
         groups(uw, 8), groups(uh, 8));
     g.parity = q;
     return true;
@@ -826,8 +826,10 @@ bool chain_evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     }
     if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.image || f.output.format != VK_FORMAT_R16G16B16A16_SFLOAT)
         return false;
+    const bool direct_out = f.output.view != VK_NULL_HANDLE && (f.output.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
     fsr3::Inputs ai;
     ai.color = f.color.view, ai.depth = f.depth.view, ai.motion = f.motion.view;
+    if (direct_out) ai.output = f.output.view;
     ai.render_width = f.render_w, ai.render_height = f.render_h;
     ai.upscale_width = f.output.width, ai.upscale_height = f.output.height;
     ai.jitter[0] = f.jitter[0], ai.jitter[1] = f.jitter[1];
@@ -842,14 +844,28 @@ bool chain_evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     if (reactive::Mask m; reactive::mask(cmd, f.render_w, f.render_h, f.color.width, f.color.height, f.color.view, m))
         ai.reactive = m.view;
     if (!fsr3::upscale(cmd, ai)) return false;
-    const VkImage picture = fsr3::output_image();
-    if (!picture) return false;
-    full_barrier(cmd);   // (the accumulate and RCAS passes' writes, before the copy reads them)
-    VkImageCopy region{};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.extent = {f.output.width, f.output.height, 1};
-    vkCmdCopyImage(cmd, picture, VK_IMAGE_LAYOUT_GENERAL, f.output.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    if (!direct_out) {
+        const VkImage picture = fsr3::output_image();
+        if (!picture) return false;
+        const auto barrier = [&](VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                                 VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+            VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            b.srcStageMask = src_stage, b.srcAccessMask = src_access;
+            b.dstStageMask = dst_stage, b.dstAccessMask = dst_access;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(cmd, &di);
+        };
+        barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {f.output.width, f.output.height, 1};
+        vkCmdCopyImage(cmd, picture, VK_IMAGE_LAYOUT_GENERAL, f.output.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        barrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    }
     if (++c.drawn % 600 == 0 || !c.told)
         logf("vk: fsr3 on the chain: %llu frames drawn, %ux%u -> %ux%u, jitter %+.3f %+.3f px of %u phases, depth %s",
              (unsigned long long)c.drawn, f.render_w, f.render_h, f.output.width, f.output.height, f.jitter[0], f.jitter[1],

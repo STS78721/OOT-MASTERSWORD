@@ -143,5 +143,8 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
 struct StartupView;
 void startup_screen(const StartupView* view);
 void startup_fade_to(float f);
+/// (longshot) The Upscaler row's one-time questions (NGX's start among them) asked on a thread of their own, once a run, as the
+/// start-up screen asks them: for a run with no window, whose start-up screen never shows (vk_temporal.cpp temporal_prewarm)
+void upscalers_probe_start();
 
 } // namespace mkwvk

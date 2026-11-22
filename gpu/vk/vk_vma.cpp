@@ -373,6 +373,12 @@ bool allocation_device_memory(VmaAllocation allocation, VkDeviceMemory* memory, 
     if (offset) *offset = info.offset;
     return true;
 }
+bool allocation_in_vram(VmaAllocation allocation) {
+    if (!allocation) return false;
+    VkMemoryPropertyFlags flags = 0;
+    vmaGetAllocationMemoryProperties(vma, allocation, &flags);
+    return (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+}
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
                    VmaAllocation& allocation, void** mapped, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
