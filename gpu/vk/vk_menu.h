@@ -31,29 +31,59 @@ struct Options {
     int dlss_quality = 1;      // DLSS SR or FSR 4: 0 Quality, 1 Balanced, 2 Performance, 3 Ultra Perf, 4 Native AA (DLAA / FSR4_AA)
     // Compat with origin FSR3 / NGX helpers still in-tree (menu Upscaling row uses `upscale`, not these).
     int dlss = 0;
-    int dlss_model = 0;
-    int sharpness = 0;         // 0 to 100
+    int dlss_model = 0;        // DLSS preset: 0 K (transformer), 1 M, 2 L, 3 Default
+    int sharpness = 0;         // 0 to 100 (window scaling pass)
+    int up_sharpness = 0;      // 0 to 100 (under-HUD sharpening in dlss_out.comp when DLSS/DLAA/FSR 4 draws)
+    int anisotropy = 0;        // Anisotropic filtering override: 0 Game, 1 2x, 2 4x, 3 8x, 4 16x (vk_draw.cpp aniso_override)
+    int grass_distance = 0;    // Short decorative grass draw distance: 0 Game (1x), 1 2x, 2 3x, 3 4x (vk_draw.cpp)
     int smaa = 0;              // present-path SMAA 1x (iryoku Medium): 0 Off, 1 On
+    // HDR10 output (vk_main.cpp create_swapchain, vk_framegen.cpp framegen_hdr): 0 Off, 1 Expanded SDR, 2 Native HDR
+    int hdr = 0;
+    int hdr_white = 200;       // HDR paper white in nits (80..400)
+    int hdr_peak = 1000;       // HDR peak brightness in nits (400..4000)
+    int hdr_contrast = 100;    // HDR contrast in percent around mid-grey (50..200; 100 = unchanged)
+    // CRT output filter (vk_framegen.cpp): 0 Off, 1 Lottes Aperture Grille, 2 Lottes Consumer TV, 3 Hyllian Fast, 4 zfast CRT
+    int crt_filter = 0;
+    int crt_lines = 0;         // Virtual CRT scanlines: 0 240, 1 480, 2 720
+    // Threaded rendering (threaded_rendering.h): 0 Auto, 1 On, 2 Off (read once at startup; RX_VK_ASYNC / RX_VK_RENDER_THREAD over it)
+    int threaded_rendering = 0;
     // Colour Profiles (STS78721 / TOTK / DKB vivid OLED): preset writes the four values; moving one → Custom
     int color_preset = 0;       // 0 Default, 1 Vivid (OLED), 2 Clarity, 3 Custom
     int color_brightness = 0;   // -30..30 (% added)
     int color_contrast = 100;   // 70..150 (%; 100 = unchanged)
     int color_saturation = 100; // 50..200 (%; 100 = unchanged)
     int color_gamma = 100;      // 80..120 as hundredths of the exponent (100 = 1.00)
+    int colour_vision = 0;      // Colour vision correction: 0 Off, 1 Protan, 2 Deutan, 3 Tritan
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
     int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)
     int ultrawide = 0;    // the camera at the monitor's shape when it is wider than 16:9; read once, at the start (host/hos_main.c)
-    int show_fps = 0;
+    int show_fps = 0;     // FPS counter: 0 Off, 1 FPS, 2 Frame time, 3 Graph, 4 Detailed
+    int fps_corner = 0;   // FPS overlay corner: 0 Top right, 1 Top left, 2 Bottom right, 3 Bottom left
     // In-game FPS overlay scale (1 Small, 2 Medium default, 3 Large); independent of menu_size.
     int overlay_size = 2;
+    int audio_output = 0; // Audio output (host/nn_audio.c audio_output=): 0 Auto, 1 Stereo, 2 5.1 (read at startup)
+    int mic = 1;          // Ocarina microphone (host->mic_select): 0 Off, 1 System default, 2.. device index
+    int discord = 1;      // Discord Rich Presence (host/discord_rpc.c HOS_OPT_DISCORD): 0 Off, 1 On
+    int menu_shortcut = 0;// Menu open key: 0 Insert / F1, 1 F1 only, 2 Insert / F1 / Esc
+    int pad_menu = 1;     // Controller menu button: 0 Off, 1 Home
     int fullscreen = 0;   // borderless fullscreen + cursor hide: F11 is the same setting
     int gpu_device = 0;   // graphics card index: 0 Auto, 1..N device 0..N-1 (gpu/vk/vk_main.cpp; RX_VK_DEVICE)
     int pad_background = 0;   // the controllers count while another window has the focus (host/nn_hid.c; HOS_INPUT_BACKGROUND)
     int mouse_native = 0; // the mouse turns the camera's own angles (host/mouse_native.c); 0: as the right stick
+    int disable_camera_centering = 0; // 0 stock movement-follow turning; 1 keep horizontal camera angle (host/mouse_native.c id 45)
     int mouse_sens = 100; // the mouse's sensitivity in percent: 0.1 degrees a count at 100 with native look (host/nn_hid.c)
     int mouse_invert = 0; // the mouse's up and down swapped
     int stick_l_sens = 100; // left analog stick speed percent (host/pad_sdl.c, host/nn_hid.c; 100 = stock)
     int stick_r_sens = 100; // right analog stick speed percent (camera look)
+    int rumble = 100;       // Controller rumble strength in percent: 0 Off, 25..150 (host/pad_sdl.c id 9)
+    int stick_dead_zone = 0;// Circular stick dead zone: 0 Auto (~24%), 1..6 = 5%..30% (host/nn_hid.c & pad_sdl.c id 11)
+    int gyro = 1;           // Motion controls from controller gyroscope (host/pad_sdl.c HOS_OPT_GYRO)
+    int gyro_sens_x = 100;  // Gyro horizontal sensitivity % (10..300)
+    int gyro_sens_y = 100;  // Gyro vertical sensitivity % (10..300)
+    int gyro_inv_x = 0;     // Invert gyro X
+    int gyro_inv_y = 0;     // Invert gyro Y
+    int gyro_deadzone = 1;  // Gyro deadzone: 0 Tight, 1 Standard, 2 Loose
+    int prompts = 0;        // Button prompt icons (host/prompts.c button_prompts=): 0 Auto, 1 Switch, 2 Xbox, 3 PS4, 4 PS5, 5 Steam Deck
     int text_speed = 0;   // how fast dialogue prints: 0 the game's, 1 2x, 2 4x, 3 instant (host/nn_vi.c, nx2/oot_patches.py; HOS_TEXT_SPEED)
     int fov = 100;        // vertical gameplay field of view, 50..150% of the game's current angle (host/oot_fov.c)
     int invert_cam_x = 0; // right-stick camera horizontal inversion: 0 normal, 1 inverted
@@ -61,12 +91,20 @@ struct Options {
     int pad_layout = 0;   // 0 Nintendo (default), 1 Xbox / PC, 2 Swap Face Buttons, 3 Custom
     int robust = 0;       // bounds-checked buffer access: 0 Auto (on), 1 Off, 2 On (gpu/vk/vk_main.cpp; RX_VK_ROBUST)
     int mesh_mode = 0;    // task/mesh programs: 0 Automatic, 1 Native, 2 Compute (mesh_shaders=; RX_VK_FORCE_MESH_FALLBACK over it)
+    int astc_rgba8 = 0;   // Debug: keep large ASTC textures as RGBA8 instead of BC3 (vk_texture.cpp bc_ready; restart)
+    int present_queue = 0;// Debug: dedicated compute present queue: 0 Auto, 1 On, 2 Off (vk_main.cpp; restart)
+    int intel_compiles = 0;// Debug: Windows Intel shader compiler threading: 0 Auto, 1 Parallel, 2 Serial (restart)
+    int cheat_hearts = 0; // Debug/Cheats (session-only, never persisted): heart protection (HOS_OPT_CHEAT_HEARTS)
+    int cheat_flight = 0; // Debug/Cheats (session-only, never persisted): no-clip flight (HOS_OPT_CHEAT_FLIGHT)
+    int cheat_camera = 0; // Debug/Cheats (session-only, never persisted): free camera (HOS_OPT_CHEAT_CAMERA)
     int preset = 0;       // quality preset: 0 Custom, 1 Minimum (4GB), 2 Low (6GB), 3 Balanced (8GB), 4 High (12GB), 5 Ultra (16GB+)
     int vram_mb = 0;      // dynamic texture cache budget limit in MB
     int mirror_mb = 0;    // staging mirror limit in MB
     // NVIDIA Reflex (VK_NV_low_latency2): 0 Off, 1 On, 2 Boost. Hardware-gated; ignored on non-NVIDIA.
     int reflex = 0;
-    // Insert menu look: 0 OOT Mastersword (default), 1 Light, 2 Dark, 3 Longshot.
+    // AMD Anti-Lag 2 (VK_AMD_anti_lag): 0 Off, 1 On. Hardware-gated; ignored on non-AMD.
+    int antilag = 0;
+    // Insert menu look: 0 OOT Mastersword (default), 1 Light, 2 Dark, 3 Longshot, 4 OOT Options (Amber).
     int menu_theme = 0;
     // Insert menu and start-up screen scale (1 Small, 2 Medium default, 3 Large); independent of overlay_size.
     int menu_size = 2;

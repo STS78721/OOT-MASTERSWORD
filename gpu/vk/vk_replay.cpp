@@ -39,6 +39,7 @@
 #include "vk_temporal.h"
 #include "vk_fsr3_inputs.h"
 #include "vk_reflex.h"
+#include "vk_antilag.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_state.h"
@@ -208,7 +209,11 @@ void queue_flush_locked() {   // (dev.present_mu held)
     si.pSignalSemaphoreInfos = sig;
     PROF(PROF_QSUBMIT);
     si.pNext = reflex_submit_id(nullptr, pend.reflex);   // (NVIDIA Reflex: the game frame of the batch's first command buffer)
-    const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
+    VkResult res;
+    {
+        DriverTurn turn;
+        res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
+    }
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -835,7 +840,11 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     PROF(PROF_QSUBMIT);
     si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made)
-    const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+    VkResult res;
+    {
+        DriverTurn turn;
+        res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+    }
     r.submitted = res == VK_SUCCESS;
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
@@ -1321,6 +1330,10 @@ void log_stage_bind(uint32_t op, int stage) {
 }
 
 void maybe_split(VkCommandBuffer& cmd);
+void split_part(VkCommandBuffer& cmd);
+bool part_end_at_pass = false;
+// (a short command buffer a parallel replay records on this thread: one segment's worth, and a segment is not split)
+thread_local bool split_off = false;
 extern uint64_t rec_cur_value;   // (the submission being recorded: the occlusion queries' value)
 
 /// The handles already stored, so a rebind of the same ones does not rebuild descriptors
@@ -1420,6 +1433,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
         OpClock op_clock(h.op);
+        // Split deferred by maybe_split() completes at the game's natural render-pass boundary (barrier or RT change).
+        if (!dry && !worker && !split_off && part_end_at_pass && (h.op == NOP_BARRIER || h.op == NOP_SET_RT))
+            split_part(cmd);
         switch (h.op) {
         case NOP_END: return;
         case NOP_BEGIN: case NOP_JUMP: case NOP_CALL: break;
@@ -1984,8 +2000,6 @@ int64_t part_work = 0, st_parts = 0;
 // at once, kMaxBatch of them at most: fewer than the slots)
 constexpr int kMaxParts = 32;
 constexpr int kMaxBatch = 6;   // (three recording threads: more segments only took slots and submits)
-// (a short command buffer a parallel replay records on this thread: one segment's worth, and a segment is not split)
-thread_local bool split_off = false;
 
 /// A draw or a dispatch: what a segment is a count of (dry_work, RX_VK_PARALLEL_SEG)
 bool op_is_work(uint32_t op) {
@@ -1996,6 +2010,19 @@ bool op_is_work(uint32_t op) {
 void maybe_split(VkCommandBuffer& cmd) {
     static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 240;
     if (split_off || !rec_cur || every <= 0 || ++part_work < every || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    // Defer chunk split to the game's next natural pass end (barrier or RT change) so we don't cut an active render pass
+    // in two and force LOAD_OP_LOAD reloads; still split immediately on very long passes (4x chunk size). RX_VK_SPLIT_AT_PASS=0: off.
+    static const bool at_pass = !(getenv("RX_VK_SPLIT_AT_PASS") && atoi(getenv("RX_VK_SPLIT_AT_PASS")) == 0);
+    if (at_pass && part_work < every * 4) {
+        part_end_at_pass = true;
+        return;
+    }
+    split_part(cmd);
+}
+
+void split_part(VkCommandBuffer& cmd) {
+    part_end_at_pass = false;
+    if (split_off || !rec_cur || rec_parts + 1 >= kMaxParts || dump_on()) return;
     end_pass(cmd);
     // (on Intel iGPUs without VRAM mirrors, uniform updates in a split submission are written at the last part's end:
     // RX_VK_SPLIT_UBFLUSH=1 writes at each part's end as before, =0 at the last part's on any GPU)
@@ -2218,7 +2245,11 @@ void submit_segment_recording(Recording& r) {
     std::lock_guard lk(dev.present_mu);
     queue_flush_locked();
     si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made; after the flush, which tags its own)
-    const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+    VkResult res;
+    {
+        DriverTurn turn;
+        res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+    }
     r.submitted = res == VK_SUCCESS;
     if (res != VK_SUCCESS) logf("vk: segment submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -2508,6 +2539,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         full_barrier(rest.cmd);
         rec_cur = &rest;
         cmd = rest.cmd;
+        part_end_at_pass = false;
         rec_parts++;
         Segment whole = seg[0];
         whole.end = stop;
@@ -2572,7 +2604,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made; after the flush, which tags its own)
-        const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
+        VkResult res;
+        {
+            DriverTurn turn;
+            res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
+        }
         j->r->submitted = res == VK_SUCCESS;
         if (res != VK_SUCCESS) logf("vk: segment submit %llu failed (%d)", (unsigned long long)j->r->value, (int)res);
         if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -2623,6 +2659,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     full_barrier(nr.cmd);
     rec_cur = &nr;
     cmd = nr.cmd;
+    part_end_at_pass = false;
     rec_parts += (int)seg.size() + 1;
     st_par_buffers++;
     st_par_segments += (int64_t)seg.size();
@@ -2646,7 +2683,7 @@ void bench_replay(const std::vector<uint64_t>& handles) {
     Recording& first = begin_recording(value);
     memory_begin_submission();
     full_barrier(first.cmd);
-    rec_cur = &first, rec_cur_value = value, rec_parts = 0, part_work = 0;
+    rec_cur = &first, rec_cur_value = value, rec_parts = 0, part_work = 0, part_end_at_pass = false;
     VkCommandBuffer cmd = first.cmd;
     for (uint64_t h : handles)
         if (h) {
@@ -2656,6 +2693,7 @@ void bench_replay(const std::vector<uint64_t>& handles) {
         }
     Recording& r = *rec_cur;
     rec_cur = nullptr;
+    part_end_at_pass = false;
     end_pass(r.cmd);
     flush_ub_updates(r.cmd);
     memory_end_submission(r.cmd, r.part);
@@ -2949,6 +2987,7 @@ void finish_recording(uint64_t value) {
     (void)value;
     Recording& r = *rec_cur;
     rec_cur = nullptr;
+    part_end_at_pass = false;
     end_pass(r.cmd);
     flush_ub_updates(r.cmd);
     memory_end_submission(r.cmd, r.part);
@@ -3044,7 +3083,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         Recording& first = begin_recording(tag);
         memory_begin_submission();
         full_barrier(first.cmd, "barrier (recording start)");
-        rec_cur = &first, rec_cur_value = tag, rec_parts = 0, part_work = 0;
+        rec_cur = &first, rec_cur_value = tag, rec_parts = 0, part_work = 0, part_end_at_pass = false;
         temporal_prewarm(first.cmd);   // (longshot, RX_VK_DLSS_PREWARM: DLSS's feature in a light frame before the first 3D one)
     }
     VkCommandBuffer cmd = rec_cur->cmd;
@@ -4227,11 +4266,20 @@ void log_frame_stats() {
     }
 }
 
+static std::atomic<bool> last_present_pq{false};
+
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
 void do_present(const nvn_tex* t, const int crop[4]) {
     temporal_idle();   // (DLSS, FSR: their video memory let go once not used for a while)
     if (!dev.offscreen) reflex_present_begins();
-    struct ReflexSleep { ~ReflexSleep() { if (!dev.offscreen) reflex_sleep(); } } reflex_sleep_after;
+    struct ReflexSleep {
+        ~ReflexSleep() {
+            if (!dev.offscreen) {
+                reflex_sleep();
+                antilag_input();
+            }
+        }
+    } reflex_sleep_after;
     {   // (hookshot, RX_VK_PASS_TRACE_AT=<frames>: the passes of the frames around these frame numbers, for finding what a frame is made of)
         static std::atomic<int64_t> seen{0};
         static const int64_t at = getenv("RX_VK_PASS_TRACE_AT") ? atoll(getenv("RX_VK_PASS_TRACE_AT")) : 0;
@@ -4264,9 +4312,15 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                  t ? t->d.width : 0, t ? t->d.height : 0, t ? t->d.format : 0,
                  tex ? (tex->gpu_written ? "rendered" : "never rendered") : "no image");
         if (tex) src = tex->image, sw = tex->width, sh = tex->height;
+        const bool is_pq = tex && opts.hdr == 2 &&
+                           ((t && vk_format(t->d.format).format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) ||
+                            tex->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                            tex->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+        last_present_pq.store(is_pq, std::memory_order_relaxed);
         if (t) temporal_note_present(t->d.width, t->d.height);   // (RX_VK_DLSS_PREWARM: the size its feature is made for)
         if (tex && !dev.offscreen &&
-            (opts_spatial_upscale() || opts.sharpness || color_grade_active() || smaa_active() || mvec_on())) {
+            (opts_spatial_upscale() || opts.sharpness || color_grade_active() || smaa_active() || mvec_on() || dev.hdr ||
+             opts.crt_filter != 0)) {
             // Keep the sampled view with the same cached image as the direct present, before advancing its age.
             direct_view = texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
             tex->last_frame = texture_frame_no();
@@ -4875,9 +4929,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     std::lock_guard lk(present_image_mu);
     static int vsync_was = -1;   // (V-Sync row as the swapchain was made for it)
-    // (and frame generation's multiplier, swapchain_framegen: a spare image a frame; and swapchain_dlssg: FIFO under V-Sync
-    // Auto with DLSS Frame Generation)
-    const int vsync_now = menu_vsync() * 16 + swapchain_framegen() * 2 + (swapchain_dlssg() ? 1 : 0);
+    // (and frame generation's multiplier, swapchain_framegen: a spare image a frame; swapchain_dlssg: FIFO under V-Sync
+    // Auto with DLSS Frame Generation; and HDR on/off, which switches the swapchain format and colour space)
+    const int vsync_now = menu_vsync() * 32 + swapchain_framegen() * 4 + (swapchain_dlssg() ? 2 : 0) + (opts.hdr > 0 ? 1 : 0);
     const bool vsync_changed = vsync_was >= 0 && vsync_was != vsync_now;
     if (vsync_was < 0) vsync_was = vsync_now;
     const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire);   // (window resize: main's resize)
@@ -4980,6 +5034,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     const int* present_crop = crop;
     VkImageView grade_view = VK_NULL_HANDLE, smaa_view = VK_NULL_HANDLE;
     uint32_t gw = 0, gh = 0, aw = 0, ah = 0;
+    const bool pq = dev.hdr && last_present_pq.load(std::memory_order_relaxed);
     if (mvec_debug_active()) {
         present_src = mvec_debug_image();
         present_view = mvec_debug_view();
@@ -4987,7 +5042,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         pw = mvec_width();
         ph = mvec_height();
         present_crop = nullptr;
-    } else if (src && view) {
+    } else if (src && view && !pq) {
         if (const VkImage graded =
                 color_grade_record(f.cmd, log_slot, src, view, VK_FORMAT_UNDEFINED, sw, sh, crop, &grade_view, &gw, &gh)) {
             present_src = graded;
@@ -5007,10 +5062,19 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
             present_crop = nullptr;
         }
     }
-    if (const VkImage scaled =
-            present_src && present_view
-                ? framegen_scale(f.cmd, present_view, present_src, pw, ph, present_crop, rect.w, rect.h)
-                : VK_NULL_HANDLE) {
+    VkImageView scaled_view = VK_NULL_HANDLE;
+    const VkImage scaled =
+        present_src && present_view
+            ? framegen_scale(f.cmd, present_view, present_src, pw, ph, present_crop, rect.w, rect.h, &scaled_view, pq)
+            : VK_NULL_HANDLE;
+    const VkImage hdr_img =
+        dev.hdr && present_src && present_view
+            ? framegen_hdr(f.cmd, scaled ? scaled_view : present_view, scaled ? rect.w : pw, scaled ? rect.h : ph,
+                           scaled ? nullptr : present_crop, rect.w, rect.h, pq, opts.colour_vision)
+            : VK_NULL_HANDLE;
+    if (hdr_img) {
+        blit_crop_to_rect(f.cmd, hdr_img, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
+    } else if (scaled) {
         blit_crop_to_rect(f.cmd, scaled, rect.w, rect.h, nullptr, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
     } else if (present_src) {
         blit_crop_to_rect(f.cmd, present_src, pw, ph, present_crop, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, rect);
@@ -5074,13 +5138,17 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     reflex_submit_ends();
     // (NVIDIA Reflex: the frame this present shows; with frame generation the set's game frame, none for a made frame)
     si.pNext = reflex_submit_id(nullptr, reflex_present_frame);
-    if (vkQueueSubmit2(dev.queue, 1, &si, f.done) == VK_ERROR_DEVICE_LOST) device_lost();
+    {
+        DriverTurn turn;
+        if (vkQueueSubmit2(dev.queue, 1, &si, f.done) == VK_ERROR_DEVICE_LOST) device_lost();
+    }
     if (present_defer_into) {   // (present ahead: the copy is queued; present_commit shows it at its time)
         present_defer_into->used = true;
         present_defer_into->index = index;
         present_defer_into->done = f.done;
         present_defer_into->swapchain = dev.swapchain;
         present_defer_into->reflex_frame = reflex_present_frame;   // (NVIDIA Reflex: the frame it shows, at its present)
+        present_defer_into->antilag_frame = antilag_present_frame;
         present_defer_into->swapchain_generation = dev.swapchain_generation;
         return;
     }
@@ -5095,11 +5163,14 @@ bool present_commit(const PendingPresent& p) {
     std::unique_lock qk(dev.present_mu);
     if (p.swapchain != dev.swapchain || p.swapchain_generation != dev.swapchain_generation) return false;   // (made again since the copy)
     const uint64_t was = reflex_present_frame;
+    const uint64_t al_was = antilag_present_frame;
     reflex_present_frame = p.reflex_frame;   // (NVIDIA Reflex: the frame this present shows, as at its copy)
+    antilag_present_frame = p.antilag_frame;
     present_copy_fence = p.done;   // (its copy's fence, for present_out's wait before the present)
     const bool shown = present_out(p.index, qk);
     present_copy_fence = VK_NULL_HANDLE;
     reflex_present_frame = was;
+    antilag_present_frame = al_was;
     return shown;
 }
 
@@ -5161,8 +5232,12 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk) {
     if (dev.present_queue) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
+        antilag_present();
+        DriverTurn turn;
         res = vkQueuePresentKHR(dev.present_queue, &pi);
     } else {
+        antilag_present();
+        DriverTurn turn;
         res = vkQueuePresentKHR(dev.queue, &pi);
     }
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
@@ -5380,7 +5455,7 @@ int render_thread_mode() {
             logf("vk: Threaded rendering: %s (RX_VK_ASYNC=%s)", v ? "On" : "Off", e);
             return v;
         }
-        int setting = threaded::AUTO;
+        int setting = opts.threaded_rendering;
         if (const char* rt = getenv("RX_VK_RENDER_THREAD")) {
             if (!_stricmp(rt, "1") || !_stricmp(rt, "on") || !_stricmp(rt, "true")) setting = threaded::ON;
             else if (!_stricmp(rt, "0") || !_stricmp(rt, "off") || !_stricmp(rt, "false")) setting = threaded::OFF;
@@ -6056,6 +6131,22 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_STICK_L_SENS) return opts.stick_l_sens;
         if (id == HOS_OPT_STICK_R_SENS) return opts.stick_r_sens;
         if (id == HOS_OPT_MS_RENDER_THREAD) return async_on() ? 1 : 0;
+        if (id == 9) return opts.rumble;
+        if (id == 11) return opts.stick_dead_zone;
+        if (id == HOS_OPT_GYRO) return opts.gyro;
+        if (id == HOS_OPT_GYRO_SENS_X) return opts.gyro_sens_x;
+        if (id == HOS_OPT_GYRO_INV_X) return opts.gyro_inv_x;
+        if (id == HOS_OPT_GYRO_INV_Y) return opts.gyro_inv_y;
+        if (id == HOS_OPT_GYRO_SENS_Y) return opts.gyro_sens_y;
+        if (id == HOS_OPT_GYRO_DEADZONE) return opts.gyro_deadzone;
+        if (id == HOS_OPT_CHEAT_HEARTS) return opts.cheat_hearts ? 1 : -1;
+        if (id == HOS_OPT_CHEAT_FLIGHT) return opts.cheat_flight ? 1 : -1;
+        if (id == HOS_OPT_CHEAT_CAMERA) return opts.cheat_camera;
+        if (id == HOS_OPT_HDR_NATIVE) return (dev.hdr && opts.hdr == 2) ? 1 : 0;
+        if (id == HOS_OPT_HDR_PEAK) return opts.hdr_peak;
+        if (id == HOS_OPT_HDR_WHITE) return opts.hdr_white;
+        if (id == HOS_OPT_DISCORD) return opts.discord;
+        if (id == 45) return opts.disable_camera_centering;
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !temporal_full_scale() : id == 3 ? (temporal_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y :
                id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H || id == HOS_OPT_DLSS_JITTER_PHASES
@@ -6075,6 +6166,7 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_texture_created = texture_created_of;
 }
 
+bool crt_native_pq() { return dev.hdr && last_present_pq.load(std::memory_order_relaxed); }
 std::atomic<bool> par_active{false};
 std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
 ParSiteStat par_site_stats[(size_t)ParSite::Count];

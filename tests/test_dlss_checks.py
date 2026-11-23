@@ -18,11 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 def check_sources():
     dlss = (ROOT / "gpu" / "vk" / "vk_dlss.cpp").read_text(encoding="utf-8")
     draw = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
+    temporal = (ROOT / "gpu" / "vk" / "vk_temporal.cpp").read_text(encoding="utf-8")
     # (no fixed floor on the scene's size: it follows the output)
-    for name, src in (("vk_dlss.cpp", dlss), ("vk_draw.cpp", draw)):
+    for name, src in (("vk_dlss.cpp", dlss), ("vk_temporal.cpp", temporal), ("vk_draw.cpp", draw)):
         assert not re.search(r"\b(width|height)\s*<\s*(640|360)\b", src), name + ": a fixed scene size floor"
-    assert "!dlss_scene_size(width, height)" in dlss, "dlss_note_scene_draw: the output's sizes"
-    assert "!dlss_scene_size(at.width, at.height)" in draw, "dlss_skin_check: the output's sizes"
+    assert "!temporal_scene_size(width, height)" in temporal, "temporal_note_scene_draw: the output's sizes"
+    assert "!temporal_scene_size(at.width, at.height)" in draw, "temporal_skin_check: the output's sizes"
     # (the Linux wide(): decoded, not each byte widened)
     widened = [l.strip() for l in dlss.splitlines() if "std::wstring(s.begin(), s.end())" in l]
     assert widened == ["if (dlss_checks::ascii(s)) return std::wstring(s.begin(), s.end());"], \
@@ -31,6 +32,17 @@ def check_sources():
     # (NGX's Linux library converts its wide paths back in the "C" locale, ASCII only: a folder named otherwise goes to it
     # as /proc/self/fd/<n>)
     assert "dlss_checks::ascii(s)" in dlss and '"/proc/self/fd/"' in dlss, "wide(): non-ASCII folders by descriptor"
+    # (bounded retry on transient VRAM OOM; cleared on feature creation, release(), and dlss_retry())
+    assert "dlss_checks::retry::verdict(s.refusal, key, texture_frame_no())" in dlss, "prepare: checks retry verdict"
+    assert "dlss_checks::retry::failed(s.refusal, key, out_of_memory, texture_frame_no())" in dlss and \
+        "NVSDK_NGX_Result_FAIL_OutOfGPUMemory" in dlss, "prepare: records OOM retry"
+    assert "dlss_checks::retry::made(s.refusal)" in dlss, "prepare: made clears refusal"
+    rel_start = dlss.index("void release() {")
+    release = dlss[rel_start:dlss.index("\nuint64_t memory()", rel_start)]
+    retry_start = dlss.index("void dlss_retry() { st().refusal")
+    retry = dlss[retry_start:dlss.index("}", retry_start) + 1]
+    assert "s.refusal = {}" in release, "release() clears refusal"
+    assert "st().refusal = {}" in retry, "dlss_retry() clears refusal"
 
 
 def main():

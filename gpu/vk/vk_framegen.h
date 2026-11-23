@@ -29,11 +29,18 @@ struct PendingPresent {
     VkFence done = VK_NULL_HANDLE;           // (the copy's fence)
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     uint64_t reflex_frame = ~0ull;           // (NVIDIA Reflex: the frame it shows, vk_reflex.h reflex_present_frame)
+    uint64_t antilag_frame = ~0ull;          // (AMD Anti-Lag 2: the frame it shows, vk_antilag.h antilag_present_frame)
     uint64_t swapchain_generation = 0;
 };
 extern thread_local PendingPresent* present_defer_into;
 bool present_commit(const PendingPresent& p);   // (false: not shown, nothing deferred or a swapchain made again since)
-/// The Insert menu's upscaling of a frame to the window (dw x dh), recorded: the image to show, or null when it is off
-VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh);
+/// Window-scale / sharpness / CRT pass (dw x dh), recorded: returns image to show (and optional *out_view), or null if skipped.
+VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4],
+                       uint32_t dw, uint32_t dh, VkImageView* out_view = nullptr, bool pq = false);
+/// HDR10 ST.2084 + RenoDX contrast + Rec.2020 colour-vision output pass (dw x dh, A2B10G10R10_UNORM).
+VkImage framegen_hdr(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4],
+                     uint32_t dw, uint32_t dh, bool pq, int colour_vision);
+/// True while Native HDR is presenting a 10-bit PQ picture directly from the game.
+bool crt_native_pq();
 
 } // namespace mkwvk

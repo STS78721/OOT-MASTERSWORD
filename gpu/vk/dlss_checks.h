@@ -51,6 +51,39 @@ inline int mode_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh, const Mode
 /// later once the size dropped (119 ms, then 29.5 ms)
 inline bool dlaa_feature(bool full, bool native_aa, bool prefer_scaled) { return full && (native_aa || !prefer_scaled); }
 
+/// A DLSS feature creation refused for want of video memory is often temporary: an old feature and its VRAM from a menu
+/// switch may still be waiting in temporal_later to be released (vk_dlss.cpp prepare). NGX's out-of-video-memory result
+/// is tried again after kRetryFrames, at most kMaxTries creations; any other result is kept until a DLSS setting changes
+/// (dlss_retry) or the engine is released (release). The key covers output size, quality mode, and preset.
+namespace retry {
+constexpr uint64_t kRetryFrames = 600;   // (~10 s at 60 fps: old NGX feature memory is released within seconds)
+constexpr unsigned kMaxTries = 3;        // (total creations that may fail for one key, including the first)
+struct Refusal {
+    uint64_t key = 0;        // (0: none refused)
+    uint64_t retry_at = 0;   // (frame at which the next attempt is due)
+    unsigned tries = 0;      // (creations that failed for this key)
+    bool ended = false;      // (no more automatic retries: non-OOM failure or kMaxTries reached)
+};
+enum class Verdict { None, Wait, Try, Ended };
+inline Verdict verdict(const Refusal& r, uint64_t key, uint64_t frame) {
+    if (!r.key || r.key != key) return Verdict::None;
+    if (r.ended) return Verdict::Ended;
+    return frame >= r.retry_at ? Verdict::Try : Verdict::Wait;
+}
+inline bool failed(Refusal& r, uint64_t key, bool out_of_memory, uint64_t frame) {
+    if (r.key != key) r = {};
+    r.key = key;
+    r.tries++;
+    if (!out_of_memory || r.tries >= kMaxTries) {
+        r.ended = true;
+        return true;
+    }
+    r.retry_at = frame + kRetryFrames;
+    return false;
+}
+inline void made(Refusal& r) { r = {}; }
+} // namespace retry
+
 /// Whether s is all ASCII: NGX's Linux library takes only such paths (vk_dlss.cpp wide())
 inline bool ascii(std::string_view s) {
     for (const char c : s)

@@ -1193,7 +1193,7 @@ void cap_destroy_worker() {
             item = cap_destroy_q.front();
             cap_destroy_q.pop_front();
         }
-        if (!cap_shutting_down.load()) destroy_buffer(item.buffer, item.alloc);
+        if (!cap_shutting_down.load()) reap_wait_turn(), destroy_buffer(item.buffer, item.alloc);
     }
 }
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size, bool from_worker = false) {

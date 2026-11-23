@@ -1,17 +1,37 @@
 #version 450
-// (hookshot) NVIDIA DLSS's picture into OoT's gameplay upscale's output (vk_dlss.cpp): what the network's own output
+// (relink) NVIDIA DLSS's picture into OoT's gameplay upscale's output (vk_dlss.cpp): what the network's own output
 // does, the square of its perceptual encoding (linear colour again). DLAA's picture is at the render size: scaled up to the
 // output's with the sampler's linear filter.
+// (relink, 0.7.9.3) and sharpened first, when the Sharpness row asks: DLSS's and FSR's pictures are softer than the game's
+// own network's, and the row's sharpening came after the HUD, on the window's picture, text and icons with it. Here it is
+// the 3D alone, at its own size, in the perceptual encoding (as the eye weighs it): the pixel pushed away from the mean of
+// its four neighbours and held near the darkest and the lightest of the five: it may pass them by pc.over of their
+// distance, no more. Held exactly between them (over 0) the edge only gets steeper and the measure stopped at 7.2 where the
+// game's own network gives 9.6 to 10 (the mean luma step of the Market's house fronts, DLSS at 5.9 unsharpened): the game's
+// network overshoots its edges, and so must this to look like it. The overshoot is a share of the local contrast, so flat
+// parts (sky, noise) get next to none and an edge's halo is as small as the edge is soft. pc.sharp: 0 none
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
-layout(push_constant) uniform P { ivec2 size; } pc;
+// pc.linear 1: the picture given is linear colour (FSR 3.1's, given linear colour): its square root taken first
+layout(push_constant) uniform P { ivec2 size; float sharp; float over; int linear; } pc;
+vec3 tap(ivec2 g, bool same) {
+    const ivec2 q = clamp(g, ivec2(0), pc.size - 1);
+    const vec3 c = same ? texelFetch(src, q, 0).rgb : textureLod(src, (vec2(q) + 0.5) / vec2(pc.size), 0.0).rgb;
+    return pc.linear != 0 ? sqrt(max(c, vec3(0.0))) : max(c, vec3(0.0));
+}
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
-    vec3 c = all(equal(textureSize(src, 0), pc.size)) ? texelFetch(src, g, 0).rgb
-                                                     : textureLod(src, (vec2(g) + 0.5) / vec2(pc.size), 0.0).rgb;
-    c = max(c, vec3(0.0));
+    const bool same = all(equal(textureSize(src, 0), pc.size));
+    vec3 c = tap(g, same);
+    if (pc.sharp > 0.0) {
+        const vec3 n = tap(g + ivec2(0, -1), same), s = tap(g + ivec2(0, 1), same);
+        const vec3 w = tap(g + ivec2(-1, 0), same), e = tap(g + ivec2(1, 0), same);
+        const vec3 lo = min(min(min(n, s), min(w, e)), c), hi = max(max(max(n, s), max(w, e)), c);
+        const vec3 room = (hi - lo) * pc.over;
+        c = clamp(c + pc.sharp * (c - (n + s + w + e) * 0.25), max(lo - room, vec3(0.0)), min(hi + room, vec3(1.0)));
+    }
     c *= c;
     imageStore(dst, g, vec4(c, 1.0));
 }

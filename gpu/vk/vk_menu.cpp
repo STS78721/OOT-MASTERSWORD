@@ -4,6 +4,7 @@
 // (hookshot) A gamepad's Home button, or Select and Start together, opens it too; the D-pad chooses and changes, the bottom
 // face button changes too, the right one closes. The game gets no gamepad input while it is open either.
 // Its Controls page binds the Switch's buttons to gamepad inputs and keys.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,8 @@
 #include "vk_imgui.h"
 #include "vk_ui.h"
 #include "vk_reflex.h"
+#include "vk_antilag.h"
+#include "vk_framegen.h"
 #include "vk_progress.h"
 #include "vk_draw.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -40,6 +43,7 @@ namespace mkwvk {
 HWND app_window();
 
 Options opts;
+int menu_intel_compiles() { return opts.intel_compiles; }
 
 namespace {
 
@@ -48,7 +52,8 @@ enum MenuTab {
     TAB_GAMEPLAY = 1,
     TAB_COLOUR = 2,
     TAB_CONTROLS = 3,
-    TAB_COUNT = 4
+    TAB_DEBUG = 4,
+    TAB_COUNT = 5
 };
 
 struct Row {
@@ -92,9 +97,152 @@ const char* tx_nodix_quality(int v) {
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_hybrid(int v) { return v ? "On (Recommended)" : "Off"; }   // (0.1.9c: Intel Hybrid CPU Patch)
 const char* tx_menu_theme(int v) {
-    static const char* t[] = {"OOT Mastersword", "Light", "Dark", "Longshot"};
+    static const char* t[] = {"OOT Mastersword", "Light", "Dark", "Longshot", "OOT Mastersword (Amber)"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
+}
+const char* tx_dlss_model(int v) {
+    static const char* t[] = {"K (Transformer)", "M (Transformer 2)", "L (Transformer 2)", "NVIDIA Default"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_aniso(int v) {
+    static const char* t[] = {"Game's own", "2x", "4x", "8x", "16x"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_grass(int v) {
+    static const char* t[] = {"Default", "1.5x", "2x", "3x"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_hdr(int v) {
+    static const char* t[] = {"Off", "Expanded", "Native"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    if (v > 0 && !dev.hdr) {
+        static char b[48];
+        const char* why = dev.hdr_sdr_why == Device::hdr_sdr_os_off       ? "Windows HDR off"
+                        : dev.hdr_sdr_why == Device::hdr_sdr_no_extension ? "no HDR ext"
+                        : dev.hdr_sdr_why == Device::hdr_sdr_driver       ? "driver SDR"
+                                                                          : "SDR fallback";
+        snprintf(b, sizeof b, "%s (%s)", t[v], why);
+        return b;
+    }
+    return t[v];
+}
+const char* tx_nits(int v) {
+    static char b[16];
+    snprintf(b, sizeof b, "%d nits", v);
+    return b;
+}
+const char* tx_crt_filter(int v) {
+    static const char* t[] = {"Off", "Lottes Aperture", "Lottes TV", "Hyllian", "ZFast"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    if (v > 0 && crt_native_pq()) {
+        static char b[48];
+        snprintf(b, sizeof b, "%s (off in Native HDR)", t[v]);
+        return b;
+    }
+    return t[v];
+}
+const char* tx_crt_lines(int v) {
+    static const char* t[] = {"240p", "480p", "720p"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_threaded(int v) {
+    static const char* t[] = {"Auto", "On", "Off"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_colour_vision(int v) {
+    static const char* t[] = {"Off", "Protan (Red-weak)", "Deutan (Green-weak)", "Tritan (Blue-weak)"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_fps_mode(int v) {
+    static const char* t[] = {"Off", "FPS", "Frame time", "Graph", "Detailed"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_fps_corner(int v) {
+    static const char* t[] = {"Top right", "Top left", "Bottom right", "Bottom left"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_audio_output(int v) {
+    static const char* t[] = {"Auto", "Stereo", "5.1 Surround"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_mic(int v) {
+    if (v <= 0) return "Off";
+    if (v == 1) return "System default";
+    const int idx = v - 2;
+    if (host && host->mic_count && host->mic_name && idx < host->mic_count()) {
+        if (const char* name = host->mic_name(idx)) return name;
+    }
+    static char b[24];
+    snprintf(b, sizeof b, "Microphone %d", idx + 1);
+    return b;
+}
+const char* tx_menu_shortcut(int v) {
+    static const char* t[] = {"Insert / F1", "F1 only", "Insert / F1 / Esc"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_pad_menu(int v) { return v ? "Home / Select+Start" : "Select+Start only"; }
+const char* tx_rumble(int v) {
+    if (v <= 0) return "Off";
+    static char b[12];
+    snprintf(b, sizeof b, "%d%%", v);
+    return b;
+}
+const char* tx_deadzone(int v) {
+    static const char* t[] = {"Off (0%)", "5%", "10%", "15%", "20%", "25%", "30%"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_gyro_deadzone(int v) {
+    static const char* t[] = {"Off", "Normal", "High"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_gyro(int v) {
+    if (!v) return "Off";
+    if (host && host->gyro_status) {
+        const int st = host->gyro_status();
+        if (st == 0) return "On (no controller)";
+        if (st == 1) return "On (no gyro)";
+    }
+    return "On";
+}
+const char* tx_prompts(int v) {
+    static const char* t[] = {"Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    if (v == 0 && host && host->prompt_face) {
+        const int face = host->prompt_face();
+        if (face >= 0 && face < 5) {
+            static char b[40];
+            snprintf(b, sizeof b, "Auto (%s)", t[face + 1]);
+            return b;
+        }
+    }
+    return t[v];
+}
+const char* tx_present_queue(int v) {
+    static const char* t[] = {"Auto", "On", "Off"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_intel_compiles(int v) {
+    static const char* t[] = {"Auto", "Parallel", "Serial"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
+const char* tx_antilag(int v) {
+    if (!v) return "Off";
+    return antilag_available() ? "On" : "On (unavailable)";
 }
 const char* tx_ui_size(int v) {
     static const char* t[] = {"Small", "Medium", "Large"};
@@ -326,9 +474,10 @@ void apply_preset(int p) {
 
 Row rows[] = {
     // Graphics
-    {TAB_GRAPHICS, "Menu theme", &opts.menu_theme, 0, 3, 1, tx_menu_theme,
+    {TAB_GRAPHICS, "Menu theme", &opts.menu_theme, 0, 4, 1, tx_menu_theme,
      "OOT Mastersword: Lost Woods greens with Master Sword blue and gold. Light: Switch settings grey and cyan. "
-     "Dark: near-black panels with crimson accents. Longshot: warm bronze, parchment, and gold.",
+     "Dark: near-black panels with crimson accents. Longshot: warm bronze, parchment, and gold. "
+     "OOT Mastersword (Amber): warm mahogany leather, terracotta copper, and glowing amber accents inspired by the in-game Options screen.",
      true, false},
     {TAB_GRAPHICS, "Menu size", &opts.menu_size, 1, 3, 1, tx_ui_size,
      "Size of the Insert menu and start-up screen (Small, Medium, or Large). Separate from the FPS overlay size.",
@@ -340,6 +489,19 @@ Row rows[] = {
     {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart.",
      true, true},
+    {TAB_GRAPHICS, "HDR", &opts.hdr, 0, 2, 1, tx_hdr,
+     "High Dynamic Range (HDR10 ST.2084) when Windows HDR is active on your display. Expanded lifts SDR highlights cleanly; "
+     "Native asks the game for its own 10-bit PQ output. Falls back cleanly to SDR on non-HDR screens.",
+     true, false},
+    {TAB_GRAPHICS, "HDR paper white", &opts.hdr_white, 80, 400, 10, tx_nits,
+     "Brightness of normal white text, UI, and diffuse surfaces in HDR (default 200 nits).",
+     true, false},
+    {TAB_GRAPHICS, "HDR peak brightness", &opts.hdr_peak, 400, 4000, 100, tx_nits,
+     "Maximum highlight brightness for your HDR monitor or TV (default 1000 nits).",
+     true, false},
+    {TAB_GRAPHICS, "HDR contrast", &opts.hdr_contrast, 50, 200, 5, tx_percent,
+     "Luminance contrast around mid-grey with smooth highlight roll-off to peak brightness. 100% leaves HDR tones unchanged.",
+     true, false},
     {TAB_GRAPHICS, "FG engine", &opts.fg_backend, 0, 6, 1, tx_fg_backend,
      "MasterSword = Hookshot native FG only when chosen. DLSS MFG / Nodix SMFG / FSR / XeSS / Apex FG (Fast) are "
      "separate engine rows (interpolator stand-in until vendor FG evaluates). The multiplier you pick is the one that is made. Off disables FG. "
@@ -365,7 +527,10 @@ Row rows[] = {
      "On waits for the display refresh (FIFO). Mailbox shows the latest finished frame on the next refresh, without tearing. "
      "Off presents immediately and can tear. Changes at once. RX_VK_FIFO / RX_VK_IMMEDIATE still choose for a run."},
     {TAB_GRAPHICS, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_reflex,
-     "Low-latency pacing on NVIDIA GPUs (VK_NV_low_latency2). Boost also raises GPU clocks. Hidden effect on AMD/Intel."},
+     "Low-latency pacing on NVIDIA GPUs (VK_NV_low_latency2). Boost also raises GPU clocks. No effect on AMD/Intel."},
+    {TAB_GRAPHICS, "AMD Anti-Lag 2", &opts.antilag, 0, 1, 1, tx_antilag,
+     "Low-latency pacing on AMD Radeon GPUs (VK_AMD_anti_lag). Reduces input latency when GPU-bound; inactive on non-AMD GPUs.",
+     true, false},
     {TAB_GRAPHICS, "Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
      "Internal 3D size as a percent of Output resolution (like a PC title). Auto lets the game lower it when the GPU is busy. "
      "With XeSS/FSR/Nodix selected, their quality row sets this live (e.g. FSR Quality = 67% of 1440p/4K)."},
@@ -388,14 +553,35 @@ Row rows[] = {
     {TAB_GRAPHICS, "DLSS quality", &opts.dlss_quality, 0, 4, 1, tx_dlss_quality,
      "DLSS SR quality (transformer presets): Quality/Balanced/DLAA use preset K, Performance uses M, Ultra Performance uses L. "
      "Also sets 3D render scale of Output."},
+    {TAB_GRAPHICS, "DLSS model", &opts.dlss_model, 0, 3, 1, tx_dlss_model,
+     "Chooses which NVIDIA DLSS neural network preset runs (K Transformer default, M/L Transformer Gen 2, or NVIDIA Default).",
+     true, false},
     {TAB_GRAPHICS, "FSR 4 quality", &opts.dlss_quality, 0, 4, 1, tx_fsr4_quality,
      "FSR 4 quality: same render-scale shares as DLSS (Quality 67% … Ultra Performance 33%), plus Native AA at full Output. "
      "Needs AMD's FSR 4 runtime and a GPU AMD's library lists an FSR 4 model for."},
+    {TAB_GRAPHICS, "Upscaler sharpness", &opts.up_sharpness, 0, 100, 10, tx_percent,
+     "Contrast-adaptive sharpening applied right after DLSS, FSR 3.1, or FSR 4 — before the HUD is drawn, so UI text stays clean.",
+     true, false},
     {TAB_GRAPHICS, "SMAA", &opts.smaa, 0, 1, 1, tx_onoff,
      "Subpixel Morphological Anti-Aliasing on the present (iryoku SMAA Medium). Softens shimmering edges after the game "
      "draws, before upscaling. The game's own title SMAA is separate."},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "Sharpens the picture as it goes to the window, with or without an upscaling filter. Too much shows halos around edges."},
+    {TAB_GRAPHICS, "Anisotropic filtering", &opts.anisotropy, 0, 4, 1, tx_aniso,
+     "Sharpens ground, road, and wall textures viewed at shallow angles. Applies live without a restart.",
+     true, false},
+    {TAB_GRAPHICS, "Grass distance", &opts.grass_distance, 0, 3, 1, tx_grass,
+     "Pushes out the fade-out distance of instanced grass and foliage in open areas (1.5x, 2x, or 3x). Applies live.",
+     true, false},
+    {TAB_GRAPHICS, "CRT filter", &opts.crt_filter, 0, 4, 1, tx_crt_filter,
+     "Retro CRT tube simulation (scanlines and phosphor mask) applied after scaling and before menus. Disabled automatically in Native HDR.",
+     true, false},
+    {TAB_GRAPHICS, "CRT lines", &opts.crt_lines, 0, 2, 1, tx_crt_lines,
+     "Virtual scanline resolution for the CRT filter (240p classic, 480p EDTV, or 720p crisp scanlines; clamped to half output height).",
+     true, false},
+    {TAB_GRAPHICS, "Threaded rendering", &opts.threaded_rendering, 0, 2, 1, tx_threaded,
+     "Runs Vulkan command replay on a dedicated render thread for steadier frame pacing. Auto enables on 6+ core CPUs. Applies after a restart.",
+     true, true},
     {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
      "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart.",
      false, true},
@@ -414,8 +600,12 @@ Row rows[] = {
      "Saves options and closes MasterSword. Enter or the bottom face button quits."},
 
     // Gameplay
-    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
-     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate."},
+    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 4, 1, tx_fps_mode,
+     "On-screen performance overlay: Off, compact FPS, Frame time + 1% lows, real-time Frame-time Graph, or Detailed (VRAM, active tech, GPU).",
+     true, false},
+    {TAB_GAMEPLAY, "FPS corner", &opts.fps_corner, 0, 3, 1, tx_fps_corner,
+     "Which corner of the screen displays the FPS counter.",
+     true, false},
     {TAB_GAMEPLAY, "Overlay size", &opts.overlay_size, 1, 3, 1, tx_ui_size,
      "Size of the in-game FPS overlay (Small, Medium, or Large). Separate from the Insert menu size.",
      true, false},
@@ -432,6 +622,21 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear. Normal is the game's own pace, with its pauses. Instant shows "
      "each page at once, as pressing A does."},
+    {TAB_GAMEPLAY, "Audio output", &opts.audio_output, 0, 2, 1, tx_audio_output,
+     "Audio channel layout handed to the game (Auto matches Windows, Stereo forces 2.0, 5.1 forces surround). Applies after a restart.",
+     true, true},
+    {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 16, 1, tx_mic,
+     "Microphone device for in-game audio input (such as Ocarina mic support). Changes apply immediately.",
+     true, false},
+    {TAB_GAMEPLAY, "Discord status", &opts.discord, 0, 1, 1, tx_onoff,
+     "Shares your play session via Discord Rich Presence while Discord is running.",
+     true, false},
+    {TAB_GAMEPLAY, "Menu shortcut", &opts.menu_shortcut, 0, 2, 1, tx_menu_shortcut,
+     "Which keyboard keys open this menu. Esc always closes the menu when open.",
+     true, false},
+    {TAB_GAMEPLAY, "Controller menu button", &opts.pad_menu, 0, 1, 1, tx_pad_menu,
+     "Allows the controller Home / Guide button to open this menu. Select + Start always opens it as a fallback.",
+     true, false},
     {TAB_GAMEPLAY, "Quit to Desktop", nullptr, 0, 0, 0, nullptr,
      "Saves options and closes MasterSword. Enter or the bottom face button quits."},
 
@@ -447,6 +652,9 @@ Row rows[] = {
      "Colour intensity. 100% is unchanged; higher is more vivid."},
     {TAB_COLOUR, "Gamma", &opts.color_gamma, 80, 120, 1, tx_gamma,
      "Power curve after the other three; 1.00 leaves it. Lower opens shadows (Vivid uses 0.95)."},
+    {TAB_COLOUR, "Colour vision", &opts.colour_vision, 0, 3, 1, tx_colour_vision,
+     "Luminance-preserving Daltonization filter for colour-vision deficiency (Protan, Deutan, or Tritan). Works in both SDR and HDR.",
+     true, false},
 
     // Controls
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
@@ -458,25 +666,77 @@ Row rows[] = {
     {TAB_CONTROLS, "Mouse sensitivity", &opts.mouse_sens, 10, 500, 10, tx_sens,
      "How far the camera turns for a given mouse movement, for either Mouse camera. At 1.00 native look turns a tenth of a "
      "degree a count. The - and = keys change it in the game too."},
+    {TAB_CONTROLS, "Disable camera centering", &opts.disable_camera_centering, 0, 1, 1, tx_onoff,
+     "Stops the camera from automatically pulling back behind Link while moving in Native mouse camera mode.",
+     true, false},
     {TAB_CONTROLS, "Left stick speed", &opts.stick_l_sens, 10, 500, 10, tx_sens,
      "How far the left analog stick pushes movement for a given deflection. 100% is stock. Keyboard WASD is unchanged."},
     {TAB_CONTROLS, "Right stick speed", &opts.stick_r_sens, 10, 500, 10, tx_sens,
      "How far the right analog stick turns the camera for a given deflection. 100% is stock. Mouse look uses Mouse sensitivity."},
+    {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 150, 25, tx_rumble,
+     "Controller vibration and HD rumble intensity (0% Off up to 150%). Changes apply immediately.",
+     true, false},
+    {TAB_CONTROLS, "Stick dead zone", &opts.stick_dead_zone, 0, 6, 1, tx_deadzone,
+     "Inner dead zone for analog sticks (0% to 30%) to stop stick drift. Changes apply immediately.",
+     true, false},
     {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff,
      "Swaps up and down for the mouse: moving it forward tilts the camera down."},
     {TAB_CONTROLS, "Invert camera X", &opts.invert_cam_x, 0, 1, 1, tx_onoff,
      "Inverts horizontal look (left/right) on the right analog stick."},
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
      "Inverts vertical look (up/down) on the right analog stick."},
+    {TAB_CONTROLS, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
+     "Uses your controller's gyroscope for aiming (bow, slingshot, hookshot) when a gyro-capable gamepad is connected.",
+     true, false},
+    {TAB_CONTROLS, "Motion sensitivity X", &opts.gyro_sens_x, 10, 300, 10, tx_percent,
+     "Horizontal gyroscope aiming sensitivity (100% is default).",
+     true, false},
+    {TAB_CONTROLS, "Motion sensitivity Y", &opts.gyro_sens_y, 10, 300, 10, tx_percent,
+     "Vertical gyroscope aiming sensitivity (100% is default).",
+     true, false},
+    {TAB_CONTROLS, "Invert motion X", &opts.gyro_inv_x, 0, 1, 1, tx_onoff,
+     "Inverts horizontal gyroscope aiming.",
+     true, false},
+    {TAB_CONTROLS, "Invert motion Y", &opts.gyro_inv_y, 0, 1, 1, tx_onoff,
+     "Inverts vertical gyroscope aiming.",
+     true, false},
+    {TAB_CONTROLS, "Motion deadzone", &opts.gyro_deadzone, 0, 2, 1, tx_gyro_deadzone,
+     "Filters out small hand tremors during gyroscope aiming.",
+     true, false},
+    {TAB_CONTROLS, "Button prompts", &opts.prompts, 0, 5, 1, tx_prompts,
+     "Controller button icons shown in-game (Auto matches your connected pad, or pick Switch/Xbox/PS4/PS5/Steam Deck). Applies after a restart.",
+     true, true},
     {TAB_CONTROLS, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
      "Nintendo (default Switch order), Xbox / PC (A for action/talk), or Swap Face. Individual bindings switch this to Custom."},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
+
+    // Debug
+    {TAB_DEBUG, "ASTC as RGBA8", &opts.astc_rgba8, 0, 1, 1, tx_onoff,
+     "Decodes ASTC textures to uncompressed RGBA8 instead of BC3/BC7. Uses more VRAM; useful if a driver shows texture compression artefacts. Applies after a restart.",
+     true, true},
+    {TAB_DEBUG, "Present queue", &opts.present_queue, 0, 2, 1, tx_present_queue,
+     "Controls whether swapchain presents use a dedicated compute queue when available to reduce main-queue stalls. Applies after a restart.",
+     true, true},
+    {TAB_DEBUG, "Intel shader compiles", &opts.intel_compiles, 0, 2, 1, tx_intel_compiles,
+     "Controls shader compilation serialization on Intel GPUs (Auto serializes on Intel drivers to prevent driver crashes; Parallel runs multi-threaded). Applies after a restart.",
+     true, true},
+    {TAB_DEBUG, "Heart protection", &opts.cheat_hearts, 0, 1, 1, tx_onoff,
+     "Session-only debug toggle (not saved): prevents Link's hearts from dropping to zero.",
+     true, false},
+    {TAB_DEBUG, "No-clip flight", &opts.cheat_flight, 0, 1, 1, tx_onoff,
+     "Session-only debug toggle (not saved): lets Link fly freely through geometry.",
+     true, false},
+    {TAB_DEBUG, "Free camera", &opts.cheat_camera, 0, 1, 1, tx_onoff,
+     "Session-only debug toggle (not saved): detaches the camera to explore scenes freely.",
+     true, false},
+    {TAB_DEBUG, "Quit to Desktop", nullptr, 0, 0, 0, nullptr,
+     "Saves options and closes MasterSword. Enter or the bottom face button quits."},
 };
 constexpr int kRows = sizeof rows / sizeof rows[0];
 
 int cur_tab = TAB_GRAPHICS;
-int tab_selected[TAB_COUNT] = {0, 0, 0, 0};
+int tab_selected[TAB_COUNT] = {0, 0, 0, 0, 0};
 
 /// A Frame generation step this engine shows. Off, then 2 up to opts_fg_mult_max().
 /// 5x is a Nodix and Apex step (both publish ×2–×6). MasterSword and the others skip 5 and 7.
@@ -515,8 +775,9 @@ void clamp_framegen_steps() {
     opts.framegen = 2;
 }
 
-/// Sub-options only appear for the engine / upscaler they belong to (keeps Graphics readable).
+/// Sub-options only appear for the engine / upscaler / mode they belong to (keeps tabs readable).
 bool row_visible(const Row& r) {
+    if (r.value == &opts.hdr_white || r.value == &opts.hdr_peak || r.value == &opts.hdr_contrast) return opts.hdr != 0;
     if (r.value == &opts.framegen) return opts.fg_backend > 0;                 // multiplier only with an FG engine
     // DLSS FG preset (A/B/C): hide for MasterSword / SMFG / FSR / XeSS / Apex — DLSS MFG only.
     if (r.value == &opts.framegen_preset || !strcmp(r.name, "DLSS FG preset")) return opts.fg_backend == 3;
@@ -528,6 +789,13 @@ bool row_visible(const Row& r) {
         if (!strcmp(r.name, "FSR 4 quality")) return opts.upscale == 9;
         return opts.upscale == 8;   // DLSS quality
     }
+    if (r.value == &opts.dlss_model) return opts.upscale == 8;
+    if (r.value == &opts.up_sharpness) return opts.upscale == 8 || opts.upscale == 9 || opts.upscale == 4;
+    if (r.value == &opts.crt_lines) return opts.crt_filter != 0;
+    if (r.value == &opts.fps_corner) return opts.show_fps > 0;
+    if (r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.gyro_inv_x ||
+        r.value == &opts.gyro_inv_y || r.value == &opts.gyro_deadzone)
+        return opts.gyro != 0;
     return true;
 }
 
@@ -571,7 +839,7 @@ int drag_row = -1;
 bool mouse_read = false;
 float scroll_at[TAB_COUNT + 1] = {};
 float scroll_want[TAB_COUNT + 1] = {};
-int scrolled_to[TAB_COUNT + 1] = {-1, -1, -1, -1, -1};
+int scrolled_to[TAB_COUNT + 1] = {-1, -1, -1, -1, -1, -1};
 int wheel_rows[TAB_COUNT + 1] = {};
 float ease_step = 1.0f;
 bool pad_last = false;
@@ -618,15 +886,39 @@ std::string restart_list(const char* last) {
 }
 
 bool is_slider(const Row& r) {
-    return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.stick_l_sens ||
-           r.value == &opts.stick_r_sens || r.value == &opts.fg_flow || r.value == &opts.fov ||
-           r.value == &opts.color_brightness || r.value == &opts.color_contrast ||
+    return r.value == &opts.sharpness || r.value == &opts.up_sharpness || r.value == &opts.mouse_sens ||
+           r.value == &opts.stick_l_sens || r.value == &opts.stick_r_sens || r.value == &opts.fg_flow ||
+           r.value == &opts.fov || r.value == &opts.color_brightness || r.value == &opts.color_contrast ||
            r.value == &opts.color_saturation || r.value == &opts.color_gamma ||
+           r.value == &opts.hdr_white || r.value == &opts.hdr_peak || r.value == &opts.hdr_contrast ||
+           r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y ||
            (r.value && r.text == tx_percent && r.hi - r.lo >= 50 && r.step >= 5);
 }
 bool stops_at_ends(const Row& r) {
     return is_slider(r) || r.value == &opts.mouse_sens || r.value == &opts.stick_l_sens ||
            r.value == &opts.stick_r_sens || r.value == &opts.fov;
+}
+bool is_session_only(const Row& r) {
+    return r.value == &opts.cheat_hearts || r.value == &opts.cheat_flight || r.value == &opts.cheat_camera;
+}
+void mic_sync_hi() {
+    const int hi = host && host->mic_count ? std::min(16, 1 + std::max(0, host->mic_count())) : 1;
+    for (Row& r : rows)
+        if (r.value == &opts.mic) r.hi = hi;
+    if (opts.mic > hi) opts.mic = hi >= 1 ? 1 : 0;
+}
+void mic_apply() {
+    if (!host || !host->mic_select) return;
+    if (opts.mic <= 0) {
+        host->mic_select(0, "", -1);
+    } else if (opts.mic == 1) {
+        host->mic_select(1, "", -1);
+    } else {
+        const int idx = opts.mic - 2;
+        const int cnt = host->mic_count ? host->mic_count() : 0;
+        const char* name = (idx < cnt && host->mic_name) ? host->mic_name(idx) : "";
+        host->mic_select(2, name ? name : "", idx < cnt ? idx : -1);
+    }
 }
 
 // (a value too long for its row, a GPU's name: the selected row's slides through it, a character a step, resting at
@@ -650,7 +942,13 @@ const char* ini_key(const Row& r) {
     if (r.value == &opts.hybrid_cpu) return "hybrid_cpu";   // Intel Hybrid CPU Patch, host/hos_thread.c reads it at start
     if (r.value == &opts.mesh_mode) return "mesh_shaders";  // gpu/vk/vk_main.cpp reads at device create
     if (r.value == &opts.framegen_preset) return "fg_model"; // stable key (row renamed to DLSS FG preset)
-    static char k[32];
+    if (r.value == &opts.prompts) return "button_prompts";   // host/prompts.c reads this at start
+    if (r.value == &opts.audio_output) return "audio_output"; // host/nn_audio.c reads this at start
+    if (r.value == &opts.rumble) return "rumble_strength";
+    if (r.value == &opts.stick_dead_zone) return "stick_dead_zone";
+    if (r.value == &opts.up_sharpness) return "upscaler_sharpness";
+    if (r.value == &opts.antilag) return "amd_antilag";
+    static char k[48];
     size_t n = 0;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
     k[n] = 0;
@@ -732,7 +1030,7 @@ void save() {
     }
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         for (const Row& r : rows)
-            if (r.value) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
+            if (r.value && !is_session_only(r)) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load)
         // (v7: SMAI moved to Upscaling; FG is Off/Hookshot/SMFG/DLSS/FSR/XeSS. v6 Hookshot=1. v5 colour.)
@@ -845,7 +1143,7 @@ std::string key_slot_text(int button, int slot) {
 
 // ---- what is drawn: Dear ImGui draw lists over the window's image (vk_ui.h, vk_imgui.cpp) ----
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
-const char* const tab_titles[TAB_COUNT] = {"Graphics", "Gameplay", "Colour", "Controls"};
+const char* const tab_titles[TAB_COUNT] = {"Graphics", "Gameplay", "Colour", "Controls", "Debug"};
 constexpr int kVersionMinPt = 10;
 
 ui::Ctx ui_ctx(uint32_t w, uint32_t h) {
@@ -1127,9 +1425,11 @@ void draw_options(ui::Ctx& c) {
     column(c, cx0, cx1, hh);
     const int count = std::max(1, tab_row_count(cur_tab)), sel = tab_selected[cur_tab];
     const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
-    const std::string pending_line = (cur_tab == TAB_GRAPHICS || cur_tab == TAB_GAMEPLAY) && restart_pending()
-                                         ? restart_line(c, 16 * s, hx1 - hx0 - 66 * s)
-                                         : "";
+    const std::string pending_line =
+        (cur_tab == TAB_GRAPHICS || cur_tab == TAB_GAMEPLAY || cur_tab == TAB_CONTROLS || cur_tab == TAB_DEBUG) &&
+                restart_pending()
+            ? restart_line(c, 16 * s, hx1 - hx0 - 66 * s)
+            : "";
     static float help_tall = 0, help_tall_w = 0;
     if (help_tall_w != hx1 - hx0) help_tall_w = hx1 - hx0, help_tall = measure_help(c, hx1 - hx0 - 48 * s);
     ui::Prompt prompt_list[6] = {{ui::kUpDown, "Choose"}};
@@ -1345,7 +1645,17 @@ void draw_menu(ui::Ctx& c) {
 }
 
 char fps_text[48] = "";
-char fps_sub[48] = "";
+char fps_sub[64] = "";
+char fps_detail[64] = "";
+char fps_extra1[96] = "";
+char fps_extra2[96] = "";
+constexpr int kFtSamples = 120;
+std::mutex ft_mu;
+float ft_ring[kFtSamples] = {};
+int ft_head = 0, ft_count = 0;
+int64_t ft_last_ns = 0;
+float ft_snap[kFtSamples] = {};
+int ft_snap_n = 0;
 
 struct Tab {
     ImFont* font;
@@ -1387,15 +1697,55 @@ struct Tab {
 void draw_fps(ui::Ctx& c, bool under_banner) {
     float ov_safe = c.safe;
     const float s = ui::unit(c.h, opts.overlay_size, &ov_safe), big = 28 * s, small = 13 * s;
+    const int mode = std::clamp(opts.show_fps, 1, 4);
+    const int corner = std::clamp(opts.fps_corner, 0, 3);
+    const bool is_right = (corner == 0 || corner == 2);
+    const bool is_bottom = (corner == 2 || corner == 3);
     const ImU32 green = ui::rgba(72, 255, 110);
+    const ImU32 soft_ink = ui::rgba(226, 232, 226);
+    const ImU32 muted_ink = ui::rgba(190, 198, 195);
     const Tab num(c.f.strong, big), tab(c.f.strong, small);
     const float nw = num.width(fps_text), lw = ui::size_of(c.f.strong, small, "FPS").x;
+    const float top_row_w = nw + 4 * s + lw;
     const float sw = fps_sub[0] ? tab.width(fps_sub) : 0;
-    const bool beside = menu_ox >= std::max(nw + 4 * s + lw, sw) + ov_safe + c.safe + 8 * s;
-    const float edge = c.w - ov_safe;
-    const float top = under_banner && page != 5 && !beside ? banner_h(c) + 10 * s : ov_safe;
+    const float dw = (mode >= 2 && fps_detail[0]) ? tab.width(fps_detail) : 0;
+    const float e1w = (mode >= 4 && fps_extra1[0]) ? tab.width(fps_extra1) : 0;
+    const float e2w = (mode >= 4 && fps_extra2[0]) ? tab.width(fps_extra2) : 0;
+    const float graph_w = mode >= 3 ? 196 * s : 0;
+    const float graph_h = mode >= 3 ? 44 * s : 0;
+    const float line_h = 17 * s;
+    const float pad = mode >= 3 ? 10 * s : 0;
+
+    float content_w = std::max({top_row_w, sw, dw, e1w, e2w, graph_w});
+    float content_h = 30 * s;
+    if (fps_sub[0]) content_h += line_h;
+    if (mode >= 2 && fps_detail[0]) content_h += line_h;
+    if (mode >= 3) content_h += 6 * s + graph_h;
+    if (mode >= 4 && fps_extra1[0]) content_h += 4 * s + line_h;
+    if (mode >= 4 && fps_extra2[0]) content_h += line_h;
+    const float box_w = content_w + 2 * pad;
+    const float box_h = content_h + 2 * pad;
+
+    const bool beside = menu_ox >= box_w + ov_safe + c.safe + 8 * s;
+    const float x0 = is_right ? (c.w - ov_safe - box_w) : ov_safe;
+    float y0 = ov_safe;
+    if (is_bottom) {
+        const float bottom_edge = under_banner && page != 5 && !beside ? ui::prompt_bar_top(c) - 10 * s : c.h - ov_safe;
+        y0 = std::max(ov_safe, bottom_edge - box_h);
+    } else if (under_banner && page != 5 && !beside) {
+        y0 = banner_h(c) + 10 * s;
+    }
+
+    if (mode >= 3) {
+        c.d->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + box_w, y0 + box_h), ui::rgba(10, 14, 14, 185), 6 * s);
+        c.d->AddRect(ImVec2(x0, y0), ImVec2(x0 + box_w, y0 + box_h), ui::rgba(255, 255, 255, 36), 6 * s, 0, std::max(1.0f, s));
+    }
+
+    const float ix0 = x0 + pad, ix1 = x0 + box_w - pad;
+    float y = y0 + pad;
     {
-        const float x = edge - (nw + 4 * s + lw), o = std::max(1.0f, s);
+        const float x = is_right ? (ix1 - top_row_w) : ix0;
+        const float o = std::max(1.0f, s);
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++)
                 if (dx || dy) {
@@ -1404,22 +1754,62 @@ void draw_fps(ui::Ctx& c, bool under_banner) {
                     for (const char* q = fps_text; *q; q++) {
                         one[0] = *q;
                         const float adv = ui::size_of(c.f.strong, big, one).x;
-                        c.d->AddText(c.f.strong, big, ImVec2(gx + (num.digit - adv) * 0.5f + dx * o, top + dy * o), ui::rgba(0, 0, 0, 230), one);
+                        c.d->AddText(c.f.strong, big, ImVec2(gx + (num.digit - adv) * 0.5f + dx * o, y + dy * o), ui::rgba(0, 0, 0, 230), one);
                         gx += num.digit;
                     }
-                    c.d->AddText(c.f.strong, small, ImVec2(x + nw + 4 * s + dx * o, top + 14 * s + dy * o), ui::rgba(0, 0, 0, 230), "FPS");
+                    c.d->AddText(c.f.strong, small, ImVec2(x + nw + 4 * s + dx * o, y + 14 * s + dy * o), ui::rgba(0, 0, 0, 230), "FPS");
                 }
         float gx = x;
         char one[2] = {0, 0};
         for (const char* q = fps_text; *q; q++) {
             one[0] = *q;
             const float adv = ui::size_of(c.f.strong, big, one).x;
-            c.d->AddText(c.f.strong, big, ImVec2(gx + (num.digit - adv) * 0.5f, top), green, one);
+            c.d->AddText(c.f.strong, big, ImVec2(gx + (num.digit - adv) * 0.5f, y), green, one);
             gx += num.digit;
         }
-        c.d->AddText(c.f.strong, small, ImVec2(x + nw + 4 * s, top + 14 * s), green, "FPS");
+        c.d->AddText(c.f.strong, small, ImVec2(x + nw + 4 * s, y + 14 * s), green, "FPS");
+        y += 30 * s;
     }
-    if (fps_sub[0]) tab.draw(c.d, edge - sw, top + 32 * s, ui::rgba(226, 232, 226), fps_sub, s);
+    auto draw_line = [&](const char* txt, float w, ImU32 col) {
+        const float lx = is_right ? (ix1 - w) : ix0;
+        tab.draw(c.d, lx, y, col, txt, s);
+        y += line_h;
+    };
+    if (fps_sub[0]) draw_line(fps_sub, sw, soft_ink);
+    if (mode >= 2 && fps_detail[0]) draw_line(fps_detail, dw, soft_ink);
+    if (mode >= 3) {
+        y += 6 * s;
+        const float gx0 = ix0, gx1 = ix1, gy0 = y, gy1 = y + graph_h;
+        c.d->AddRectFilled(ImVec2(gx0, gy0), ImVec2(gx1, gy1), ui::rgba(0, 0, 0, 120), 3 * s);
+        constexpr float kMaxMs = 50.0f;
+        const float y16 = gy1 - (16.67f / kMaxMs) * graph_h;
+        const float y33 = gy1 - (33.33f / kMaxMs) * graph_h;
+        c.d->AddLine(ImVec2(gx0, y16), ImVec2(gx1, y16), ui::rgba(72, 255, 110, 55), std::max(1.0f, s * 0.7f));
+        c.d->AddLine(ImVec2(gx0, y33), ImVec2(gx1, y33), ui::rgba(255, 196, 64, 55), std::max(1.0f, s * 0.7f));
+        if (ft_snap_n >= 2) {
+            ImVec2 pts[kFtSamples];
+            const float dx = (gx1 - gx0) / (float)(kFtSamples - 1);
+            const int start = kFtSamples - ft_snap_n;
+            float worst = 0.0f;
+            for (int i = 0; i < ft_snap_n; i++) {
+                const float ms = std::clamp(ft_snap[i], 0.0f, kMaxMs);
+                worst = std::max(worst, ms);
+                pts[i] = ImVec2(gx0 + (start + i) * dx, gy1 - (ms / kMaxMs) * (graph_h - 2 * s) - s);
+            }
+            const ImU32 line_col = worst > 34.0f ? ui::rgba(255, 96, 80, 235)
+                                 : worst > 19.0f ? ui::rgba(255, 200, 64, 235)
+                                                 : ui::rgba(72, 255, 110, 235);
+            c.d->AddPolyline(pts, ft_snap_n, line_col, 0, std::max(1.5f, 1.6f * s));
+        }
+        y = gy1;
+    }
+    if (mode >= 4) {
+        if (fps_extra1[0]) {
+            y += 4 * s;
+            draw_line(fps_extra1, e1w, soft_ink);
+        }
+        if (fps_extra2[0]) draw_line(fps_extra2, e2w, muted_ink);
+    }
 }
 
 // ---- start-up prewarm screen: Dear ImGui over dark/themed backdrop ----
@@ -1528,7 +1918,7 @@ void menu_init() {
     bool has_options = false;
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         has_options = true;
-        char line[80];
+        char line[256];
         bool has_resolution = false;
         bool has_fg_backend = false;
         int options_ver = 0;
@@ -1540,7 +1930,7 @@ void menu_init() {
             *eq = 0;
             if (!strcmp(line, "menu_theme")) has_menu_theme = true;
             for (Row& r : rows)
-                if (r.value && !strcmp(line, ini_key(r))) {
+                if (r.value && !is_session_only(r) && !strcmp(line, ini_key(r))) {
                     if (r.value == &opts.reflex) {
                         const char* v = eq + 1;
                         while (*v == ' ' || *v == '\t') v++;
@@ -1598,10 +1988,10 @@ void menu_init() {
         // (v8 / #2147) FSR quality grew 92/83/75 between Native AA and Quality: old 1..4 → 4..7
         if (options_ver > 0 && options_ver < 8 && opts.fsr_quality >= 1 && opts.fsr_quality <= 4)
             opts.fsr_quality += 3;
-        // (v9) Menu theme: 0 OOT Mastersword (default), 1 Light, 2 Dark, 3 Longshot. First load of v9 takes OOT;
-        // after that the player's own Menu theme row is kept (saved as options_version 9).
+        // (v9) Menu theme: 0 OOT Mastersword (default), 1 Light, 2 Dark, 3 Longshot, 4 OOT Mastersword (Amber).
+        // First load of v9 takes OOT; after that the player's own Menu theme row is kept (saved as options_version 9).
         if (options_ver < 9) opts.menu_theme = 0;
-        opts.menu_theme = std::min(std::max(opts.menu_theme, 0), 3);
+        opts.menu_theme = std::min(std::max(opts.menu_theme, 0), 4);
         opts.menu_size = std::min(std::max(opts.menu_size, 1), 3);
         opts.overlay_size = std::min(std::max(opts.overlay_size, 1), 3);
         (void)has_menu_theme;
@@ -1641,6 +2031,8 @@ void menu_init() {
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = std::min(std::max(atoi(e), 0), 2);
+    mic_sync_hi();
+    mic_apply();
     restart_init();
 }
 
@@ -1877,6 +2269,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
             clamp_framegen_steps();   // engine change: keep only that engine's steps
         }
         if (r.value == &opts.reflex) reflex_apply_mode(*r.value);
+        if (r.value == &opts.mic) mic_apply();
         if (r.value == &opts.color_brightness || r.value == &opts.color_contrast ||
             r.value == &opts.color_saturation || r.value == &opts.color_gamma)
             opts.color_preset = 3;
@@ -1909,6 +2302,17 @@ bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
 void menu_note_frame(bool game_frame) {
     shown_frames.fetch_add(1, std::memory_order_relaxed);
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
+    if (opts.show_fps >= 2) {
+        const int64_t now = prof_now();
+        std::lock_guard lk(ft_mu);
+        if (ft_last_ns > 0 && now > ft_last_ns) {
+            const float ms = std::clamp((float)((now - ft_last_ns) / 1e6), 0.1f, 200.0f);
+            ft_ring[ft_head] = ms;
+            ft_head = (ft_head + 1) % kFtSamples;
+            if (ft_count < kFtSamples) ft_count++;
+        }
+        ft_last_ns = now;
+    }
 }
 
 // The Fullscreen row and F11 are one setting: the row asks the window's thread (host/display.c), F11 shows in the row
@@ -1985,11 +2389,13 @@ void menu_tick() {
         if (force) pad_last = !strcmp(force, "pad");
     }
     auto pad = [&](int p) { return listening != 1 && (pad_press >> p & 1) != 0; };
+    if (opts.menu_shortcut == 1) press[0] = false;   // (F1 only: ignore keyboard Insert)
+    if (!open_now.load() && opts.menu_shortcut == 2 && press[5]) press[6] = true;   // (Insert/F1/Esc: Esc opens when closed)
     if (pad(HOS_PAD_TOUCHPAD) && !touchpad_bound()) press[6] = true;
     if (host && host->binding)
         menu_keys::confirm_back(host->binding(HOS_BIND_PAD, HOS_SW_A, 0), host->binding(HOS_BIND_PAD, HOS_SW_B, 0),
                                 &pad_confirm, &pad_back);
-    if (pad(HOS_PAD_GUIDE) || chord_now) press[0] = true;
+    if ((opts.pad_menu && pad(HOS_PAD_GUIDE)) || chord_now) press[0] = true;
     {   // holding an arrow or the D-pad repeats it: after 0.35 s, 12/s, then 30/s after 1.5 s held
         static int64_t held_since[5], next_repeat[5];
         const int pads[5] = {0, HOS_PAD_UP, HOS_PAD_DOWN, HOS_PAD_LEFT, HOS_PAD_RIGHT};
@@ -2062,6 +2468,7 @@ void menu_tick() {
         if (open_now.load()) {
             const int64_t t0 = prof_now();
             opts.pad_layout = detect_pad_layout();
+            mic_sync_hi();
             const int64_t dt = prof_now() - t0;
             if (dt > 50000000LL) logf("menu: the opening took %.0f ms", (double)dt / 1e6);
         }
@@ -2266,6 +2673,60 @@ void menu_tick() {
                 else snprintf(fps_sub, sizeof fps_sub, "Base %.0f", game);
             } else {
                 fps_sub[0] = 0;
+            }
+            if (opts.show_fps >= 2) {
+                float sorted[kFtSamples];
+                int n = 0;
+                {
+                    std::lock_guard lk(ft_mu);
+                    n = ft_count;
+                    const int oldest = (ft_head - n + kFtSamples) % kFtSamples;
+                    for (int i = 0; i < n; i++) {
+                        const float v = ft_ring[(oldest + i) % kFtSamples];
+                        ft_snap[i] = v;
+                        sorted[i] = v;
+                    }
+                    ft_snap_n = n;
+                }
+                if (n > 0) {
+                    double sum = 0;
+                    for (int i = 0; i < n; i++) sum += sorted[i];
+                    const double avg_ms = sum / n;
+                    std::sort(sorted, sorted + n);
+                    const int p99_i = std::min(n - 1, std::max(0, (int)(n * 0.99)));
+                    const double low1 = sorted[p99_i] > 0.01f ? 1000.0 / sorted[p99_i] : shown;
+                    snprintf(fps_detail, sizeof fps_detail, "%.1f ms  1%% %.0f", avg_ms, low1);
+                } else {
+                    fps_detail[0] = 0;
+                }
+            } else {
+                fps_detail[0] = 0;
+            }
+            if (opts.show_fps >= 4) {
+                std::string e1;
+                uint64_t used = 0, budget = 0;
+                if (vram_usage(&used, &budget) && budget > 0) {
+                    char vb[48];
+                    snprintf(vb, sizeof vb, "VRAM %.1f/%.1f GB", used / 1073741824.0, budget / 1073741824.0);
+                    e1 = vb;
+                }
+                if (opts.upscale > 0) {
+                    if (!e1.empty()) e1 += " · ";
+                    e1 += tx_upscale(opts.upscale);
+                }
+                if (dev.hdr) {
+                    if (!e1.empty()) e1 += " · ";
+                    e1 += (opts.hdr == 2 ? "HDR Native" : "HDR");
+                }
+                if (opts.crt_filter > 0 && !crt_native_pq()) {
+                    if (!e1.empty()) e1 += " · ";
+                    e1 += "CRT";
+                }
+                snprintf(fps_extra1, sizeof fps_extra1, "%s", e1.c_str());
+                snprintf(fps_extra2, sizeof fps_extra2, "%.44s", dev.props.deviceName);
+            } else {
+                fps_extra1[0] = 0;
+                fps_extra2[0] = 0;
             }
         }
     }

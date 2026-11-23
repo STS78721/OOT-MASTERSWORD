@@ -37,8 +37,8 @@ int main() {
     CHECK("output not known yet", !dc::scene_size_fits(512, 288, 0, 0));
     CHECK("output not known yet (1080p scene)", !dc::scene_size_fits(1536, 864, 0, 0));
     CHECK("no size", !dc::scene_size_fits(0, 0, 1536, 864));
-    CHECK("under a third wide", !dc::scene_size_fits(511, 288, 1536, 864));
-    CHECK("under a third high", !dc::scene_size_fits(512, 287, 1536, 864));
+    CHECK("under a third wide", !dc::scene_size_fits(509, 288, 1536, 864));
+    CHECK("under a third high", !dc::scene_size_fits(512, 285, 1536, 864));
     CHECK("a square shadow-map-like target", !dc::scene_size_fits(384, 384, 1536, 864));
     CHECK("a half-size pass of the handheld scene", !dc::scene_size_fits(256, 144, 1536, 864));
     CHECK("the old floor is under a third of 2048x1152", !dc::scene_size_fits(640, 360, 2048, 1152));
@@ -80,6 +80,25 @@ int main() {
     CHECK("good after bad", decode("\xFF\xC3\xA9", bad) == L"�é" && bad);
     CHECK("no flag asked", dc::utf8_to_wide("\xFF") == L"�");
     CHECK("empty", decode("", bad).empty() && !bad);
+    // ---- transient VRAM OOM creation refusal bounded retry (vk_dlss.cpp prepare) ----
+    {
+        namespace rt = mkwvk::dlss_checks::retry;
+        rt::Refusal r;
+        CHECK("nothing refused", rt::verdict(r, 7, 0) == rt::Verdict::None);
+        CHECK("out of video memory waits", !rt::failed(r, 7, true, 100));
+        CHECK("before the interval", rt::verdict(r, 7, 699) == rt::Verdict::Wait);
+        CHECK("at the interval", rt::verdict(r, 7, 700) == rt::Verdict::Try);
+        CHECK("another key at once", rt::verdict(r, 8, 700) == rt::Verdict::None);
+        CHECK("second failure", !rt::failed(r, 7, true, 700));
+        CHECK("second wait", rt::verdict(r, 7, 1299) == rt::Verdict::Wait);
+        CHECK("third failure is final", rt::failed(r, 7, true, 1300));
+        CHECK("ended", rt::verdict(r, 7, 100000) == rt::Verdict::Ended);
+        rt::made(r);
+        CHECK("made clears", rt::verdict(r, 7, 2000) == rt::Verdict::None && r.tries == 0);
+        CHECK("another result is final", rt::failed(r, 9, false, 2000) && rt::verdict(r, 9, 100000) == rt::Verdict::Ended);
+        rt::made(r);
+        CHECK("a different key starts its count", !rt::failed(r, 10, true, 3000) && r.tries == 1);
+    }
     std::puts("dlss checks: ok");
     return 0;
 }

@@ -317,6 +317,29 @@ void destroy_or_defer(VkImage image, VmaAllocation allocation) {
     }
     vmaDestroyImage(vma, image, allocation);
 }
+} // namespace
+// Drivers serialize device-wide frees and queue submits/presents behind an internal lock: pause background frees briefly
+// (at most 3 ms) while a frame submit or present is in flight so driver cleanup does not cause frame-pacing hitches.
+// RX_VK_REAP_TURNS=0: disable yield.
+std::atomic<int> driver_turns{0};
+void reap_wait_turn() {
+    static const bool on = !(getenv("RX_VK_REAP_TURNS") && atoi(getenv("RX_VK_REAP_TURNS")) == 0);
+    if (!on || driver_turns.load(std::memory_order_acquire) == 0) return;
+    static std::atomic<int64_t> waits{0}, gave_up{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    while (driver_turns.load(std::memory_order_acquire) > 0) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(3)) {
+            gave_up++;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    const int64_t n = ++waits;
+    if (!(n & (n - 1)) && n >= 64)
+        logf("vk: the reaper let %lld submits or presents go first (%lld waits of 3 ms given up)", (long long)n,
+             (long long)gave_up.load());
+}
+namespace {
 bool reap_on() {
     static const bool on = [] {
         const char* e = getenv("RX_VK_REAP");
@@ -334,7 +357,7 @@ bool reap_on() {
                     reap_cv.wait(lk, [] { return !reap_queue.empty(); });
                     batch.swap(reap_queue);
                 }
-                for (auto& fn : batch) fn();
+                for (auto& fn : batch) reap_wait_turn(), fn();
                 batch.clear();
             }
         }).detach();

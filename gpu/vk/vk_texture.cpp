@@ -1015,7 +1015,7 @@ bool bc_ready() {
     static int state = 0;
     if (state) return state > 0;
     state = -1;
-    if (!astc_ready() || getenv("RX_VK_ASTC_RGBA8") || !dev.features.textureCompressionBC) return false;
+    if (!astc_ready() || getenv("RX_VK_ASTC_RGBA8") || opts.astc_rgba8 || !dev.features.textureCompressionBC) return false;
     bool bc7 = bc7_enabled();
     VkFormat bc_format = bc7 ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
     VkFormatProperties fp{};
@@ -2933,6 +2933,19 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 }
 
 } // namespace
+
+// Pre-build the ASTC decode and BC3/BC7 re-encode compute pipelines at startup on GPUs without native ASTC sampling,
+// avoiding first-upload compilation hitches on the title screen. RX_VK_TEX_PIPES_LATE=1 restores lazy creation.
+void texture_pipelines_ahead() {
+    if (getenv("RX_VK_TEX_PIPES_LATE")) return;
+    VkFormatProperties p{};
+    vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &p);
+    if (p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool astc = astc_ready(), bc = astc && bc_ready();
+    logf("vk: texture decoders made before the game (ASTC %d, BC %d) in %.1f ms", (int)astc, (int)bc,
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+}
 
 std::atomic<uint64_t> work_epoch{0};
 namespace {

@@ -3,13 +3,14 @@
 // 1 Light: Switch system-settings bright white/grey + crisp cyan-blue.
 // 2 Dark: near-black panels + crimson red accents.
 // 3 Longshot: Longshot RC3 warm parchment, bronze cells, and gold.
+// 4 OOT Options (Amber): native OoT Options warm mahogany leather, copper banner, amber-gold pills, white focus frame.
 #pragma once
 #include <algorithm>
 #include <cstdint>
 
 namespace mkwvk::menu_theme {
 
-enum Id { kOot = 0, kLight = 1, kDark = 2, kLongshot = 3, kCount = 4 };
+enum Id { kOot = 0, kLight = 1, kDark = 2, kLongshot = 3, kOotAmber = 4, kCount = 5 };
 
 // Matches IM_COL32(r, g, b, a) layout without dragging imgui.h into standalone tests.
 constexpr uint32_t col32(int r, int g, int b, int a = 255) {
@@ -193,6 +194,51 @@ inline Palette of(int theme) {
             col32(14, 10, 6),          // startup_bg
             col32(46, 33, 18, 4),      // startup_glow
             col32(246, 232, 204),      // startup_title
+        };
+    case kOotAmber:
+        // Native OoT Options palette: warm mahogany leather, terracotta-copper header, vibrant amber-gold pills, crisp white focus
+        return Palette{
+            col32(18, 10, 9, 178),     // dim_bg
+            col32(248, 240, 230),      // ink (crisp warm ivory)
+            col32(255, 252, 246),      // ink_bright
+            col32(224, 206, 192),      // soft
+            col32(184, 162, 148),      // dim
+            col32(214, 128, 16),       // gold (rich golden-amber button bottom)
+            col32(238, 154, 28),       // gold_hi (vibrant amber button top)
+            col32(255, 253, 248),      // gold_ink (crisp white on amber, native Options style)
+            col32(240, 168, 56),       // accent (warm amber scrollbar & sliders)
+            col32(248, 192, 92),       // heading_col (warm golden-tan headings)
+            col32(166, 122, 94, 185),  // edge (parchment-bronze dividers)
+            col32(72, 58, 62, 246),    // cell_dark (smoky plum-espresso inactive toggle well)
+            col32(138, 95, 76, 242),   // cell_name (warm dusty-terracotta row label strip)
+            col32(166, 118, 94, 248),  // cell_name_sel (brightened terracotta when selected)
+            col32(100, 82, 84),        // bronze (unselected toggle-half highlight)
+            col32(66, 42, 39, 238),    // column (deep mahogany leather column)
+            col32(202, 128, 82, 248),  // banner_top (warm copper header top)
+            col32(150, 86, 52, 248),   // banner (terracotta header bottom)
+            col32(252, 244, 234),      // banner_ink (warm white header title & inactive tabs)
+            col32(84, 48, 32),         // banner_edge
+            col32(232, 174, 122, 165), // banner_hi (delicate warm-gold header trim)
+            col32(220, 136, 20, 250),  // tab_inset (vibrant amber active tab)
+            col32(255, 224, 152),      // tab_inset_edge
+            col32(255, 252, 246),      // tab_ink
+            col32(78, 50, 41, 244),    // box (warm leather description panel)
+            col32(178, 138, 106, 225), // box_edge (soft parchment-tan outline)
+            col32(34, 22, 20, 240),    // bar (deep dark espresso prompt bar)
+            col32(198, 126, 26),       // listen
+            col32(248, 242, 234),      // keycap
+            col32(46, 28, 22),         // keycap_ink
+            col32(158, 140, 130),      // keycap_dim
+            col32(255, 250, 242),      // glow_col (luminous white focus frame around active value)
+            col32(255, 236, 204, 0),   // glow_halo
+            col32(255, 252, 244, 115), // inner_frame_sel
+            col32(208, 164, 126, 105), // inner_frame
+            col32(255, 255, 255, 48),  // slider_track
+            col32(255, 255, 255, 110), // slider_track_sel
+            col32(32, 18, 16, 155),    // scroll_track
+            col32(34, 21, 18),         // startup_bg
+            col32(174, 102, 46, 5),    // startup_glow
+            col32(252, 238, 216),      // startup_title
         };
     case kOot:
     default:

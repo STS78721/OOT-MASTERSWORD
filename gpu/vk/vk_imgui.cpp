@@ -153,6 +153,35 @@ void linearize(ImDrawData* dd) {
             v.col = (v.col & IM_COL32_A_MASK) | (ImU32)lut[v.col >> IM_COL32_R_SHIFT & 0xFF] << IM_COL32_R_SHIFT |
                     (ImU32)lut[v.col >> IM_COL32_G_SHIFT & 0xFF] << IM_COL32_G_SHIFT | (ImU32)lut[v.col >> IM_COL32_B_SHIFT & 0xFF] << IM_COL32_B_SHIFT;
 }
+/// Convert sRGB ImGui color to Rec.2020 PQ (ST 2084) scaled to opts.hdr_white nits so overlays stay comfortable in HDR10.
+ImU32 hdr10_of(ImU32 c, float white) {
+    static float lin[256];
+    static unsigned char pq[4097];
+    static float pq_white = -1.0f;
+    if (pq_white != white) {
+        pq_white = white;
+        for (int i = 0; i < 256; i++) {
+            const float x = i / 255.0f;
+            lin[i] = x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
+        }
+        for (int i = 0; i <= 4096; i++) {
+            const float y = std::pow(i / 4096.0f * white / 10000.0f, 0.1593017578125f);
+            const float e = std::pow((0.8359375f + 18.8515625f * y) / (1.0f + 18.6875f * y), 78.84375f);
+            pq[i] = (unsigned char)std::clamp((int)(e * 255.0f + 0.5f), 0, 255);
+        }
+    }
+    const float r = lin[c >> IM_COL32_R_SHIFT & 0xFF], g = lin[c >> IM_COL32_G_SHIFT & 0xFF], b = lin[c >> IM_COL32_B_SHIFT & 0xFF];
+    const float r2020 = 0.627404f * r + 0.329283f * g + 0.043313f * b;
+    const float g2020 = 0.069097f * r + 0.919540f * g + 0.011362f * b;
+    const float b2020 = 0.016392f * r + 0.088013f * g + 0.895595f * b;
+    auto code = [&](float v) { return (ImU32)pq[std::clamp((int)(v * 4096.0f + 0.5f), 0, 4096)]; };
+    return (c & IM_COL32_A_MASK) | (code(r2020) << IM_COL32_R_SHIFT) | (code(g2020) << IM_COL32_G_SHIFT) | (code(b2020) << IM_COL32_B_SHIFT);
+}
+void hdr10(ImDrawData* dd) {
+    const float white = (float)std::clamp(opts.hdr_white, 80, 400);
+    for (ImDrawList* list : dd->CmdLists)
+        for (ImDrawVert& v : list->VtxBuffer) v.col = hdr10_of(v.col, white);
+}
 void layout(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 src_stage,
             VkAccessFlags2 src, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -378,6 +407,7 @@ void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w,
     presents++;
     reap(false);
     if (srgb_target) linearize(dd);
+    else if (dev.hdr) hdr10(dd);
     if (!image || !view) return;
     bool textures_ok = true;   // (a texture that could not be made has no descriptor: draws that sample it must not be recorded)
     if (dd->Textures)

@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageDraw, ImageTk
 
-CURRENT_VERSION = "0.2.3"
+CURRENT_VERSION = "0.2.4"
 EDITION_NAME = "SteelTemple MasterSword Edition"
 APP_TITLE = "The Legend of Zelda: Ocarina of Time - PC Recompiled"
 VERSION_STRING = f"V {CURRENT_VERSION}"
@@ -555,8 +555,13 @@ def launcher_ui_from_game_ini(out):
         out["fg_flow"] = out["flow_scale"]
     if "resolution" in out:
         out["render_scale"] = RESOLUTION_TO_RENDER_SCALE.get(_int_or(out["resolution"]), out.get("render_scale", "67"))
-    if "fps_counter" in out and "perf_overlay" not in out:
-        out["perf_overlay"] = "fps" if _int_or(out["fps_counter"]) else "off"
+    if "fps_counter" in out:
+        fps_map = {0: "off", 1: "fps", 2: "frametime", 3: "graph", 4: "detailed"}
+        out["perf_overlay"] = fps_map.get(_int_or(out["fps_counter"]), "fps" if _int_or(out["fps_counter"]) else "off")
+    if "audio_output" in out and "audio_channels" not in out:
+        out["audio_channels"] = {0: "auto", 1: "stereo", 2: "5.1"}.get(_int_or(out["audio_output"]), "auto")
+    if "motion_controls" in out and "motion" not in out:
+        out["motion"] = "1" if _int_or(out["motion_controls"], 1) else "0"
     if "handheld_profile" in out and "operation_mode" not in out:
         out["operation_mode"] = "handheld" if _int_or(out["handheld_profile"]) else "docked"
     layout = out.get("layout_preset")
@@ -628,7 +633,14 @@ def game_keys_from_launcher_ui(updates):
     # Quality-owned scales (58/33/…) leave Resolution alone; the quality row owns % of Output.
 
     overlay = str(out.get("perf_overlay", "off")).strip().casefold()
-    out["fps_counter"] = "0" if overlay in {"off", "0"} else "1"
+    overlay_to_game = {"off": "0", "0": "0", "fps": "1", "1": "1", "frametime": "2", "2": "2",
+                       "graph": "3", "3": "3", "detailed": "4", "full": "4", "4": "4"}
+    out["fps_counter"] = overlay_to_game.get(overlay, "0")
+    if "audio_channels" in out:
+        ac = str(out["audio_channels"]).strip().casefold()
+        out["audio_output"] = {"auto": "0", "stereo": "1", "5.1": "2"}.get(ac, "0")
+    if "motion" in out:
+        out["motion_controls"] = "1" if str(out["motion"]).strip() not in {"0", "off", "false"} else "0"
     op = str(out.get("operation_mode", out.get("device_profile", "docked"))).strip().casefold()
     out["handheld_profile"] = "1" if op in {"handheld", "deck"} else "0"
     pad = str(out.get("pad_layout", "nintendo")).strip().casefold()
@@ -1221,7 +1233,7 @@ class MasterSwordSettingsDialog(tk.Toplevel):
         cur_fps=self.get_val("fps_limit","60")
         self.create_row_dropdown(f,"Frame Rate Limit","fps_limit",rates,"30" if cur_fps=="30" else "60","Target frame rate: 60 FPS (Native MasterSword speed) or 30 FPS (Battery Saver / Handheld).")
         self.create_row_dropdown(f,"V-Sync / Presentation Mode","vk_present",["mailbox","fifo","immediate"],"mailbox","Mailbox is low-latency; FIFO is strict V-Sync; Immediate may tear.")
-        self.create_row_dropdown(f,"Performance Metrics Overlay","perf_overlay",["off","fps","full"],self.get_val("perf_overlay","off"),"Display in-game real-time FPS and frametime metrics overlay.")
+        self.create_row_dropdown(f,"Performance Metrics Overlay","perf_overlay",["off","fps","frametime","graph","detailed"],self.get_val("perf_overlay","off"),"Display in-game real-time FPS, frametime, graph, or detailed hardware overlay.")
         # Runtime docked modes are 1920x1080 / 2560x1440 / 3840x2160 (0/1/2). Default to safe 1920x1080 on fresh installs so 4K monitors don't tank FPS out of the gate.
         output_sizes=["1920x1080","2560x1440","3840x2160","1280x720","1600x900","3200x1800","2560x1080","3440x1440","3840x1600","5120x2160","5120x1440"]
         if self.display_resolution not in output_sizes:output_sizes.insert(0,self.display_resolution)
@@ -1591,13 +1603,13 @@ class MasterSwordSettingsDialog(tk.Toplevel):
         f=self.tab_controls
         self.create_row_dropdown(f,"Controller Button Prompts","pad_layout",["auto","nintendo","xbox","xbox_prompts"],"auto","Select Nintendo-style, Xbox-style, or automatic prompts.")
         self.create_row_toggle(f,"Motion Controls","motion","1","Enable motion input for supported controllers.")
-        self.create_row_slider(f,"Controller Rumble Strength","rumble_strength",0,300,130,"%","Set controller vibration strength.")
+        self.create_row_slider(f,"Controller Rumble Strength","rumble_strength",0,150,100,"%","Set controller vibration strength (0% Off to 150%).")
         self.create_row_dropdown(f,"Rumble Response Curve","rumble_curve",["0.2","0.4","0.6","0.8","1.0","1.2","1.5"],"0.6","Shape the response to small and large rumble events.")
         self.create_row_toggle(f,"Rumble Triggers","rumble_triggers","0","Enable trigger rumble where the controller supports it.")
         self.create_row_slider(f,"Stick Deadzone","stick_deadzone",0,50,8,"%","Ignore small stick movements below this threshold.")
         self.create_row_slider(f,"Mouse Sensitivity","mouse_sens",0,10,1,"x","Adjust mouse input sensitivity.")
         self.create_row_slider(f,"Game Volume","volume",0,100,100,"%","Set the game's master volume.")
-        self.create_row_dropdown(f,"Audio Output Channels","audio_channels",["stereo","5.1"],self.get_val("audio_channels","stereo"),"Choose between stereo or 5.1 surround sound audio mixing.")
+        self.create_row_dropdown(f,"Audio Output Channels","audio_channels",["auto","stereo","5.1"],self.get_val("audio_channels","auto"),"Choose automatic Windows detection, Stereo, or 5.1 surround sound audio mixing.")
         loc = self.get_val("locale") or self.get_val("lang") or "en-US"
         self.create_row_dropdown(f,"Game Language","locale",["en-US","en-GB","ja","fr","de","it","es","nl","ru","pt","pt-BR","zh-Hans","zh-Hant","ko"],loc,"English is selected by default.")
         self.create_row_dropdown(f,"Launcher Menu Language","menu_lang",["en"],"en","The game menu and overlay are kept in English.")
@@ -1651,7 +1663,7 @@ class MasterSwordSettingsDialog(tk.Toplevel):
             "color_preset":"default","color_brightness":"0","color_contrast":"100","color_saturation":"100","color_gamma":"1.0",
             "fxaa":"1","realtime":"1",
             "experimental_geometry":"0","fix_vs_fault":"1","fix_zero":"1","lod_guard":"1","fix_indirect_reset":"1","lib_prebuild":"1",
-            "pad_layout":"auto","motion":"1","rumble_strength":"130","rumble_curve":"0.6","rumble_triggers":"0","stick_deadzone":"8",
+            "pad_layout":"auto","motion":"1","rumble_strength":"100","rumble_curve":"0.6","rumble_triggers":"0","stick_deadzone":"8",
             "mouse_sens":"1","volume":"100","locale":"en-US","menu_lang":"en","assume_focus":"1"}
         for k,v in defaults.items():
             if k in self.vars:self.vars[k].set(v)

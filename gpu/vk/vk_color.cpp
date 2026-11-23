@@ -40,7 +40,7 @@ bool init() {
     dci.bindingCount = 2;
     dci.pBindings = b;
     if (vkCreateDescriptorSetLayout(dev.device, &dci, nullptr, &C.dsl) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 36};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     li.setLayoutCount = 1;
     li.pSetLayouts = &C.dsl;
@@ -139,7 +139,7 @@ void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkPipelineStag
 
 bool color_grade_active() {
     return opts.color_brightness != 0 || opts.color_contrast != 100 || opts.color_saturation != 100 ||
-           opts.color_gamma != 100;
+           opts.color_gamma != 100 || (!dev.hdr && opts.colour_vision != 0);
 }
 
 VkImage color_grade_record(VkCommandBuffer cmd, int slot, VkImage src, VkImageView src_view, VkFormat fmt, uint32_t sw,
@@ -187,10 +187,12 @@ VkImage color_grade_record(VkCommandBuffer cmd, int slot, VkImage src, VkImageVi
     struct {
         int32_t offset[2], size[2];
         float adj[4];
+        int32_t cv_mode;
     } pc{{x0, y0},
          {cw, ch},
          {(float)opts.color_brightness / 100.0f, (float)opts.color_contrast / 100.0f,
-          (float)opts.color_saturation / 100.0f, (float)opts.color_gamma / 100.0f}};
+          (float)opts.color_saturation / 100.0f, (float)opts.color_gamma / 100.0f},
+         dev.hdr ? 0 : opts.colour_vision};
     vkCmdPushConstants(cmd, C.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, ((uint32_t)cw + 7) / 8, ((uint32_t)ch + 7) / 8, 1);
     barrier(cmd, src, VK_IMAGE_LAYOUT_GENERAL, CS, 0, ALL, 0);

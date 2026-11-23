@@ -22,6 +22,8 @@
 #include "vk_fsr3fi.h"
 #include "vk_menu.h"
 #include "vk_reflex.h"
+#include "vk_antilag.h"
+#include "crt_policy.h"
 #include "vk_texture.h"
 #include "vk_draw.h"   // (extern_guarded_shader_module, extern_guarded_compute)
 
@@ -32,6 +34,11 @@
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
 #include "shaders/fg_synth_comp_spv.h"
+#include "shaders/hdr_encode_comp_spv.h"
+#include "shaders/crt_downsample_comp_spv.h"
+#include "shaders/crt_lottes_comp_spv.h"
+#include "shaders/crt_hyllian_comp_spv.h"
+#include "shaders/crt_zfast_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   // (older Windows SDKs lack it: Windows 10 1803 and later take it)
@@ -53,7 +60,8 @@ struct OutSet {
     Img frame[kMaxMult];
     int made = 0;   // (frame[0..made) are made frames; frame[made] is the game's)
     bool busy = false;
-    uint64_t reflex_id = 0;   // (NVIDIA Reflex: the game frame it was made at, 0 none: its game frame is presented with it)
+    uint64_t reflex_id = 0;    // (NVIDIA Reflex: the game frame it was made at, 0 none: its game frame is presented with it)
+    uint64_t antilag_id = 0;   // (AMD Anti-Lag 2: same per-game-frame tracking)
 };
 struct Job {
     OutSet* set;
@@ -94,6 +102,23 @@ struct ScaleState {
     uint32_t cropped_w = 0, cropped_h = 0, scaled_w = 0, scaled_h = 0;
 } scale;
 
+struct HdrState {
+    bool init = false, failed = false;
+    Pipe pipe;
+    Img out;
+    uint32_t w = 0, h = 0;
+} hdr;
+
+struct CrtState {
+    bool init = false, failed = false;
+    bool tried[3]{};
+    Pipe downsample;
+    Pipe filter[3];
+    VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
+    Img raster, output;
+    uint32_t rw = 0, rh = 0, w = 0, h = 0;
+} crt;
+
 int64_t now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -112,7 +137,7 @@ int multiplier() {
 // RX_VK_PACE_CUSHION_MS (10) after it was handed over. Not with Low latency on. RX_VK_PACE_ONLY=0: off, as before.
 bool pace_only() {
     static const bool on = !getenv("RX_VK_PACE_ONLY") || atoi(getenv("RX_VK_PACE_ONLY")) != 0;
-    return on && opts.pace != 0 && !opts_fg_on() && opts.reflex == 0;
+    return on && opts.pace != 0 && !opts_fg_on() && opts.reflex == 0 && opts.antilag == 0;
 }
 
 
@@ -234,6 +259,12 @@ void drop_img(Img& i) {
     if (i.image) destroy_image(i.image, i.alloc);
     i = {};
 }
+void drop_pipe(Pipe& p) {
+    if (p.pipe) vkDestroyPipeline(dev.device, p.pipe, nullptr);
+    if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr);
+    if (p.set) vkDestroyDescriptorSetLayout(dev.device, p.set, nullptr);
+    p = {};
+}
 
 void to_general(VkCommandBuffer cmd, VkImage image) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -335,6 +366,89 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
     full_barrier(cmd);
 }
 
+bool init_crt(int filter) {
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (!crt.init) {
+        crt.init = crt.failed = true;
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        si.maxLod = 0.0f;
+        if (dev.push_descriptor && vkCmdPushDescriptorSetKHR &&
+            make_pipe(crt.downsample, CRT_DOWNSAMPLE_COMP_SPV, sizeof CRT_DOWNSAMPLE_COMP_SPV, {S, I}, 0)) {
+            if (vkCreateSampler(dev.device, &si, nullptr, &crt.nearest) != VK_SUCCESS) {
+                crt.nearest = VK_NULL_HANDLE;
+            } else {
+                si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+                if (vkCreateSampler(dev.device, &si, nullptr, &crt.linear) == VK_SUCCESS) crt.failed = false;
+                else crt.linear = VK_NULL_HANDLE;
+            }
+        }
+        if (crt.failed) {
+            drop_pipe(crt.downsample);
+            if (crt.nearest) vkDestroySampler(dev.device, crt.nearest, nullptr);
+            if (crt.linear) vkDestroySampler(dev.device, crt.linear, nullptr);
+            crt.nearest = crt.linear = VK_NULL_HANDLE;
+            logf("vk: CRT filter unavailable: its pipeline or samplers could not be made; the unfiltered picture is kept");
+        }
+    }
+    if (crt.failed) return false;
+    if (!crt.tried[filter]) {
+        crt.tried[filter] = true;
+        const bool made = filter == 0   ? make_pipe(crt.filter[filter], CRT_LOTTES_COMP_SPV, sizeof CRT_LOTTES_COMP_SPV, {S, I}, 36)
+                          : filter == 1 ? make_pipe(crt.filter[filter], CRT_HYLLIAN_COMP_SPV, sizeof CRT_HYLLIAN_COMP_SPV, {S, I}, 36)
+                                        : make_pipe(crt.filter[filter], CRT_ZFAST_COMP_SPV, sizeof CRT_ZFAST_COMP_SPV, {S, I}, 36);
+        if (!made)
+            logf("vk: CRT filter unavailable: shader %d could not be made; the unfiltered picture is kept", filter);
+    }
+    return crt.filter[filter].pipe != VK_NULL_HANDLE;
+}
+
+VkImage record_crt(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh,
+                   VkImageView* out_view) {
+    const int mode = opts.crt_filter;
+    const auto raster = crt_policy::raster(dw, dh, opts.crt_lines);
+    const int filter = mode <= 2 ? 0 : mode - 2;
+    if (!src || !sw || !sh || !raster.w || !raster.h || !init_crt(filter)) return VK_NULL_HANDLE;
+    if (crt.rw != raster.w || crt.rh != raster.h || crt.w != dw || crt.h != dh) {
+        {
+            std::lock_guard qk(dev.present_mu);
+            device_wait_idle_locked();
+        }
+        drop_img(crt.raster);
+        drop_img(crt.output);
+        crt.rw = crt.rh = crt.w = crt.h = 0;
+        const VkImageUsageFlags sampled = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (!make_img(crt.raster, raster.w, raster.h, VK_FORMAT_R8G8B8A8_UNORM, sampled) ||
+            !make_img(crt.output, dw, dh, VK_FORMAT_R8G8B8A8_UNORM, sampled | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            drop_img(crt.raster);
+            drop_img(crt.output);
+            crt.failed = true;
+            logf("vk: CRT filter unavailable: its images could not be made; the unfiltered picture is kept");
+            return VK_NULL_HANDLE;
+        }
+        crt.rw = raster.w, crt.rh = raster.h, crt.w = dw, crt.h = dh;
+        to_general(cmd, crt.raster.image);
+        to_general(cmd, crt.output.image);
+    }
+    pass(cmd, crt.downsample, {{src, crt.nearest}, {crt.raster.view, VK_NULL_HANDLE}}, raster.w, raster.h);
+    const struct { float source[4], output[4]; uint32_t style; } pc{
+        {(float)raster.w, (float)raster.h, 1.0f / raster.w, 1.0f / raster.h},
+        {(float)dw, (float)dh, 1.0f / dw, 1.0f / dh}, (uint32_t)mode};
+    static_assert(sizeof pc == 36);
+    pass(cmd, crt.filter[filter], {{crt.raster.view, mode == 4 ? crt.linear : crt.nearest},
+                                   {crt.output.view, VK_NULL_HANDLE}}, dw, dh, &pc, sizeof pc);
+    static int last_mode = 0;
+    static uint32_t last_w = 0, last_h = 0, last_lines = 0;
+    if (last_mode != mode || last_w != dw || last_h != dh || last_lines != raster.h) {
+        const char* labels[] = {"", "crt-lottes-aperture", "crt-lottes-tv", "crt-hyllian", "crt-zfast"};
+        logf("vk: CRT %s: %ux%u virtual raster, %ux%u output", labels[mode], raster.w, raster.h, dw, dh);
+        last_mode = mode, last_w = dw, last_h = dh, last_lines = raster.h;
+    }
+    if (out_view) *out_view = crt.output.view;
+    return crt.output.image;
+}
+
 // (hookshot) The display thread's wait for a frame's time, on a high-resolution timer. sleep_for rests on the system timer,
 // whose 1 ms (timeBeginPeriod) Windows 11 does not keep for a process whose window it takes as unseen: with the presents
 // no longer blocking (a present queue of their own) the thread slept before most frames and woke up to 20 ms after their time.
@@ -403,6 +517,7 @@ void display_main() {
             for (int k = 0; k < shown; k++) {
                 present_kind.store(k < j.set->made ? 1 : 0);
                 reflex_present_frame = (k == j.set->made) ? j.set->reflex_id : 0;
+                antilag_present_frame = (k == j.set->made) ? j.set->antilag_id : 0;
                 present_defer_into = &pending[k];
                 present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
                 present_defer_into = nullptr;
@@ -460,6 +575,7 @@ void display_main() {
             } else {
                 present_kind.store(k < j.set->made ? 1 : 0);
                 reflex_present_frame = (k == j.set->made) ? j.set->reflex_id : 0;
+                antilag_present_frame = (k == j.set->made) ? j.set->antilag_id : 0;
                 present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
             }
             menu_note_frame(k == j.set->made);
@@ -495,9 +611,11 @@ bool framegen_on() {
            !dev.offscreen && !fg.failed;
 }
 
-VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
+VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh,
+                       VkImageView* out_view, bool pq) {
+    if (out_view) *out_view = VK_NULL_HANDLE;
     const int scale_mode = opts_spatial_upscale();
-    if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
+    if (!src || !image || !sw || !sh || !dw || !dh || pq) return VK_NULL_HANDLE;
     const bool has_crop = crop && crop[2] > 0 && crop[3] > 0;
     if (has_crop && (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
     const bool cropped = has_crop && (crop[0] || crop[1] || (uint32_t)crop[2] < sw || (uint32_t)crop[3] < sh);
@@ -506,8 +624,10 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     // (a picture larger than the window takes the pass even with the filter Off: the blit's linear filter reads 2 x 2 of the
     // picture whatever the shrink, and fine detail shimmered)
     const bool shrink = cw > dw || ch > dh;
-    if (!scale_mode && !opts.sharpness && !shrink) return VK_NULL_HANDLE;
-    if (!init_scale()) return VK_NULL_HANDLE;
+    const bool scaling = scale_mode || opts.sharpness || shrink;
+    const bool tube = crt_policy::enabled(opts.crt_filter, pq);
+    if (!scaling && !tube) return VK_NULL_HANDLE;
+    if (scaling && !init_scale()) return VK_NULL_HANDLE;
     // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
     // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
     if (cropped) {
@@ -534,6 +654,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         full_barrier(cmd);
         src = scale.cropped.view;
     }
+    if (!scaling) return record_crt(cmd, src, cw, ch, dw, dh, out_view);
     if (scale.scaled_w != dw || scale.scaled_h != dh) {
         {
             std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
@@ -562,7 +683,56 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
              scale_mode, opts.upscale, opts.sharpness, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
              crop ? crop[2] : (int)sw, crop ? crop[3] : (int)sh, dw, dh);
     }
+    if (tube)
+        if (const VkImage filtered = record_crt(cmd, scale.scaled.view, dw, dh, dw, dh, out_view)) return filtered;
+    if (out_view) *out_view = scale.scaled.view;
     return scale.scaled.image;
+}
+
+VkImage framegen_hdr(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh,
+                     bool pq, int colour_vision) {
+    if (!src || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
+    const bool has_crop = crop && crop[2] > 0 && crop[3] > 0;
+    if (has_crop && (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
+    const uint32_t cx = has_crop ? (uint32_t)crop[0] : 0;
+    const uint32_t cy = has_crop ? (uint32_t)crop[1] : 0;
+    const uint32_t cw = has_crop ? std::min((uint32_t)crop[2], sw - cx) : sw;
+    const uint32_t ch = has_crop ? std::min((uint32_t)crop[3], sh - cy) : sh;
+    if (!cw || !ch) return VK_NULL_HANDLE;
+    if (!hdr.init) {
+        hdr.init = hdr.failed = true;
+        const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (dev.push_descriptor && vkCmdPushDescriptorSetKHR && init_scale() &&
+            make_pipe(hdr.pipe, HDR_ENCODE_COMP_SPV, sizeof HDR_ENCODE_COMP_SPV, {S, I}, 48))
+            hdr.failed = false;
+        else
+            logf("vk: HDR: the HDR pass could not be made: SDR");
+    }
+    if (hdr.failed) return VK_NULL_HANDLE;
+    if (hdr.w != dw || hdr.h != dh) {
+        {
+            std::lock_guard qk(dev.present_mu);
+            device_wait_idle_locked();
+        }
+        drop_img(hdr.out);
+        hdr.w = hdr.h = 0;
+        if (!make_img(hdr.out, dw, dh, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            drop_img(hdr.out);
+            static bool told;
+            if (!told) told = true, logf("vk: HDR: no 10-bit storage image on this GPU: SDR");
+            return VK_NULL_HANDLE;
+        }
+        hdr.w = dw, hdr.h = dh;
+        to_general(cmd, hdr.out.image);
+    }
+    const float x0 = cx / (float)sw, y0 = cy / (float)sh;
+    const float x1 = (cx + cw) / (float)sw, y1 = (cy + ch) / (float)sh;
+    const struct { float uv[4]; float white, peak, knee, mode, contrast, exposure, colour_vision, pad1; } pc{
+        {x0, y0, x1, y1}, (float)std::clamp(opts.hdr_white, 80, 500), (float)std::clamp(opts.hdr_peak, 400, 10000), 0.6f,
+        pq ? 1.0f : 0.0f, std::clamp(opts.hdr_contrast, 50, 200) / 100.0f, 1.0f, (float)colour_vision, 0.0f};
+    static_assert(sizeof pc == 48);
+    pass(cmd, hdr.pipe, {{src, scale.linear}, {hdr.out.view, VK_NULL_HANDLE}}, dw, dh, &pc, sizeof pc);
+    return hdr.out.image;
 }
 
 VkImage framegen_made_image(uint32_t* w, uint32_t* h) {
@@ -765,6 +935,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const int m = multiplier();
     const bool blend = fg.have_prev && !gap;
     set->reflex_id = reflex_frame();   // (NVIDIA Reflex: the game frame this set shows, vk_reflex.cpp)
+    set->antilag_id = antilag_frame(); // (AMD Anti-Lag 2: same per-game-frame index, vk_antilag.cpp)
     static uint64_t sequence = 0;
     sequence++;
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;

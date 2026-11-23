@@ -50,6 +50,7 @@
 #include "dlss_checks.h"
 #include "hidden_mesh.h"      // (hidden-mesh depth exclusion, hidden_depth_draw)
 #include "vk_menu.h"
+#include "grass_distance.h"
 #include "vk_mvec.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
@@ -68,6 +69,9 @@
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+#ifdef _WIN32
+#include <psapi.h>     // (K32GetProcessMemoryInfo: committed memory before/after compute module release)
+#endif
 
 namespace mkwvk {
 // (EvilOOT, RX_VK_DRAW_STATS: the pointer table's regions, vk_bank.cpp)
@@ -2571,8 +2575,11 @@ VkSamplerAddressMode wrap(uint8_t w) {
 // get at least n-times anisotropic filtering (the game's value if it asks for more; the device's limit if n is above it): surfaces seen
 // at a slant keep their detail, for some GPU time. Part of every sampler's key below, so no cached sampler is one made for another n
 uint32_t aniso_override() {
-    static const uint32_t n = getenv("RX_VK_ANISO") ? (uint32_t)std::clamp(atoi(getenv("RX_VK_ANISO")), 0, 16) : 0u;
-    return n;
+    static const char* const e = getenv("RX_VK_ANISO");
+    if (e && *e) return (uint32_t)std::clamp(atoi(e), 0, 16);
+    static const uint32_t steps[] = {0u, 2u, 4u, 8u, 16u};
+    const int v = opts.anisotropy;
+    return (unsigned)v < 5u ? steps[v] : 0u;
 }
 // (hookshot) The upscalers' texture LOD bias. OoT draws its 3D at 3/4 of the output and gives its world's materials a LOD bias of
 // -0.5 for that. An upscaler that draws from another share adds to the samplers the game biases below 0
@@ -2592,7 +2599,7 @@ float upscale_lod_bias() {
 }
 uint64_t sampler_state_generation() {
     return mix(sampler_registrations_generation(),
-               (uint64_t)(uint32_t)(opts.upscale * 257 + opts.resolution * 17 + opts.dlss_quality)) | 1ull;
+               (uint64_t)(uint32_t)(opts.upscale * 257 + opts.resolution * 17 + opts.dlss_quality + opts.anisotropy * 4099)) | 1ull;
 }
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare). one_level: the image bound with it
 /// has a single level, and the Anisotropic filtering row's anisotropy is not added (the game's own stays)
@@ -3019,7 +3026,16 @@ thread_local bool grid_patch_want = false;
 thread_local uint64_t grid_patch_at = UINT64_MAX;
 thread_local VkBuffer grid_patch_buf = VK_NULL_HANDLE;   // (the stream c0 went to: PR 585's streams can move on)
 
-VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_t index) {
+float grass_reach() {
+    static const char* const env = getenv("RX_VK_GRASS_DISTANCE");
+    static const float forced = env && *env ? std::clamp((float)atof(env), 1.0f, 8.0f) : 0.0f;
+    if (forced > 0.0f) return forced;
+    static const float times[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const int v = opts.grass_distance;
+    return (unsigned)v < 4u ? times[v] : 1.0f;
+}
+
+VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_t index, uint64_t prog_key = 0) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minUniformBufferOffsetAlignment, 16);
     uint32_t used = index < Shader::Info::MAX_CBUFS ? st.info.constant_buffer_used_sizes[index] : 0;
@@ -3104,6 +3120,23 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                                               dev.props.limits.maxUniformBufferRange);
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
+        {   // Grass draw distance override (opts.grass_distance / RX_VK_GRASS_DISTANCE): patch a stream copy, never guest RAM.
+            uint16_t words[2];
+            int power[2];
+            const int nw = index == 3 && prog_key ? grass_words(prog_key, words, power) : 0;
+            const float reach = nw ? grass_reach() : 1.0f;
+            if (nw && reach > 1.0f && stream_reserve(n, align)) {
+                uint64_t at = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align);
+                if (at == UINT64_MAX) {
+                    at = stream_alloc(n, align);
+                    if (at != UINT64_MAX) memory_read_as_submitted(u.addr, cur->mapped + at, n);
+                }
+                if (at != UINT64_MAX) {
+                    grass_patch(prog_key, index, cur->mapped + at, n, reach, [](uint16_t, float, float) {});
+                    return {cur->stream, at, n};
+                }
+            }
+        }
         if (stream_reserve(n, align))
             if (const uint64_t at = ub_overlay(u.addr, n, cur->mapped, stream_alloc, align); at != UINT64_MAX) {
                 FINE_N(FC_UBO_OVERLAY, 1);
@@ -3544,7 +3577,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
             const size_t first = out.bufs.size();
             for (uint32_t k = 0; k < d.count; k++) {
                 const auto t0 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                out.bufs.push_back(uniform_range(s, st, d.index + k));
+                out.bufs.push_back(uniform_range(s, st, d.index + k, p.key));
                 if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, out.bufs.back().range);
             }
             w.pBufferInfo = &out.bufs[first];
@@ -4498,7 +4531,7 @@ bool rebuild_uniform_ranges(const NvnState& s, const Program& p) {
     size_t at = 0;
     for (const Stage& st : p.stages) {
         for (const auto& d : st.info.constant_buffer_descriptors)
-            for (uint32_t k = 0; k < d.count; k++) out.bufs[at++] = uniform_range(s, st, d.index + k);
+            for (uint32_t k = 0; k < d.count; k++) out.bufs[at++] = uniform_range(s, st, d.index + k, p.key);
         for (const auto& d : st.info.storage_buffers_descriptors) at += d.count;
     }
     return true;
@@ -9137,6 +9170,28 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         for (std::thread& t : threads) t.detach();
     } else {
         for (std::thread& t : threads) t.join();
+        // Release redundant compute VkShaderModules once their VkPipelines are built (no-op when the inline SPIR-V memory pack
+        // is active, saves driver commit RAM on GPUs/drivers that keep VkShaderModules). RX_VK_KEEP_MODULES=1 keeps them.
+        if (!getenv("RX_VK_KEEP_MODULES")) {
+#ifdef _WIN32
+            PROCESS_MEMORY_COUNTERS_EX m0{}, m1{};
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&m0, sizeof m0);
+#endif
+            size_t gone = 0;
+            for (Program* p : pre->computes)
+                if (std::atomic_ref<VkPipeline>(p->compute_pipeline).load(std::memory_order_acquire) && !taau_key(p->key))
+                    for (Stage& st : p->stages)
+                        if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE, gone++;
+            if (gone) {
+#ifdef _WIN32
+                K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&m1, sizeof m1);
+                logf("vk: %zu shader modules of compute programs let go, their pipelines made: committed memory %.0f -> %.0f MB "
+                     "(RX_VK_KEEP_MODULES=1: kept)", gone, m0.PrivateUsage / 1048576.0, m1.PrivateUsage / 1048576.0);
+#else
+                logf("vk: %zu shader modules of compute programs let go, their pipelines made (RX_VK_KEEP_MODULES=1: kept)", gone);
+#endif
+            }
+        }
         delete pre;
     }
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines, %zu mesh fallback programs in %.0f ms (%.0f ms "

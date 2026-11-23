@@ -60,7 +60,11 @@ struct Device {
          native_mma = false,    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
          present_id = false,    // (VK_KHR_present_id: NVIDIA Reflex present IDs)
          reflex = false,        // (VK_NV_low_latency2: NVIDIA Reflex, vk_reflex.cpp)
-         swap_mutable = false;  // (VK_KHR_swapchain_mutable_format: UNORM view of an sRGB window image for ImGui overlays)
+         swap_mutable = false,  // (VK_KHR_swapchain_mutable_format: UNORM view of an sRGB window image for ImGui overlays)
+         swapchain_colorspace = false, // (VK_EXT_swapchain_colorspace: HDR10 ST.2084 surface)
+         hdr = false;           // (active swapchain is HDR10 ST.2084)
+    enum HdrSdrWhy { hdr_sdr_none = 0, hdr_sdr_no_extension, hdr_sdr_os_off, hdr_sdr_driver, hdr_sdr_unknown, hdr_sdr_count };
+    HdrSdrWhy hdr_sdr_why = hdr_sdr_none;
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
     bool task_mesh_fallback = false;   // (AMD RX 6700 XT class: task+mesh as compute even with mesh shaders, #1747)
@@ -103,9 +107,17 @@ extern Device dev;
 /// ask: a create that compiles nothing (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), on the replay thread so
 /// a draw or dispatch never waits for a compile. It never waits here either: while a worker holds the gate, busy is set and
 /// the caller answers VK_PIPELINE_COMPILE_REQUIRED (cold) without asking the driver.
+/// (vk_menu.cpp) Debug tab's Intel shader compiler mode: 0 Auto (serial on Windows Intel), 1 Parallel, 2 Serial.
+int menu_intel_compiles();
 inline bool intel_gate_on() {
 #ifdef _WIN32
-    static const bool on = !env_on("RX_VK_NO_INTEL_SERIAL") && dev.props.vendorID == 0x8086;
+    static const bool on = [] {
+        if (env_on("RX_VK_NO_INTEL_SERIAL")) return false;
+        const int mode = menu_intel_compiles();
+        if (mode == 1) return false;
+        if (mode == 2) return true;
+        return dev.props.vendorID == 0x8086;
+    }();
     return on;
 #else
     return false;
@@ -378,6 +390,18 @@ void image_compact_ignore(size_t i);
 bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks);
 void destroy_image(VkImage image, VmaAllocation allocation);
 void reap(std::function<void()> fn);   // (driver cleanup on the reaper thread, in FIFO order)
+/// Yields background driver frees up to 3 ms while a frame submit or present is in flight (vk_vma.cpp).
+void reap_wait_turn();
+/// Pre-builds ASTC/BC texture decoder compute pipelines at startup before the title screen (vk_texture.cpp).
+void texture_pipelines_ahead();
+/// Active frame submit/present guard: background reaper/cap-free threads yield so driver frees do not stall submits.
+extern std::atomic<int> driver_turns;
+struct DriverTurn {
+    DriverTurn() { driver_turns.fetch_add(1, std::memory_order_relaxed); }
+    ~DriverTurn() { driver_turns.fetch_sub(1, std::memory_order_release); }
+    DriverTurn(const DriverTurn&) = delete;
+    DriverTurn& operator=(const DriverTurn&) = delete;
+};
 void vma_log_image_blocks();
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
 uint64_t allocation_size(VmaAllocation allocation);

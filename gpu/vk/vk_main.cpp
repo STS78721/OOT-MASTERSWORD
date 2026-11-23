@@ -22,6 +22,7 @@
 #include "gpu_choice.h"
 #include "vk_menu.h"
 #include "vk_reflex.h"
+#include "vk_antilag.h"
 #include "vk_dlss.h"
 #include "vk_progress.h"
 
@@ -126,6 +127,10 @@ bool create_instance() {
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         dlss_instance_extensions(ext_list, all);
+        if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+            ext_list.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+            dev.swapchain_colorspace = true;
+        }
     }
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
@@ -279,6 +284,7 @@ bool create_device() {
     dlss_device_extensions(want, exts);
     dlss_fg_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS Frame Generation's through NGX, asked of NGX)
     reflex_device_extensions(want, exts);    // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
+    antilag_device_extensions(want, exts);   // (AMD Anti-Lag 2: VK_AMD_anti_lag, vk_antilag.cpp)
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -316,6 +322,8 @@ bool create_device() {
         (void)dp;       //  NVIDIA's driver on Windows. RX_VK_PRESENT_QUEUE=1: on)
 #endif
         if (const char* e = getenv("RX_VK_PRESENT_QUEUE")) want = atoi(e) != 0;
+        else if (opts.present_queue == 1) want = true;
+        else if (opts.present_queue == 2) want = false;
         for (uint32_t i = 0; want && i < n && compute_family == UINT32_MAX; i++)
             if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
                 compute_family = i;
@@ -359,6 +367,7 @@ bool create_device() {
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
     reflex_device_features(tail);
+    antilag_device_features(tail);
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
@@ -508,6 +517,7 @@ bool create_device() {
 
     load_device(dev.device);
     reflex_device_created();
+    antilag_device_created();
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
     dev.present_queue = VK_NULL_HANDLE;
     dev.present_family = dev.queue_family;
@@ -594,7 +604,25 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, formats.data());
     VkSurfaceFormatKHR fmt = formats[0];
     for (const auto& f : formats)   // (an UNORM target: the game's window textures are presented as they are)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) fmt = f;
+        if ((f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) &&
+            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            fmt = f;
+    dev.hdr = false;
+    dev.hdr_sdr_why = Device::hdr_sdr_none;
+    if (opts.hdr > 0) {
+        for (const auto& f : formats)
+            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+                fmt = f, dev.hdr = true;
+        if (!dev.hdr) {
+            dev.hdr_sdr_why = !dev.swapchain_colorspace ? Device::hdr_sdr_no_extension : Device::hdr_sdr_os_off;
+            logf("vk: HDR: no HDR10 ST.2084 surface available (%s): using SDR",
+                 !dev.swapchain_colorspace ? "no VK_EXT_swapchain_colorspace" : "enable Use HDR in Windows display settings");
+        } else {
+            logf("vk: HDR: HDR10 ST.2084 surface active (format %d), mode %s, paper white %d nits, peak %d nits",
+                 (int)fmt.format, opts.hdr == 2 ? "Native" : "Expanded", opts.hdr_white, opts.hdr_peak);
+        }
+    }
     // mailbox when the driver has it (latest frame, no tear). The game paces itself (nn_vi.c).
     n = 0;
     result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
@@ -860,6 +888,7 @@ void prepare_with_screen() {
 bool started_up() {
     if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
     if (!replay_start()) return false;
+    texture_pipelines_ahead();
     if (prepare_only()) {
         // (three parts: the programs, the pipelines the notes predict, then those they name; most of the time is the first)
         static int part;

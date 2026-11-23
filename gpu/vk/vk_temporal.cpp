@@ -368,7 +368,7 @@ bool make_pipelines() {
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
     if (!s.prep && !make_pipeline(DLSS_PREP_COMP_SPV, sizeof DLSS_PREP_COMP_SPV, prep_types, 5, 84, s.prep_set, s.prep_layout, s.prep))
         return false;
-    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 8, s.out_set, s.out_layout, s.out))
+    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 20, s.out_set, s.out_layout, s.out))
         return false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -844,6 +844,7 @@ void temporal_reset_failure() {
     for (auto& k : s.engines) {
         k.failed.store(false, std::memory_order_relaxed);
     }
+    dlss_retry();
     s.reason = nullptr;
     s.reason_repeats = 0;
     s.last_frame = 0;
@@ -1179,7 +1180,7 @@ bool stretch(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImage
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
     full_barrier(cmd);
-    const int32_t pc[2] = {(int32_t)ow, (int32_t)oh};
+    const struct { int32_t w, h; float sharp, over; int32_t linear; } pc{(int32_t)ow, (int32_t)oh, 0.0f, 0.0f, 0};
     const VkDescriptorImageInfo info[2] = {{s.linear, in_view, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -1189,7 +1190,7 @@ bool stretch(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImage
     w[1].pImageInfo = &info[1];
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out_layout, 0, 2, w);
-    vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
     full_barrier(cmd);
     static uint64_t told = 0;
@@ -1396,7 +1397,9 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         return false;   // (the network writes its output over whatever the evaluation did)
     }
     {
-        const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
+        const float sharp = std::clamp(opts.up_sharpness, 0, 100) / 100.0f;
+        const struct { int32_t w, h; float sharp, over; int32_t linear; } opc{
+            (int32_t)ow, (int32_t)oh, sharp * 2.0f, sharp > 0.0f ? 0.35f : 0.0f, 0};
         const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -1406,7 +1409,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         w[1].pImageInfo = &info[1];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out);
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out_layout, 0, 2, w);
-        vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, opc);
+        vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, &opc);
         vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
     }
     // (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: this frame's depth, motion and camera for the present's made
